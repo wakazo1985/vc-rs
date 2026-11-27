@@ -17,6 +17,7 @@ mod editor;
 mod params;
 mod runtime;
 mod voice_bank;
+mod echo;
 
 // Share the standalone GUI's test-only renderer to exercise both real editors
 // with the same Vulkan setup, without changing shipped plugin dependencies.
@@ -66,6 +67,9 @@ pub(crate) mod plugin_identity {
 pub struct VcRvcPlugin {
     params: Arc<VcRvcParams>,
     runtime: Option<PluginRuntime>,
+    echo: Option<echo::HoldEcho>,
+    was_original: bool,
+    last_host_latency: Option<u32>,
     /// GUI → worker: request a pipeline rebuild from the current settings.
     reload: Arc<AtomicBool>,
     /// GUI/worker handshake: disables duplicate reload requests while loading.
@@ -91,6 +95,9 @@ impl Default for VcRvcPlugin {
         Self {
             params: Arc::new(VcRvcParams::default()),
             runtime: None,
+            echo: None,
+            was_original: false,
+            last_host_latency: None,
             reload: Arc::new(AtomicBool::new(false)),
             loading: Arc::new(AtomicBool::new(false)),
             dirty: Arc::new(AtomicBool::new(false)),
@@ -182,9 +189,14 @@ impl Plugin for VcRvcPlugin {
 
         let sample_rate = buffer_config.sample_rate.round() as u32;
         let max_block = buffer_config.max_buffer_size as usize;
+        self.echo = Some(echo::HoldEcho::new(sample_rate));
+        self.was_original = self.params.voice_slot.value() == 0;
+        self.last_host_latency = None;
         if let Some(runtime) = self.runtime.as_mut() {
             if runtime.reconfigure(sample_rate, max_block, buffer_config.process_mode) {
-                context.set_latency_samples(runtime.current_latency());
+                let latency = if self.was_original { 0 } else { runtime.current_latency() };
+                context.set_latency_samples(latency);
+                self.last_host_latency = Some(latency);
                 return true;
             }
         }
@@ -208,7 +220,9 @@ impl Plugin for VcRvcPlugin {
             buffer_config.process_mode,
             applied_settings,
         );
-        context.set_latency_samples(runtime.latency_samples);
+        let latency = if self.was_original { 0 } else { runtime.latency_samples };
+        context.set_latency_samples(latency);
+        self.last_host_latency = Some(latency);
         self.runtime = Some(runtime);
         true
     }
@@ -219,28 +233,40 @@ impl Plugin for VcRvcPlugin {
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        match self.runtime.as_mut() {
-            Some(runtime) => {
-                runtime.process_block(buffer.as_slice());
-                // The worker updates latency when chunk_ms changes; relay it to
-                // the host (this just sets a pending flag in the wrapper).
-                if let Some(latency) = runtime.poll_latency_update() {
-                    context.set_latency_samples(latency);
-                }
-            }
-            None => {
-                for channel in buffer.as_slice() {
-                    channel.fill(0.0);
-                }
-            }
+        let original = self.params.voice_slot.value() == 0;
+        if original != self.was_original {
+            if let Some(runtime) = self.runtime.as_mut() { runtime.reset(); }
+            if let Some(echo) = self.echo.as_mut() { echo.clear(); }
+            self.was_original = original;
         }
-        self.runtime
-            .as_ref()
-            .and_then(PluginRuntime::tail_samples)
-            .map_or(ProcessStatus::Normal, ProcessStatus::Tail)
+        let latency = if original {
+            // The host buffer is already in-place: do not downmix, gate,
+            // resample, infer, or apply RVC gain to the original voice.
+            0
+        } else if let Some(runtime) = self.runtime.as_mut() {
+            runtime.process_block(buffer.as_slice());
+            runtime.current_latency()
+        } else {
+            for channel in buffer.as_slice() { channel.fill(0.0); }
+            0
+        };
+        if self.last_host_latency != Some(latency) {
+            context.set_latency_samples(latency);
+            self.last_host_latency = Some(latency);
+        }
+        if let Some(echo) = self.echo.as_mut() {
+            echo.process(buffer.as_slice(), self.params.echo_held.load(Ordering::Acquire));
+        }
+        if original {
+            ProcessStatus::Normal
+        } else {
+            self.runtime.as_ref().and_then(PluginRuntime::tail_samples)
+                .map_or(ProcessStatus::Normal, ProcessStatus::Tail)
+        }
     }
 
     fn reset(&mut self) {
+        if let Some(echo) = self.echo.as_mut() { echo.clear(); }
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.reset();
         }
@@ -252,6 +278,8 @@ impl Plugin for VcRvcPlugin {
             .as_ref()
             .and_then(PluginRuntime::applied_settings);
         self.runtime = None;
+        self.echo = None;
+        self.params.echo_held.store(false, Ordering::Release);
         self.reload.store(false, Ordering::SeqCst);
         self.loading.store(false, Ordering::SeqCst);
     }

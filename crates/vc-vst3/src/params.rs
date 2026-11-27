@@ -6,7 +6,7 @@
 //!   window size are non-parameter state persisted via `#[persist]`, so they
 //!   are saved/restored with the project too.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use nice_plug::prelude::*;
@@ -74,6 +74,7 @@ impl nice_plug::params::persist::PersistentField<'_, PluginConfig> for SettingsS
 pub struct VcRvcParams {
     #[id = "voice-slot"]
     pub voice_slot: IntParam,
+    pub echo_held: AtomicBool,
     #[id = "pitch"]
     pub pitch_shift: FloatParam,
     #[id = "speaker"]
@@ -102,7 +103,8 @@ pub struct VcRvcParams {
 impl Default for VcRvcParams {
     fn default() -> Self {
         Self {
-            voice_slot: IntParam::new("Voice slot", 1, IntRange::Linear { min: 1, max: 4 }),
+            voice_slot: IntParam::new("Voice slot", 1, IntRange::Linear { min: 0, max: 4 }),
+            echo_held: AtomicBool::new(false),
             pitch_shift: FloatParam::new(
                 "Pitch",
                 0.0,

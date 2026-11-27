@@ -1,0 +1,47 @@
+name: VoiceBank stage 07 dry voice and hold echo
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-stage07.yml'
+permissions:
+  contents: read
+env:
+  VC_RS_ENABLE_NATIVE_TENSORRT: "0"
+jobs:
+  compile:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build VST3
+        shell: pwsh
+        run: |
+          cargo xtask bundle vc-vst3 --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -File crates/vc-vst3/package-windowsml.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage07-dry-and-echo-windowsml
+          path: target/bundled/vc-vst3.vst3/
+          if-no-files-found: error
+  echo-tests:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test actual echo module
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --edition=2021 --test crates/vc-vst3/src/echo.rs -o echo-tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./echo-tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

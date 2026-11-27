@@ -103,6 +103,7 @@ pub fn create(
 
 impl Drop for EditorState {
     fn drop(&mut self) {
+        self.params.echo_held.store(false, Ordering::Release);
         if let Some(thread) = self.gpu_discovery_thread.take() {
             let _ = thread.join();
         }
@@ -152,8 +153,8 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
 
     ui.heading("Voice bank");
     ui.horizontal_wrapped(|ui| {
-        for (i, name) in crate::voice_bank::LABELS.iter().enumerate() {
-            let value = i as i32 + 1;
+        for (i, name) in std::iter::once(&"Original").chain(crate::voice_bank::LABELS.iter()).enumerate() {
+            let value = i as i32;
             if ui.selectable_label(state.params.voice_slot.value() == value, *name).clicked() {
                 setter.begin_set_parameter(&state.params.voice_slot);
                 setter.set_parameter(&state.params.voice_slot, value);
@@ -162,7 +163,11 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
             }
         }
     });
-    ui.small("Select a loaded voice. Register files and press Load / Reload first.");
+    let hold = ui.button("Hold echo");
+    let held = hold.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down());
+    state.params.echo_held.store(held, Ordering::Release);
+    if held { ui.ctx().request_repaint_after(std::time::Duration::from_millis(16)); }
+    ui.small("Echo applies only while held. Select a loaded voice after Load / Reload.");
     ui.heading("Live controls");
     ui.small("Changes apply immediately and can be automated in your DAW.");
     egui::Grid::new("params").num_columns(2).show(ui, |ui| {

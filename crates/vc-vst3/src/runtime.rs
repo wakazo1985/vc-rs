@@ -771,8 +771,9 @@ impl WorkerCtx {
                 self.state.notify_offline();
             }
 
-            let requested_voice = self.params.voice_slot.value().saturating_sub(1) as usize;
-            if requested_voice != last_voice_request {
+            let selected = self.params.voice_slot.value();
+            let requested_voice = selected.saturating_sub(1) as usize;
+            if selected > 0 && requested_voice != last_voice_request {
                 last_voice_request = requested_voice;
                 if let Some(current) = converter.as_mut() {
                     match current.select_voice(requested_voice) {

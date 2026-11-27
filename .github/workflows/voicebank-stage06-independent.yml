@@ -60,7 +60,8 @@ jobs:
             'version = "0.1.0"',
             'edition = "2021"',
             '[dependencies]',
-            'anyhow = "1"'
+            'anyhow = "1"',
+            '[workspace]'
           ) | Set-Content stage06-check/Cargo.toml -Encoding ascii
           cargo test --manifest-path stage06-check/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
