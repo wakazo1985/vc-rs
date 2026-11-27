@@ -349,6 +349,17 @@ pub struct RunArgs {
 pub struct WavArgs {
     #[arg(long)]
     pub model: PathBuf,
+    /// Optional local FAISS retrieval index.
+    #[arg(long)]
+    pub index: Option<PathBuf>,
+    #[arg(long, default_value_t = 0.0, value_parser = parse_unit_f32)]
+    pub index_rate: f32,
+    #[arg(long, default_value_t = 0.5)]
+    pub protect: f32,
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    pub formant_shift: f32,
+    #[arg(long)]
+    pub peak_protection: bool,
     #[arg(long)]
     pub embedder: PathBuf,
     #[arg(long)]
@@ -620,7 +631,17 @@ impl WavArgs {
             self.target_output_rms,
             self.max_output_gain,
         )
-        .and_then(|()| validate_wav_live_conversion_options(self))
+        .and_then(|()| validate_wav_live_conversion_options(self))?;
+        if !self.protect.is_finite() || !(0.0..=0.5).contains(&self.protect) {
+            return Err("Protect must be in 0..=0.5".into());
+        }
+        if !self.formant_shift.is_finite() || !(-12.0..=12.0).contains(&self.formant_shift) {
+            return Err("Formant shift must be in -12..=12".into());
+        }
+        if self.index_rate > 0.0 && self.index.is_none() {
+            return Err("Nonzero index rate requires --index".into());
+        }
+        Ok(())
     }
 }
 
@@ -1411,6 +1432,21 @@ mod tests {
         };
 
         assert_eq!(args.rms_mix_rate, 0.25);
+    }
+
+    #[test]
+    fn wav_voicebank_quality_flags_validate() {
+        let mut flags = vec!["vc-rs","wav","--model","m.onnx","--embedder","e.onnx","--f0-model","f.onnx","--input","a.wav","--output","b.wav","--chunk-ms","50","--index","m.index","--index-rate","0.4","--protect","0.25","--formant-shift","-2","--peak-protection"];
+        let Command::Wav(args) = Cli::try_parse_from(&flags).unwrap().command else { panic!("wav expected"); };
+        assert_eq!(args.index_rate,0.4);
+        assert_eq!(args.protect,0.25);
+        assert_eq!(args.formant_shift,-2.0);
+        assert!(args.peak_protection);
+        args.validate_conversion_options().unwrap();
+        let i=flags.iter().position(|x|*x=="0.25").unwrap();
+        flags[i]="0.6";
+        let Command::Wav(args) = Cli::try_parse_from(&flags).unwrap().command else { panic!("wav expected"); };
+        assert!(args.validate_conversion_options().is_err());
     }
 
     #[test]

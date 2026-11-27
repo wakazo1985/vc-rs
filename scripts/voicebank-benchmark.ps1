@@ -1,70 +1,87 @@
-﻿$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Windows.Forms
-$exe = Join-Path $PSScriptRoot 'vc-rs.exe'
-$metrics = Join-Path $PSScriptRoot 'voicebank_wav_metrics.exe'
-function Select-File([string]$title,[string]$filter) {
+param([string]$InputWav)
+$ErrorActionPreference = 'Stop'
+# Run from the installed bundle tools folder, after model conversion.
+$bundle = Split-Path -Parent $PSScriptRoot
+$bin = Join-Path $bundle 'Contents/x86_64-win'
+$exe = Join-Path $bin 'vc-rs.exe'
+$metrics = Join-Path $bin 'voicebank_wav_metrics.exe'
+$env:VC_RS_TENSORRT_BUILDER_HELPER = Join-Path $bin 'vc-tensorrt-builder.exe'
+$env:VC_RS_TENSORRT_CACHE_DIR = Join-Path $bundle 'engine-cache'
+$env:PATH = "$bin;$env:PATH"
+if (!$InputWav) {
+    Add-Type -AssemblyName System.Windows.Forms
     $d = New-Object System.Windows.Forms.OpenFileDialog
     try {
-        $d.Title=$title; $d.Filter=$filter; $d.CheckFileExists=$true
-        if ($d.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { throw "Cancelled: $title" }
-        return $d.FileName
+        $d.Filter='WAV|*.wav'; $d.Title='Select one 48 kHz speech WAV (10-20 seconds)'
+        if ($d.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        $InputWav=$d.FileName
     } finally { $d.Dispose() }
 }
-function Run-Native([string]$binary,[string[]]$arguments,[string]$stdout,[string]$stderr) {
-    $quoted = @($arguments | ForEach-Object { '"' + $_ + '"' })
-    $p = Start-Process -FilePath $binary -ArgumentList $quoted -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    return $p.ExitCode
+$InputWav=(Resolve-Path -LiteralPath $InputWav).Path
+$embedder=Join-Path $bundle 'models/common/contentvec-f.onnx'
+$f0=Join-Path $bundle 'models/common/rmvpe_20231006.onnx'
+foreach ($file in @($exe,$metrics,$embedder,$f0,$env:VC_RS_TENSORRT_BUILDER_HELPER)) {
+    if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing local file: $file" }
 }
-if (!(Test-Path -LiteralPath $exe) -or !(Test-Path -LiteralPath $metrics)) { throw 'Benchmark binaries missing' }
-$input = Select-File 'Select the same speech WAV for all voices (10-30 seconds recommended)' 'WAV|*.wav'
-$embedder = Select-File 'Select local ContentVec ONNX (common embedder)' 'ONNX|*.onnx'
-$f0 = Select-File 'Select local RMVPE ONNX (common F0 model)' 'ONNX|*.onnx'
-$provider = 'windowsml-directml'
-$chunk = 500
-$root = Join-Path $PSScriptRoot ('measurements\run-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
-New-Item -ItemType Directory -Path $root -Force | Out-Null
-$results = @()
-$wav = Join-Path $root 'original.wav'
-Copy-Item -LiteralPath $input -Destination $wav
-if ((Run-Native $metrics @($wav) (Join-Path $root 'original.metrics.json') (Join-Path $root 'original.metrics.log')) -ne 0) { throw 'Input WAV analysis failed' }
-$manifest = [ordered]@{
-    started_utc=[DateTime]::UtcNow.ToString('o')
-    provider_requested=$provider
-    chunk_ms=$chunk
-    input_sha256=(Get-FileHash -LiteralPath $input -Algorithm SHA256).Hash
-    embedder_sha256=(Get-FileHash -LiteralPath $embedder -Algorithm SHA256).Hash
-    f0_sha256=(Get-FileHash -LiteralPath $f0 -Algorithm SHA256).Hash
-    gpu=@(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object Name,DriverVersion)
-    cpu=@(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors)
-    scope='Offline per-model processing. No claim of Wave Link realtime behavior, GPU placement, VRAM or perceptual quality.'
-}
-$manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $root 'environment.json') -Encoding UTF8
-foreach ($slot in @('toddler','girl','male','robot')) {
-    Write-Host "Testing $slot"
-    try {
-        $model = Select-File "Select $slot ONNX" 'ONNX|*.onnx'
-        $hash = (Get-FileHash -LiteralPath $model -Algorithm SHA256).Hash
-        $dir = Join-Path $root $slot
-        New-Item -ItemType Directory -Path $dir | Out-Null
-        for ($run=1; $run -le 3; $run++) {
-            $out=Join-Path $dir "run-$run.wav"
-            $timing=Join-Path $dir "run-$run.timing.json"
-            $join=Join-Path $dir "run-$run.join.csv"
-            $argsList=@('wav','--input',$wav,'--output',$out,'--model',$model,'--embedder',$embedder,'--f0-model',$f0,'--provider',$provider,'--chunk-ms',"$chunk",'--smoother','phase-vocoder','--extra-convert-ms','100','--rms-mix-rate','0','--performance-report',$timing,'--performance-warmup-chunks','3','--join-report',$join)
-            $exitCode=Run-Native $exe $argsList (Join-Path $dir "run-$run.stdout.log") (Join-Path $dir "run-$run.stderr.log")
-            if ($exitCode -ne 0) { throw "Conversion failed on run $run (exit $exitCode)" }
-            $metricPath=Join-Path $dir "run-$run.metrics.json"
-            if ((Run-Native $metrics @($out) $metricPath (Join-Path $dir "run-$run.metrics.log")) -ne 0) { throw "WAV analysis failed on run $run" }
-            $stats=Get-Content -LiteralPath $metricPath -Raw | ConvertFrom-Json
-            $t=Get-Content -LiteralPath $timing -Raw | ConvertFrom-Json
-            $p=$t.steady.processing_ms
-            $results += [pscustomobject]@{slot=$slot;run=$run;status='measured';model_sha256=$hash;processing_p95_ms=$p.p95_ms;processing_max_ms=$p.max_ms;deadline_misses=$p.deadline_misses;steady_chunks=$p.count;rms=$stats.rms;peak=$stats.peak;nonfinite=$stats.nonfinite_samples;near_full_scale_fraction=$stats.near_full_scale_fraction;max_sample_step=$stats.max_adjacent_sample_step;duration_seconds=$stats.duration_seconds;error=''}
-        }
-    } catch {
-        $results += [pscustomobject]@{slot=$slot;run=0;status='failed';model_sha256='';processing_p95_ms=$null;processing_max_ms=$null;deadline_misses=$null;steady_chunks=$null;rms=$null;peak=$null;nonfinite=$null;near_full_scale_fraction=$null;max_sample_step=$null;duration_seconds=$null;error=$_.Exception.Message}
-        Write-Warning "$slot : $($_.Exception.Message)"
+$root=Join-Path $bundle ('measurements/stage03-'+(Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+New-Item -ItemType Directory -Force $root | Out-Null
+$raw=& $metrics $InputWav
+if ($LASTEXITCODE -ne 0) { throw 'Input WAV metrics failed' }
+$raw | Set-Content (Join-Path $root 'input.json') -Encoding UTF8
+$info=($raw -join "`n") | ConvertFrom-Json
+if ($info.sample_rate -ne 48000 -or $info.nonfinite_samples -ne 0) { throw 'Use a valid 48 kHz WAV, matching Wave Link.' }
+Copy-Item -LiteralPath $InputWav (Join-Path $root 'original.wav')
+$profiles=@(
+    @{slot='toddler';pitch=14;index=0.4;protect=0.25;rms=0.75;pitchAlt=12;formantAlt=2},
+    @{slot='girl';pitch=12;index=0.4;protect=0.25;rms=0.75;pitchAlt=10;formantAlt=2},
+    @{slot='male';pitch=0;index=0.5;protect=0.33;rms=0.8;pitchAlt=-2;formantAlt=-2},
+    @{slot='robot';pitch=0;index=0.7;protect=0.33;rms=1.0;pitchAlt=2;formantAlt=0}
+)
+$results=@()
+$profiles | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $root 'profiles.json') -Encoding UTF8
+foreach ($p in $profiles) {
+    $slot=$p.slot
+    $dir=Join-Path $root $slot
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $modelDir=Join-Path $bundle "models/$slot"
+    $model=Join-Path $modelDir "$slot.onnx"
+    $indexes=@(Get-ChildItem -LiteralPath $modelDir -File -Filter '*.index' -ErrorAction SilentlyContinue)
+    if (!(Test-Path -LiteralPath $model) -or $indexes.Count -ne 1) {
+        $results += [pscustomobject]@{slot=$slot;variant='all';status='failed';error='Need local ONNX and exactly one INDEX';pitch=$null;index=$null;protect=$null;formant=$null;rms_mix=$null;context_ms=$null;processing_p95_ms=$null;deadline_misses=$null;nonfinite=$null;peak=$null;duration_seconds=$null;wav=''}
+        continue
     }
-    $results | Export-Csv -LiteralPath (Join-Path $root 'summary.csv') -NoTypeInformation -Encoding UTF8
+    $index=$indexes[0].FullName
+    $variants=@(
+        @{name='baseline';pitch=$p.pitch;index=$p.index;protect=$p.protect;formant=0;rms=0.0;context=100},
+        @{name='provisional';pitch=$p.pitch;index=$p.index;protect=$p.protect;formant=0;rms=$p.rms;context=100},
+        @{name='pitch';pitch=$p.pitchAlt;index=$p.index;protect=$p.protect;formant=0;rms=$p.rms;context=100},
+        @{name='index';pitch=$p.pitch;index=[Math]::Max(0,$p.index-0.2);protect=$p.protect;formant=0;rms=$p.rms;context=100},
+        @{name='context';pitch=$p.pitch;index=$p.index;protect=$p.protect;formant=0;rms=$p.rms;context=400}
+    )
+    if ($p.formantAlt -ne 0) { $variants+=@{name='formant';pitch=$p.pitch;index=$p.index;protect=$p.protect;formant=$p.formantAlt;rms=$p.rms;context=100} }
+    foreach ($v in $variants) {
+        $name=$v.name; $wav=Join-Path $dir "$name.wav";$timing=Join-Path $dir "$name.timing.json";$join=Join-Path $dir "$name.join.csv"
+        $row=[ordered]@{slot=$slot;variant=$name;status='failed';error='';pitch=$v.pitch;index=$v.index;protect=$v.protect;formant=$v.formant;rms_mix=$v.rms;context_ms=$v.context;processing_p95_ms=$null;deadline_misses=$null;nonfinite=$null;peak=$null;duration_seconds=$null;wav=$wav}
+        try {
+            $ci=[System.Globalization.CultureInfo]::InvariantCulture
+            $argsList=@('wav','--input',$InputWav,'--output',$wav,'--model',$model,'--embedder',$embedder,'--f0-model',$f0,'--provider','tensorrt','--chunk-ms','50','--crossfade-ms','40','--sola-search-ms','12','--rvc-output-tail-discard-ms','10','--smoother','phase-vocoder',"--pitch-shift=$($v.pitch)","--index-rate=$(([double]$v.index).ToString($ci))",'--index',$index,"--protect=$(([double]$v.protect).ToString($ci))","--formant-shift=$($v.formant)","--rms-mix-rate=$(([double]$v.rms).ToString($ci))",'--extra-convert-ms',"$($v.context)",'--peak-protection','--performance-report',$timing,'--performance-warmup-chunks','3','--join-report',$join)
+            & $exe @argsList 1> (Join-Path $dir "$name.stdout.log") 2> (Join-Path $dir "$name.stderr.log")
+            if ($LASTEXITCODE -ne 0) { throw "Conversion exit $LASTEXITCODE" }
+            $report=& $metrics $wav
+            if ($LASTEXITCODE -ne 0) { throw 'WAV metrics failed' }
+            $report | Set-Content (Join-Path $dir "$name.metrics.json") -Encoding UTF8
+            $q=($report -join "`n") | ConvertFrom-Json
+            $t=Get-Content -LiteralPath $timing -Raw | ConvertFrom-Json
+            $row.processing_p95_ms=$t.steady.processing_ms.p95_ms
+            $row.deadline_misses=$t.steady.processing_ms.deadline_misses
+            $row.nonfinite=$q.nonfinite_samples; $row.peak=$q.peak; $row.duration_seconds=$q.duration_seconds
+            if ($q.nonfinite_samples -ne 0 -or [Math]::Abs($q.duration_seconds-$info.duration_seconds) -gt 0.05 -or $q.rms -le 0) { throw 'Invalid, silent or duration-mismatched output' }
+            $row.status='measured'
+        } catch { $row.error=$_.Exception.Message }
+        $results += [pscustomobject]$row
+        $results | Export-Csv (Join-Path $root 'summary.csv') -NoTypeInformation -Encoding UTF8
+    }
 }
+$results | Export-Csv (Join-Path $root 'summary.csv') -NoTypeInformation -Encoding UTF8
 Write-Host "Results: $root"
 if (@($results | Where-Object status -eq 'failed').Count -gt 0) { exit 1 }

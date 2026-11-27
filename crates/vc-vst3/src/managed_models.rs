@@ -37,6 +37,11 @@ pub(crate) fn discover(root:&Path, config:&mut PluginConfig, running:&AtomicBool
         config.voice_profiles = saved.voice_profiles;
         log.event("VOICE_PROFILES_RESTORED", "4 independent local profiles");
     }
+    for (i, profile) in config.voice_profiles.iter_mut().enumerate() {
+        if profile.upgrade_untouched(i) {
+            log.event("VOICE_PROFILE_STAGE03", &format!("slot={} rms_mix_rate={}", i+1,profile.rms_mix_rate));
+        }
+    }
     let models=root.join("models");
     let shared=models.join("common");
     log.event("MODEL_SCAN",&format!("root={} common={} onnx_files={:?}",root.display(),shared.display(),files(&shared,"onnx")));

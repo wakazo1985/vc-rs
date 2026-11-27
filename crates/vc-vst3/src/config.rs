@@ -105,7 +105,16 @@ impl VoiceProfile {
         p.pitch_shift = [14.0, 12.0, 0.0, 0.0][slot];
         p.index_rate = [0.4, 0.4, 0.5, 0.7][slot];
         p.protect = [0.25, 0.25, 0.33, 0.33][slot];
+        // Provisional: favor the generated envelope over aggressive input RMS matching.
+        p.rms_mix_rate = [0.75, 0.75, 0.8, 1.0][slot];
         p
+    }
+    /// Migrate only a completely untouched stage 01/02 profile.
+    pub fn upgrade_untouched(&mut self, slot: usize) -> bool {
+        let updated = Self::initial(slot);
+        let mut old = updated.clone();
+        old.rms_mix_rate = 0.0;
+        if *self == old { *self = updated; true } else { false }
     }
     pub fn live(&self) -> vc_core::model_rvc::LiveParams {
         vc_core::model_rvc::LiveParams {
@@ -486,6 +495,19 @@ fn os_config_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stage03_defaults_migrate_only_untouched_profiles() {
+        for i in 0..4 {
+            let new = super::VoiceProfile::initial(i);
+            assert_eq!(new.chunk_ms,50);
+            assert_eq!(new.rms_mix_rate,[0.75,0.75,0.8,1.0][i]);
+            let mut old=new.clone(); old.rms_mix_rate=0.0;
+            let mut edited=old.clone(); edited.pitch_shift+=1.0;
+            let before=edited.clone();
+            assert!(old.upgrade_untouched(i)); assert_eq!(old,new);
+            assert!(!edited.upgrade_untouched(i)); assert_eq!(edited,before);
+        }
+    }
     #[test]
     fn smoother_defaults_only_when_missing_and_preserves_saved_choices() {
         use vc_core::sola::SmoothingKind;

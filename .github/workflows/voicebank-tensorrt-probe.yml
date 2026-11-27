@@ -151,6 +151,11 @@ jobs:
           $tools=Join-Path $bundle 'tools'
           New-Item -ItemType Directory -Force $tools | Out-Null
           Copy-Item target/release/examples/voicebank_convert.exe $tools/
+          cargo build -p vc-cli --no-default-features --features tensorrt --release --locked --bin vc-rs --example voicebank_wav_metrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item target/release/vc-rs.exe $bin/
+          Copy-Item target/release/examples/voicebank_wav_metrics.exe $bin/
+          Copy-Item scripts/voicebank-benchmark.ps1 $tools/
           Copy-Item crates/vc-convert/LICENSE-*.txt $tools/
           Copy-Item crates/vc-convert/THIRD_PARTY.md $tools/
           Copy-Item crates/vc-vst3/src/control.html $stage/

@@ -240,7 +240,13 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
     // GTCRN stays on the shared 16 kHz seam. The finite core adapter drains and
     // removes its declared content delay together with the other streaming
     // buffers, rather than truncating that delayed speech at the clip end.
-    let model = load_wav_pipeline(denoiser_mode, args.gtcrn_model.as_deref(), pipeline_config)?;
+    let mut model = load_wav_pipeline(denoiser_mode, args.gtcrn_model.as_deref(), pipeline_config)?;
+    if let Some(index) = args.index.as_deref() {
+        model.set_retrieval_index(index, args.index_rate)?;
+    }
+    model.set_protect(args.protect)?;
+    model.set_formant_shift(args.formant_shift)?;
+    model.set_peak_protection(args.peak_protection);
     let load_duration = load_started.elapsed();
     let converter = ChunkConverter::new(
         model,
