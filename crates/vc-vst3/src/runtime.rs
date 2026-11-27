@@ -669,7 +669,7 @@ impl WorkerCtx {
             running: Arc::clone(&self.running),
             state: Arc::clone(&self.state),
         };
-        let mut last_voice_request = self.params.voice_slot.value().saturating_sub(1) as usize;
+        let mut last_voice_request = self.params.selected_voice().saturating_sub(1) as usize;
         let initial_settings = self.initial_settings.clone();
         let initial_chunk = initial_settings.validated_chunk_samples(self.sample_rate);
         // Invalid persisted settings never load a model. The fallback only
@@ -771,7 +771,7 @@ impl WorkerCtx {
                 self.state.notify_offline();
             }
 
-            let selected = self.params.voice_slot.value();
+            let selected = self.params.selected_voice();
             let requested_voice = selected.saturating_sub(1) as usize;
             if selected > 0 && requested_voice != last_voice_request {
                 last_voice_request = requested_voice;
@@ -949,7 +949,7 @@ impl WorkerCtx {
                     }
                 }
             }
-            let requested = self.params.voice_slot.value().saturating_sub(1) as usize;
+            let requested = self.params.selected_voice().saturating_sub(1) as usize;
             let Some(bank) = VoiceBank::new(slots, requested) else {
                 self.set_error("No voice bank model could load", errors.join("\n"));
                 self.dirty.store(true, Ordering::SeqCst);

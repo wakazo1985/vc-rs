@@ -6,7 +6,7 @@
 //!   window size are non-parameter state persisted via `#[persist]`, so they
 //!   are saved/restored with the project too.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use nice_plug::prelude::*;
@@ -75,6 +75,8 @@ pub struct VcRvcParams {
     #[id = "voice-slot"]
     pub voice_slot: IntParam,
     pub echo_held: AtomicBool,
+    pub echo_hotkey: AtomicBool,
+    selected_voice: Arc<AtomicI32>,
     #[id = "pitch"]
     pub pitch_shift: FloatParam,
     #[id = "speaker"]
@@ -100,10 +102,20 @@ pub struct VcRvcParams {
     pub editor_state: Arc<EguiState>,
 }
 
+impl VcRvcParams {
+    pub(crate) fn selected_voice(&self) -> i32 { self.selected_voice.load(Ordering::Acquire) }
+    pub(crate) fn set_selected_voice(&self, voice: i32) { self.selected_voice.store(voice.clamp(0,4), Ordering::Release); }
+}
+
 impl Default for VcRvcParams {
     fn default() -> Self {
+        let selected_voice = Arc::new(AtomicI32::new(1));
+        let selection_callback = selected_voice.clone();
         Self {
-            voice_slot: IntParam::new("Voice slot", 1, IntRange::Linear { min: 0, max: 4 }),
+            voice_slot: IntParam::new("Voice slot", 1, IntRange::Linear { min: 0, max: 4 })
+                .with_callback(Arc::new(move |value| selection_callback.store(value, Ordering::Release))),
+            selected_voice,
+            echo_hotkey: AtomicBool::new(false),
             echo_held: AtomicBool::new(false),
             pitch_shift: FloatParam::new(
                 "Pitch",

@@ -18,6 +18,7 @@ mod params;
 mod runtime;
 mod voice_bank;
 mod echo;
+mod hotkeys;
 
 // Share the standalone GUI's test-only renderer to exercise both real editors
 // with the same Vulkan setup, without changing shipped plugin dependencies.
@@ -68,6 +69,8 @@ pub struct VcRvcPlugin {
     params: Arc<VcRvcParams>,
     runtime: Option<PluginRuntime>,
     echo: Option<echo::HoldEcho>,
+    #[cfg(windows)]
+    hotkeys: Option<hotkeys::HotkeyWorker>,
     was_original: bool,
     last_host_latency: Option<u32>,
     /// GUI → worker: request a pipeline rebuild from the current settings.
@@ -96,6 +99,8 @@ impl Default for VcRvcPlugin {
             params: Arc::new(VcRvcParams::default()),
             runtime: None,
             echo: None,
+            #[cfg(windows)]
+            hotkeys: None,
             was_original: false,
             last_host_latency: None,
             reload: Arc::new(AtomicBool::new(false)),
@@ -186,11 +191,22 @@ impl Plugin for VcRvcPlugin {
         // Only untouched fresh instances consult the optional seed, once. A
         // saved project can intentionally contain empty or partial model paths.
         self.seed_settings(PluginConfig::discover);
+        #[cfg(windows)]
+        {
+            if buffer_config.process_mode == ProcessMode::Offline {
+                self.hotkeys = None;
+            } else if self.hotkeys.is_none() {
+                match hotkeys::HotkeyWorker::start(self.params.clone(), self.reload_waker.clone()) {
+                    Ok(worker) => self.hotkeys = Some(worker),
+                    Err(error) => nice_plug::nice_error!("voicebank: shortcut thread start failed: {error}"),
+                }
+            }
+        }
 
         let sample_rate = buffer_config.sample_rate.round() as u32;
         let max_block = buffer_config.max_buffer_size as usize;
         self.echo = Some(echo::HoldEcho::new(sample_rate));
-        self.was_original = self.params.voice_slot.value() == 0;
+        self.was_original = self.params.selected_voice() == 0;
         self.last_host_latency = None;
         if let Some(runtime) = self.runtime.as_mut() {
             if runtime.reconfigure(sample_rate, max_block, buffer_config.process_mode) {
@@ -233,7 +249,7 @@ impl Plugin for VcRvcPlugin {
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let original = self.params.voice_slot.value() == 0;
+        let original = self.params.selected_voice() == 0;
         if original != self.was_original {
             if let Some(runtime) = self.runtime.as_mut() { runtime.reset(); }
             if let Some(echo) = self.echo.as_mut() { echo.clear(); }
@@ -255,7 +271,7 @@ impl Plugin for VcRvcPlugin {
             self.last_host_latency = Some(latency);
         }
         if let Some(echo) = self.echo.as_mut() {
-            echo.process(buffer.as_slice(), self.params.echo_held.load(Ordering::Acquire));
+            echo.process(buffer.as_slice(), self.params.echo_held.load(Ordering::Acquire) || self.params.echo_hotkey.load(Ordering::Acquire));
         }
         if original {
             ProcessStatus::Normal
@@ -273,6 +289,9 @@ impl Plugin for VcRvcPlugin {
     }
 
     fn deactivate(&mut self) {
+        #[cfg(windows)]
+        { self.hotkeys = None; }
+        self.params.echo_hotkey.store(false, Ordering::Release);
         self.applied_settings = self
             .runtime
             .as_ref()

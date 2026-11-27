@@ -43,6 +43,7 @@ pub struct VoiceSlot {
 pub struct PluginConfig {
     pub model: PathBuf,
     pub voice_slots: [VoiceSlot; 4],
+    pub hotkeys: crate::hotkeys::HotkeyConfig,
     pub embedder: PathBuf,
     pub f0_model: PathBuf,
     pub embedder_output: Option<String>,
@@ -91,6 +92,7 @@ impl Default for PluginConfig {
         Self {
             model: PathBuf::new(),
             voice_slots: std::array::from_fn(|_| VoiceSlot::default()),
+            hotkeys: Default::default(),
             embedder: PathBuf::new(),
             f0_model: PathBuf::new(),
             embedder_output: None,

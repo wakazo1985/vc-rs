@@ -155,10 +155,11 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
     ui.horizontal_wrapped(|ui| {
         for (i, name) in std::iter::once(&"Original").chain(crate::voice_bank::LABELS.iter()).enumerate() {
             let value = i as i32;
-            if ui.selectable_label(state.params.voice_slot.value() == value, *name).clicked() {
+            if ui.selectable_label(state.params.selected_voice() == value, *name).clicked() {
                 setter.begin_set_parameter(&state.params.voice_slot);
                 setter.set_parameter(&state.params.voice_slot, value);
                 setter.end_set_parameter(&state.params.voice_slot);
+                state.params.set_selected_voice(value);
                 state.reload_waker.wake();
             }
         }
@@ -167,7 +168,10 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
     let held = hold.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down());
     state.params.echo_held.store(held, Ordering::Release);
     if held { ui.ctx().request_repaint_after(std::time::Duration::from_millis(16)); }
+    if state.params.echo_hotkey.load(Ordering::Acquire) { ui.label("Echo shortcut held"); }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
     ui.small("Echo applies only while held. Select a loaded voice after Load / Reload.");
+    draw_hotkeys(ui, state);
     ui.heading("Live controls");
     ui.small("Changes apply immediately and can be automated in your DAW.");
     egui::Grid::new("params").num_columns(2).show(ui, |ui| {
@@ -211,6 +215,45 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
 
     ui.separator();
     draw_setup(ui, state);
+}
+
+fn draw_hotkeys(ui: &mut egui::Ui, state: &EditorState) {
+    use crate::hotkeys::{self, ACTIONS, MODIFIERS};
+    egui::CollapsingHeader::new("Keyboard shortcuts").show(ui, |ui| {
+        let original = state.params.settings.read().unwrap().hotkeys;
+        let mut config = original;
+        ui.checkbox(&mut config.enabled, "Enable shortcuts");
+        for (i, binding) in config.bindings.iter_mut().enumerate() {
+            ui.push_id(("voicebank-shortcut", i), |ui| {
+                ui.label(ACTIONS[i]);
+                ui.horizontal_wrapped(|ui| {
+                    egui::ComboBox::from_id_salt("key")
+                        .selected_text(hotkeys::key_name(binding.key))
+                        .show_ui(ui, |ui| {
+                            for key in hotkeys::supported_keys() {
+                                if ui.selectable_value(&mut binding.key, key, hotkeys::key_name(key)).changed() && key == 0 {
+                                    binding.modifiers = 0;
+                                }
+                            }
+                        });
+                    for (mask, name) in MODIFIERS {
+                        let mut checked = binding.modifiers & mask != 0;
+                        if ui.checkbox(&mut checked, name).changed() {
+                            if checked { binding.modifiers |= mask; } else { binding.modifiers &= !mask; }
+                        }
+                    }
+                });
+            });
+        }
+        if ui.button("Reset F5 - F10").clicked() { config = Default::default(); }
+        if config != original {
+            match config.validate() {
+                Ok(()) => state.params.settings.write().unwrap().hotkeys = config,
+                Err(error) => { ui.colored_label(egui::Color32::RED, error); }
+            }
+        }
+        ui.small("Changes apply immediately. Host shortcuts may still receive the same key.");
+    });
 }
 
 fn draw_setup(ui: &mut egui::Ui, state: &mut EditorState) {

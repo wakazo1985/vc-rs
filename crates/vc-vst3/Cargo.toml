@@ -44,7 +44,7 @@ anyhow.workspace = true
 ort = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse"] }
 
 [dev-dependencies]
 egui_kittest = "0.34.3"
