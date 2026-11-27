@@ -53,7 +53,9 @@ impl SettingsState {
         if pristine(&value) {
             *value = seed;
             true
-        } else { false }
+        } else {
+            false
+        }
     }
 }
 
@@ -111,24 +113,40 @@ pub struct VcRvcParams {
 }
 
 impl VcRvcParams {
-    pub(crate) fn selected_voice(&self) -> i32 { self.selected_voice.load(Ordering::Acquire) }
-    pub(crate) fn set_selected_voice(&self, voice: i32) { let voice=voice.clamp(0,4); if self.selected_voice.swap(voice, Ordering::AcqRel)!=voice { self.save_requested.store(true, Ordering::Release); } }
-    pub(crate) fn voice_loaded(&self, voice:i32)->bool { voice==0 || ((1..=4).contains(&voice) && self.loaded_voice_mask.load(Ordering::Acquire)&(1u32<<voice as u32)!=0) }
-    pub(crate) fn request_save(&self) { self.save_requested.store(true, Ordering::Release); }
+    pub(crate) fn selected_voice(&self) -> i32 {
+        self.selected_voice.load(Ordering::Acquire)
+    }
+    pub(crate) fn set_selected_voice(&self, voice: i32) {
+        let voice = voice.clamp(0, 4);
+        if self.selected_voice.swap(voice, Ordering::AcqRel) != voice {
+            self.save_requested.store(true, Ordering::Release);
+        }
+    }
+    pub(crate) fn voice_loaded(&self, voice: i32) -> bool {
+        voice == 0
+            || ((1..=4).contains(&voice)
+                && self.loaded_voice_mask.load(Ordering::Acquire) & (1u32 << voice as u32) != 0)
+    }
+    pub(crate) fn request_save(&self) {
+        self.save_requested.store(true, Ordering::Release);
+    }
     pub(crate) fn flush_profile(&self) {
-        if !self.save_requested.swap(false, Ordering::AcqRel) || cfg!(test) { return; }
+        if !self.save_requested.swap(false, Ordering::AcqRel) || cfg!(test) {
+            return;
+        }
         let mut config = self.settings.read().unwrap().clone();
         config.startup_voice = self.selected_voice();
         match crate::diagnostics::save_profile(&config) {
             Ok(()) => {
                 self.diagnostics.set_profile_error(None);
-                self.diagnostics.event("SETTINGS_SAVED", "VST3 folder settings updated");
+                self.diagnostics
+                    .event("SETTINGS_SAVED", "VST3 folder settings updated");
             }
             Err(error) => {
                 let detail = format!("Save settings in VST3 folder: {error:#}");
                 self.diagnostics.set_profile_error(Some(detail.clone()));
                 self.diagnostics.event("ERROR", &detail);
-            },
+            }
         }
     }
 }
@@ -139,7 +157,9 @@ impl Default for VcRvcParams {
         let selection_callback = selected_voice.clone();
         Self {
             voice_slot: IntParam::new("Voice slot", 1, IntRange::Linear { min: 0, max: 4 })
-                .with_callback(Arc::new(move |value| selection_callback.store(value, Ordering::Release))),
+                .with_callback(Arc::new(move |value| {
+                    selection_callback.store(value, Ordering::Release)
+                })),
             selected_voice,
             echo_hotkey: AtomicBool::new(false),
             diagnostics: Arc::new(crate::diagnostics::Diagnostics::default()),

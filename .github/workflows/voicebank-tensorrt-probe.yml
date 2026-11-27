@@ -302,3 +302,5 @@ jobs:
             gh release create "$tag" RVCVoiceBank-TensorRT-RTX5070Ti.zip RVCVoiceBank-TensorRT-RTX5070Ti.zip.sha256 --target "$GITHUB_SHA" --prerelease --title "RVC VoiceBank Stage 07 RTX 5070 Ti" --notes "$notes"
           fi
           gh release view "$tag" --json assets,url
+
+# Stage 07: rebuild after the verified formatting corrections.

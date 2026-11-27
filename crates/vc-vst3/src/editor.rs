@@ -153,9 +153,15 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
 
     ui.heading("Voice bank");
     ui.horizontal_wrapped(|ui| {
-        for (i, name) in std::iter::once(&"Original").chain(crate::voice_bank::LABELS.iter()).enumerate() {
+        for (i, name) in std::iter::once(&"Original")
+            .chain(crate::voice_bank::LABELS.iter())
+            .enumerate()
+        {
             let value = i as i32;
-            if ui.selectable_label(state.params.selected_voice() == value, *name).clicked() {
+            if ui
+                .selectable_label(state.params.selected_voice() == value, *name)
+                .clicked()
+            {
                 setter.begin_set_parameter(&state.params.voice_slot);
                 setter.set_parameter(&state.params.voice_slot, value);
                 setter.end_set_parameter(&state.params.voice_slot);
@@ -167,9 +173,15 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
     let hold = ui.button("Hold echo");
     let held = hold.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down());
     state.params.echo_held.store(held, Ordering::Release);
-    if held { ui.ctx().request_repaint_after(std::time::Duration::from_millis(16)); }
-    if state.params.echo_hotkey.load(Ordering::Acquire) { ui.label("Echo shortcut held"); }
-    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    if held {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(16));
+    }
+    if state.params.echo_hotkey.load(Ordering::Acquire) {
+        ui.label("Echo shortcut held");
+    }
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(100));
     ui.small("Echo applies only while held. Select a loaded voice after Load / Reload.");
     draw_hotkeys(ui, state);
     draw_diagnostics(ui, setter, state);
@@ -232,7 +244,11 @@ fn draw_hotkeys(ui: &mut egui::Ui, state: &EditorState) {
                         .selected_text(hotkeys::key_name(binding.key))
                         .show_ui(ui, |ui| {
                             for key in hotkeys::supported_keys() {
-                                if ui.selectable_value(&mut binding.key, key, hotkeys::key_name(key)).changed() && key == 0 {
+                                if ui
+                                    .selectable_value(&mut binding.key, key, hotkeys::key_name(key))
+                                    .changed()
+                                    && key == 0
+                                {
                                     binding.modifiers = 0;
                                 }
                             }
@@ -240,22 +256,33 @@ fn draw_hotkeys(ui: &mut egui::Ui, state: &EditorState) {
                     for (mask, name) in MODIFIERS {
                         let mut checked = binding.modifiers & mask != 0;
                         if ui.checkbox(&mut checked, name).changed() {
-                            if checked { binding.modifiers |= mask; } else { binding.modifiers &= !mask; }
+                            if checked {
+                                binding.modifiers |= mask;
+                            } else {
+                                binding.modifiers &= !mask;
+                            }
                         }
                     }
                 });
             });
         }
-        if ui.button("Reset F5 - F10").clicked() { config = Default::default(); }
+        if ui.button("Reset F5 - F10").clicked() {
+            config = Default::default();
+        }
         if config != original {
             match config.validate() {
                 Ok(()) => {
                     state.params.settings.write().unwrap().hotkeys = config;
                     state.params.request_save();
-                    state.params.diagnostics.event("SHORTCUT_CONFIG", "Bindings updated");
+                    state
+                        .params
+                        .diagnostics
+                        .event("SHORTCUT_CONFIG", "Bindings updated");
                     state.reload_waker.wake();
-                },
-                Err(error) => { ui.colored_label(egui::Color32::RED, error); }
+                }
+                Err(error) => {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
             }
         }
         ui.small("Changes apply immediately. Host shortcuts may still receive the same key.");
@@ -365,7 +392,10 @@ fn draw_setup(ui: &mut egui::Ui, state: &mut EditorState) {
                 .is_ok()
         {
             state.params.request_save();
-            state.params.diagnostics.event("LOAD_REQUEST", "Load / Reload pressed");
+            state
+                .params
+                .diagnostics
+                .event("LOAD_REQUEST", "Load / Reload pressed");
             state.reload.store(true, Ordering::SeqCst);
             // Wake the worker so it picks up the request immediately, even if the
             // host is idle and not driving process() (no input wakes arriving).
@@ -687,7 +717,10 @@ fn spawn_picker(state: &EditorState, kind: ModelKind) {
         }
     });
     if let Err(error) = result {
-        state.params.diagnostics.event("ERROR", &format!("File picker: {error}"));
+        state
+            .params
+            .diagnostics
+            .event("ERROR", &format!("File picker: {error}"));
         *state.status.lock().unwrap() = PluginStatus {
             summary: "file picker failed".into(),
             detail: Some(error.to_string()),

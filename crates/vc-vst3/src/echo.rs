@@ -8,7 +8,11 @@ pub(crate) struct HoldEcho {
 impl HoldEcho {
     pub(crate) fn new(rate: u32) -> Self {
         let samples = ((rate as u64 * 180) / 1000).max(1) as usize;
-        Self { delay: vec![[0.0; 2]; samples], position: 0, valid: 0 }
+        Self {
+            delay: vec![[0.0; 2]; samples],
+            position: 0,
+            valid: 0,
+        }
     }
     pub(crate) fn clear(&mut self) {
         self.position = 0;
@@ -20,12 +24,16 @@ impl HoldEcho {
             return;
         }
         let count = channels.len().min(2);
-        let Some(first) = channels.first() else { return; };
+        let Some(first) = channels.first() else {
+            return;
+        };
         let n = first.len();
         for i in 0..n {
             let previous = if self.valid == self.delay.len() {
                 self.delay[self.position]
-            } else { [0.0; 2] };
+            } else {
+                [0.0; 2]
+            };
             for ch in 0..count {
                 let dry = channels[ch][i];
                 self.delay[self.position][ch] = 0.65 * dry + 0.35 * previous[ch];

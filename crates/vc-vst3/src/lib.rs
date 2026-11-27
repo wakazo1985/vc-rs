@@ -12,17 +12,17 @@ use std::sync::{Arc, Mutex};
 use nice_plug::prelude::*;
 
 mod config;
+mod diagnostics;
 mod dll_path;
+mod echo;
 mod editor;
+mod hotkeys;
+#[cfg(windows)]
+mod http_control;
+mod managed_models;
 mod params;
 mod runtime;
 mod voice_bank;
-mod echo;
-mod hotkeys;
-mod diagnostics;
-mod managed_models;
-#[cfg(windows)]
-mod http_control;
 
 // Share the standalone GUI's test-only renderer to exercise both real editors
 // with the same Vulkan setup, without changing shipped plugin dependencies.
@@ -203,7 +203,16 @@ impl Plugin for VcRvcPlugin {
         // Only untouched fresh instances consult the optional seed, once. A
         // saved project can intentionally contain empty or partial model paths.
         self.seed_settings(PluginConfig::discover);
-        self.params.diagnostics.event("INITIALIZE", &format!("version={} rate={} max_block={} mode={:?}", env!("CARGO_PKG_VERSION"), buffer_config.sample_rate, buffer_config.max_buffer_size, buffer_config.process_mode));
+        self.params.diagnostics.event(
+            "INITIALIZE",
+            &format!(
+                "version={} rate={} max_block={} mode={:?}",
+                env!("CARGO_PKG_VERSION"),
+                buffer_config.sample_rate,
+                buffer_config.max_buffer_size,
+                buffer_config.process_mode
+            ),
+        );
         #[cfg(windows)]
         {
             if buffer_config.process_mode == ProcessMode::Offline {
@@ -212,27 +221,45 @@ impl Plugin for VcRvcPlugin {
             } else if self.hotkeys.is_none() {
                 match hotkeys::HotkeyWorker::start(self.params.clone(), self.reload_waker.clone()) {
                     Ok(worker) => self.hotkeys = Some(worker),
-                    Err(error) => { self.params.diagnostics.event("ERROR", &format!("Shortcut thread start: {error}")); nice_plug::nice_error!("voicebank: shortcut thread start failed: {error}"); },
+                    Err(error) => {
+                        self.params
+                            .diagnostics
+                            .event("ERROR", &format!("Shortcut thread start: {error}"));
+                        nice_plug::nice_error!("voicebank: shortcut thread start failed: {error}");
+                    }
                 }
             }
         }
 
         #[cfg(windows)]
-        if !cfg!(test) && buffer_config.process_mode != ProcessMode::Offline && self.http_control.is_none() {
+        if !cfg!(test)
+            && buffer_config.process_mode != ProcessMode::Offline
+            && self.http_control.is_none()
+        {
             match http_control::HttpControl::start(self.params.clone(), self.reload_waker.clone()) {
                 Ok(control) => self.http_control = Some(control),
-                Err(error) => self.params.diagnostics.event("HTTP_ERROR", &format!("127.0.0.1:18765: {error}")),
+                Err(error) => self
+                    .params
+                    .diagnostics
+                    .event("HTTP_ERROR", &format!("127.0.0.1:18765: {error}")),
             }
         }
         let sample_rate = buffer_config.sample_rate.round() as u32;
-        self.params.diagnostics.host_sample_rate.store(sample_rate as u64,Ordering::Relaxed);
+        self.params
+            .diagnostics
+            .host_sample_rate
+            .store(sample_rate as u64, Ordering::Relaxed);
         let max_block = buffer_config.max_buffer_size as usize;
         self.echo = Some(echo::HoldEcho::new(sample_rate));
         self.was_original = self.params.selected_voice() == 0;
         self.last_host_latency = None;
         if let Some(runtime) = self.runtime.as_mut() {
             if runtime.reconfigure(sample_rate, max_block, buffer_config.process_mode) {
-                let latency = if self.was_original { 0 } else { runtime.current_latency() };
+                let latency = if self.was_original {
+                    0
+                } else {
+                    runtime.current_latency()
+                };
                 context.set_latency_samples(latency);
                 self.last_host_latency = Some(latency);
                 return true;
@@ -258,7 +285,11 @@ impl Plugin for VcRvcPlugin {
             buffer_config.process_mode,
             applied_settings,
         );
-        let latency = if self.was_original { 0 } else { runtime.latency_samples };
+        let latency = if self.was_original {
+            0
+        } else {
+            runtime.latency_samples
+        };
         context.set_latency_samples(latency);
         self.last_host_latency = Some(latency);
         self.runtime = Some(runtime);
@@ -271,15 +302,23 @@ impl Plugin for VcRvcPlugin {
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        if !cfg!(test) { self.params.audio_seen.store(true, Ordering::Release); }
-        let requested=self.params.selected_voice();
-        let fallback=self.runtime.as_ref().is_some_and(|r|r.realtime() && (!r.converter_ready() || !self.params.voice_loaded(requested)));
+        if !cfg!(test) {
+            self.params.audio_seen.store(true, Ordering::Release);
+        }
+        let requested = self.params.selected_voice();
+        let fallback = self.runtime.as_ref().is_some_and(|r| {
+            r.realtime() && (!r.converter_ready() || !self.params.voice_loaded(requested))
+        });
         // A missing or failed model must never mute the microphone indefinitely.
         // The HTTP screen reports fallback separately from the requested voice.
         let original = requested == 0 || fallback;
         if original != self.was_original {
-            if let Some(runtime) = self.runtime.as_mut() { runtime.reset(); }
-            if let Some(echo) = self.echo.as_mut() { echo.clear(); }
+            if let Some(runtime) = self.runtime.as_mut() {
+                runtime.reset();
+            }
+            if let Some(echo) = self.echo.as_mut() {
+                echo.clear();
+            }
             self.was_original = original;
         }
         let latency = if original {
@@ -293,27 +332,40 @@ impl Plugin for VcRvcPlugin {
             runtime.process_block(buffer.as_slice());
             runtime.current_latency()
         } else {
-            for channel in buffer.as_slice() { channel.fill(0.0); }
+            for channel in buffer.as_slice() {
+                channel.fill(0.0);
+            }
             0
         };
-        self.params.diagnostics.host_latency_samples.store(latency as u64,Ordering::Relaxed);
+        self.params
+            .diagnostics
+            .host_latency_samples
+            .store(latency as u64, Ordering::Relaxed);
         if self.last_host_latency != Some(latency) {
             context.set_latency_samples(latency);
             self.last_host_latency = Some(latency);
         }
         if let Some(echo) = self.echo.as_mut() {
-            echo.process(buffer.as_slice(), self.params.echo_held.load(Ordering::Acquire) || self.params.echo_hotkey.load(Ordering::Acquire));
+            echo.process(
+                buffer.as_slice(),
+                self.params.echo_held.load(Ordering::Acquire)
+                    || self.params.echo_hotkey.load(Ordering::Acquire),
+            );
         }
         if original {
             ProcessStatus::Normal
         } else {
-            self.runtime.as_ref().and_then(PluginRuntime::tail_samples)
+            self.runtime
+                .as_ref()
+                .and_then(PluginRuntime::tail_samples)
                 .map_or(ProcessStatus::Normal, ProcessStatus::Tail)
         }
     }
 
     fn reset(&mut self) {
-        if let Some(echo) = self.echo.as_mut() { echo.clear(); }
+        if let Some(echo) = self.echo.as_mut() {
+            echo.clear();
+        }
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.reset();
         }
@@ -321,17 +373,22 @@ impl Plugin for VcRvcPlugin {
 
     fn deactivate(&mut self) {
         #[cfg(windows)]
-        { self.http_control = None; self.hotkeys = None; }
+        {
+            self.http_control = None;
+            self.hotkeys = None;
+        }
         self.params.audio_seen.store(false, Ordering::Release);
-        self.params.loaded_voice_mask.store(0,Ordering::Release);
-        self.params.active_voice.store(0,Ordering::Release);
+        self.params.loaded_voice_mask.store(0, Ordering::Release);
+        self.params.active_voice.store(0, Ordering::Release);
         self.params.echo_hotkey.store(false, Ordering::Release);
         self.applied_settings = self
             .runtime
             .as_ref()
             .and_then(PluginRuntime::applied_settings);
         self.runtime = None;
-        self.params.diagnostics.event("DEACTIVATE", &self.params.diagnostics.counters());
+        self.params
+            .diagnostics
+            .event("DEACTIVATE", &self.params.diagnostics.counters());
         self.echo = None;
         self.params.echo_held.store(false, Ordering::Release);
         self.reload.store(false, Ordering::SeqCst);
