@@ -620,6 +620,13 @@ extern "C" NativeEngine* vc_rs_trt_engine_create(
     return native.release();
 }
 
+extern "C" int vc_rs_trt_memory_info(int32_t device, std::size_t* free, std::size_t* total) {
+    if (!free || !total) { return static_cast<int>(cudaErrorInvalidValue); }
+    auto status = cudaSetDevice(device);
+    if (status != cudaSuccess) { return static_cast<int>(status); }
+    return static_cast<int>(cudaMemGetInfo(free,total));
+}
+
 extern "C" void vc_rs_trt_engine_destroy(NativeEngine* native) {
     delete native;
 }

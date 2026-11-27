@@ -34,6 +34,7 @@ pub enum GpuPriority {
 }
 
 pub use api::{ContentDelay, ModelOutput, PassthroughModel, VoiceModel};
+pub use native_tensorrt::native_gpu_memory;
 pub use cache::{
     clear_engine_cache, engine_cache_info, engine_cache_root, ClearedEngineCache, EngineCacheEntry,
     EngineCacheInfo, ENGINE_CACHE_DIR_ENV,

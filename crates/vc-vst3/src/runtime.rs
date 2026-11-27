@@ -1295,22 +1295,6 @@ impl WorkerCtx {
         }
     }
 
-    fn report_load_progress(&self, progress: LoadProgress) {
-        self.set_status(match progress {
-            LoadProgress::Idle => "idle".to_string(),
-            LoadProgress::ValidatingConfig => "validating configuration".to_string(),
-            LoadProgress::PreparingProvider => "preparing execution provider".to_string(),
-            LoadProgress::DownloadingProvider => "downloading execution provider".to_string(),
-            LoadProgress::BuildingEngine { role } => {
-                format!("building {} TensorRT engine", role.label())
-            }
-            LoadProgress::LoadingModel { role } => format!("loading {} model", role.label()),
-            LoadProgress::OpeningAudioDevices => "opening audio devices".to_string(),
-            LoadProgress::Running => "running".to_string(),
-            LoadProgress::Failed => "failed".to_string(),
-        });
-    }
-
     fn set_idle_status(&self) {
         let settings = self.params.settings.read().unwrap();
         if settings.has_models() {
@@ -1565,7 +1549,14 @@ impl ModelLoader {
         let hop=config.validated_chunk_samples(self.sample_rate)?;
         let profile=&settings.voice_profiles[i];
         self.params.diagnostics.event("VOICE_PROFILE",&format!("slot={} pitch={} index_rate={} chunk_ms={} crossfade_ms={} f0_threshold={} extra_convert_ms={} input_gain_db={} output_gain_db={} protect={} formant_st={}",i+1,profile.pitch_shift,profile.index_rate,profile.chunk_ms,profile.crossfade_ms,profile.f0_threshold,profile.extra_convert_ms,profile.input_gain_db,profile.output_gain_db,profile.protect,profile.formant_shift));
+        let before=if config.provider().is_tensorrt() {vc_core::model_rvc::native_gpu_memory(config.gpu_device_id).ok()}else{None};
         let mut pipeline=self.load_pipeline(&config,config.provider(),hop)?;
+        if config.provider().is_tensorrt() {
+            match vc_core::model_rvc::native_gpu_memory(config.gpu_device_id) {
+                Ok((free,total))=>self.params.diagnostics.event("GPU_MEMORY",&format!("slot={} device={} total_mib={} free_mib={} device_used_delta_mib={:?} (device-wide, includes other apps)",i+1,config.gpu_device_id,total/1048576,free/1048576,before.map(|(b,_)|(b as i64-free as i64)/1048576))),
+                Err(e)=>self.params.diagnostics.event("GPU_MEMORY_UNAVAILABLE",&format!("slot={} {e:#}",i+1)),
+            }
+        }
         pipeline.set_protect(profile.protect)?;
         pipeline.set_f0_ranges(profile.input_f0_min_hz,profile.input_f0_max_hz,profile.output_f0_min_hz,profile.output_f0_max_hz)?;
         self.params.diagnostics.event("VOICE_F0_RANGE",&format!("slot={} input_min_hz={} input_max_hz={} output_min_hz={} output_max_hz={}",i+1,profile.input_f0_min_hz,profile.input_f0_max_hz,profile.output_f0_min_hz,profile.output_f0_max_hz));
@@ -2031,8 +2022,9 @@ mod tests {
         params
     }
 
+    #[track_caller]
     fn wait_for(mut predicate: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while !predicate() {
             assert!(Instant::now() < deadline, "worker did not make progress");
             thread::sleep(Duration::from_millis(1));

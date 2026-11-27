@@ -6,6 +6,8 @@ on:
       - '.github/workflows/voicebank-stage05-startup.yml'
       - 'crates/vc-vst3/src/runtime.rs'
       - 'crates/vc-core/src/model_rvc/sessions.rs'
+      - 'crates/vc-core/src/model_rvc/native_tensorrt.rs'
+      - 'crates/vc-vst3/src/voice_bank.rs'
 permissions:
   contents: read
 env:
@@ -23,3 +25,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p vc-vst3 --no-default-features --features tensorrt --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          for ($i=0;$i -lt 5;$i++) {
+            cargo test -p vc-vst3 --no-default-features --features tensorrt --locked same_hop_switch_retains_queued_output_and_partial_input -- --nocapture
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
