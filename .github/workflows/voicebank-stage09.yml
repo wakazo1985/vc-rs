@@ -4,6 +4,8 @@ on:
   push:
     paths:
       - '.github/workflows/voicebank-stage09.yml'
+      - 'crates/vc-vst3/src/diagnostics.rs'
+      - 'crates/vc-vst3/src/dll_path.rs'
 permissions:
   contents: read
 env:

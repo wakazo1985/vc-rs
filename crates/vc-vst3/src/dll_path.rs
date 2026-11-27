@@ -15,7 +15,7 @@
 //! builds use the traditional ORT CUDA EP packaging.
 
 #[cfg(windows)]
-fn plugin_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn plugin_dir() -> Option<std::path::PathBuf> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use std::path::PathBuf;

@@ -114,8 +114,15 @@ impl VcRvcParams {
         let mut config = self.settings.read().unwrap().clone();
         config.startup_voice = self.selected_voice();
         match crate::diagnostics::save_profile(&config) {
-            Ok(()) => self.diagnostics.event("SETTINGS_SAVED", "Local settings backup updated"),
-            Err(error) => self.diagnostics.event("ERROR", &format!("Save local settings: {error:#}")),
+            Ok(()) => {
+                self.diagnostics.set_profile_error(None);
+                self.diagnostics.event("SETTINGS_SAVED", "VST3 folder settings updated");
+            }
+            Err(error) => {
+                let detail = format!("Save settings in VST3 folder: {error:#}");
+                self.diagnostics.set_profile_error(Some(detail.clone()));
+                self.diagnostics.event("ERROR", &detail);
+            },
         }
     }
 }

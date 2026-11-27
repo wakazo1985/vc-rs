@@ -264,7 +264,7 @@ fn draw_hotkeys(ui: &mut egui::Ui, state: &EditorState) {
 
 fn draw_diagnostics(ui: &mut egui::Ui, setter: &ParamSetter, state: &EditorState) {
     egui::CollapsingHeader::new("Settings backup / Diagnostics").show(ui, |ui| {
-        ui.label("Local settings");
+        ui.label("Settings in VST3 folder");
         let path = crate::diagnostics::profile_path().map(|p|p.display().to_string()).unwrap_or_else(|| "Unavailable".into());
         ui.monospace(&path);
         let loading = state.loading.load(Ordering::Acquire);
@@ -319,7 +319,10 @@ fn draw_diagnostics(ui: &mut egui::Ui, setter: &ParamSetter, state: &EditorState
         if let Some(error) = state.params.diagnostics.error() {
             ui.colored_label(egui::Color32::RED, format!("Log write failed: {error}"));
         }
-        ui.small("Only settings and numeric measurements are stored; no recorded microphone audio.");
+        if let Some(error) = state.params.diagnostics.profile_error() {
+            ui.colored_label(egui::Color32::RED, error);
+        }
+        ui.small("The VST3 folder must be writable. No AppData fallback. Only settings and numeric measurements are stored; no microphone recording.");
     });
 }
 
