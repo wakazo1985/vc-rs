@@ -1240,7 +1240,7 @@ impl RvcPipeline {
         }
         let index = super::retrieval::RetrievalIndex::load(path)?;
         ensure!(
-            i64::try_from(index.dimension())? == i64::from(self.rvc.expected_feat_channels),
+            i64::try_from(index.dimension())? == self.rvc.expected_feat_channels,
             "INDEX dimension differs from RVC model"
         );
         self.retrieval = Some(index);

@@ -59,8 +59,8 @@ impl<R: Read> Reader<R> {
         while remaining > 0 {
             let count = remaining.min(buf.len() / 4);
             self.take(&mut buf[..count * 4])?;
-            for b in buf[..count * 4].chunks_exact(4) {
-                let x = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            for b in buf[..count * 4].as_chunks::<4>().0 {
+                let x = f32::from_le_bytes(*b);
                 ensure!(x.is_finite(), "INDEX contains nonfinite value");
                 values.push(x);
             }
@@ -216,7 +216,7 @@ impl RetrievalIndex {
     }
     pub(super) fn blend(&self, features: &mut [f32], rate: f32) -> Result<()> {
         ensure!(
-            features.len() % self.dim == 0,
+            features.len().is_multiple_of(self.dim),
             "INDEX features not frame aligned"
         );
         if rate == 0.0 {
