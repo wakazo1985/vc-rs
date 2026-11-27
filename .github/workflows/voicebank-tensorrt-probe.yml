@@ -15,21 +15,6 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - name: Acquire official NVIDIA SDK
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $url = 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/11.2.1/zip/TensorRT-Enterprise-11.2.1.2-Windows-amd64-cuda-13.3-Release-external.zip'
-          $zip = Join-Path $env:RUNNER_TEMP 'tensorrt.zip'
-          curl.exe --fail --location --retry 2 --output $zip $url
-          if ($LASTEXITCODE -ne 0) { throw 'Official TensorRT SDK download failed; NVIDIA authentication may be required.' }
-          New-Item -ItemType Directory -Force external/nvidia | Out-Null
-          7z x $zip "-o$PWD\external\nvidia" -y
-          if ($LASTEXITCODE -ne 0) { throw 'TensorRT SDK archive extraction failed.' }
-          . scripts/tensorrt-sdk.ps1
-          $sdk = Resolve-TensorRtSdk -RepoRoot $PWD.Path
-          if (-not $sdk) { throw 'TensorRT SDK headers, import libraries or runtime DLLs missing.' }
-          "TENSORRT_ROOT=$($sdk.Root)" >> $env:GITHUB_ENV
       - name: Extract verified official CUDA component archives
         shell: pwsh
         run: |
@@ -38,7 +23,7 @@ jobs:
           $manifest=Invoke-RestMethod "$base/redistrib_13.3.1.json"
           $root=Join-Path $env:RUNNER_TEMP 'CUDA/v13.3'
           New-Item -ItemType Directory -Force $root | Out-Null
-          foreach ($component in @('cuda_cudart','cuda_crt','cuda_nvcc','cuda_cccl')) {
+          foreach ($component in @('cuda_cudart','cuda_crt','cuda_nvcc','cccl')) {
             $entry=$manifest.$component.'windows-x86_64'
             if (!$entry.relative_path -or !$entry.sha256) { throw "Missing official manifest entry: $component" }
             $archive=Join-Path $env:RUNNER_TEMP "$component.zip"
@@ -71,6 +56,21 @@ jobs:
           }
           "CUDA_PATH=$root" >> $env:GITHUB_ENV
           "CUDA_HOME=$root" >> $env:GITHUB_ENV
+      - name: Acquire official NVIDIA SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/11.2.1/zip/TensorRT-Enterprise-11.2.1.2-Windows-amd64-cuda-13.3-Release-external.zip'
+          $zip = Join-Path $env:RUNNER_TEMP 'tensorrt.zip'
+          curl.exe --fail --location --retry 2 --output $zip $url
+          if ($LASTEXITCODE -ne 0) { throw 'Official TensorRT SDK download failed; NVIDIA authentication may be required.' }
+          New-Item -ItemType Directory -Force external/nvidia | Out-Null
+          7z x $zip "-o$PWD\external\nvidia" -y
+          if ($LASTEXITCODE -ne 0) { throw 'TensorRT SDK archive extraction failed.' }
+          . scripts/tensorrt-sdk.ps1
+          $sdk = Resolve-TensorRtSdk -RepoRoot $PWD.Path
+          if (-not $sdk) { throw 'TensorRT SDK headers, import libraries or runtime DLLs missing.' }
+          "TENSORRT_ROOT=$($sdk.Root)" >> $env:GITHUB_ENV
       - name: Build native core and RVC smoke tests
         shell: pwsh
         run: |
