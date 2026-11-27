@@ -17,7 +17,7 @@ jobs:
         run: |
           rustup toolchain install --no-self-update
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo install cargo-about --version 0.8.4 --locked --features cli
+          cargo install cargo-about --version 0.8.4 --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package original Windows ML VST3
         shell: pwsh
@@ -68,7 +68,7 @@ jobs:
         run: |
           rustup toolchain install --no-self-update
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo install cargo-about --version 0.8.4 --locked --features cli
+          cargo install cargo-about --version 0.8.4 --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package original native TensorRT VST3
         shell: pwsh
