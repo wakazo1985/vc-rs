@@ -70,7 +70,7 @@ jobs:
           sources=[
               ("toddler","https://huggingface.co/VofVoices/maxwell-young-fantastic-max-RVC-v2/resolve/main/"+quote("maxwellyoung(FantasticMax).zip"),160446052),
               ("girl","https://amitaro.net/download/others/rvc_amitaro_runrun_1.0.zip",365440882),
-              ("robot candidate","https://huggingface.co/juuxn/RVCModels/resolve/75fc6d2/speakandspell2333333.zip",96253214),
+              ("robot original-name candidate","https://huggingface.co/analogspiderweb/analogspiderweb_RVC/resolve/17a331f0ecdc9cbb52b0b7d599b36300a38fc413/speakandspell.zip",96253214),
           ]
           for name,url,expected in sources:
               print("\nSOURCE",name,url)
