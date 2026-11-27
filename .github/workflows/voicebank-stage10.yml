@@ -23,7 +23,7 @@ jobs:
       - name: Core DSP and ONNX contract tests
         shell: pwsh
         run: |
-          cargo test -p vc-core --no-default-features --locked
+          cargo test -p vc-core --no-default-features --features ort --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Plugin realtime, echo, settings and shortcut tests
         shell: pwsh
