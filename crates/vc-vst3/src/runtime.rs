@@ -1075,10 +1075,14 @@ impl WorkerCtx {
                     Err(e) => { errors.push(format!("{}: {e}",LABELS[i])); continue; }
                 };
                 let profile = &settings.voice_profiles[i];
-                self.params.diagnostics.event("VOICE_PROFILE", &format!("slot={} pitch={} index_rate={} chunk_ms={} crossfade_ms={} f0_threshold={} extra_convert_ms={} input_gain_db={} output_gain_db={} protect={} formant_reserved={}", i+1, profile.pitch_shift,profile.index_rate,profile.chunk_ms,profile.crossfade_ms,profile.f0_threshold,profile.extra_convert_ms,profile.input_gain_db,profile.output_gain_db,profile.protect,profile.formant_shift));
+                self.params.diagnostics.event("VOICE_PROFILE", &format!("slot={} pitch={} index_rate={} chunk_ms={} crossfade_ms={} f0_threshold={} extra_convert_ms={} input_gain_db={} output_gain_db={} protect={} formant_st={}", i+1, profile.pitch_shift,profile.index_rate,profile.chunk_ms,profile.crossfade_ms,profile.f0_threshold,profile.extra_convert_ms,profile.input_gain_db,profile.output_gain_db,profile.protect,profile.formant_shift));
                 match self.load_pipeline(&config, config.provider(), hop) {
                     Ok(mut pipeline) => {
                         if let Err(e) = pipeline.set_protect(profile.protect) {
+                            errors.push(format!("{}: {e}", LABELS[i]));
+                            continue;
+                        }
+                        if let Err(e) = pipeline.set_formant_shift(profile.formant_shift) {
                             errors.push(format!("{}: {e}", LABELS[i]));
                             continue;
                         }

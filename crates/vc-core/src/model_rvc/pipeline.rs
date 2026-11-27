@@ -251,6 +251,8 @@ pub struct RvcPipeline {
     quality_report: String,
     quality_enabled: bool,
     prevent_hard_clip: bool,
+    formant: Option<super::formant::Formant>,
+    formant_shift: f32,
     input_reference_scratch: Vec<f32>,
     rms_mix_scratch: dsp::RmsMixScratch,
     pitchf_untrimmed_scratch: Vec<f32>,
@@ -689,6 +691,8 @@ impl RvcPipeline {
             quality_report: String::new(),
             quality_enabled: false,
             prevent_hard_clip: false,
+            formant: None,
+            formant_shift: 0.0,
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -1204,6 +1208,8 @@ impl RvcPipeline {
             quality_report: String::new(),
             quality_enabled: false,
             prevent_hard_clip: false,
+            formant: None,
+            formant_shift: 0.0,
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -1237,6 +1243,12 @@ impl RvcPipeline {
     pub fn set_quality_diagnostics(&mut self, enabled: bool) { self.quality_enabled = enabled; }
     /// VoiceBank opt-in: preserve the shape of over-range model and RMS-mixed audio.
     pub fn set_peak_protection(&mut self, enabled: bool) { self.prevent_hard_clip = enabled; }
+    pub fn set_formant_shift(&mut self, shift: f32) -> Result<()> {
+        ensure!(shift.is_finite() && (-12.0..=12.0).contains(&shift), "Invalid formant shift");
+        self.formant = if shift == 0.0 { None } else { Some(super::formant::Formant::new(self.rvc_sample_rate, shift)?) };
+        self.formant_shift = shift;
+        Ok(())
+    }
     pub fn quality_report(&self) -> &str { &self.quality_report }
     pub fn set_pitch_shift(&mut self, pitch_shift: f32) {
         self.pitch_shift = pitch_shift;
@@ -1719,6 +1731,13 @@ impl VoiceModel for RvcPipeline {
         );
         keep_tail_in_place(out_audio, stream_input.out_size);
         pitchf_tail_for_output_into(pitchf, out_audio.len(), self.rvc_sample_rate, out_pitchf);
+        // The candidate includes join overlap, and formant correction does not
+        // change its length, pitch frame grid, or TensorRT engine shape.
+        if let Some(formant) = self.formant.as_mut() { formant.process(out_audio)?; }
+        if self.quality_enabled {
+            use std::fmt::Write as _;
+            let _ = write!(self.quality_report, " formant_st={} after_formant={:?}", self.formant_shift, signal_quality(out_audio));
+        }
         let output_envelope = if self.volume_envelope {
             stream_input.volume.sqrt().clamp(0.0, 1.0)
         } else {
@@ -1727,7 +1746,10 @@ impl VoiceModel for RvcPipeline {
         let envelope_gain = if self.prevent_hard_clip {
             peak_safe_gain(out_audio, output_envelope)
         } else { output_envelope };
-        dsp::clamp_scale_in_place(out_audio, envelope_gain);
+        if self.prevent_hard_clip {
+            // clamp_scale_in_place clips BEFORE scaling; that would defeat peak protection.
+            dsp::apply_gain_and_rms(out_audio, envelope_gain);
+        } else { dsp::clamp_scale_in_place(out_audio, envelope_gain); }
         let before_rms_mix = self.quality_enabled.then(|| signal_quality(out_audio));
         if self.rms_mix_rate < 1.0 {
             // Captured before apply_rms_mix mutates `out_audio`, but only used
