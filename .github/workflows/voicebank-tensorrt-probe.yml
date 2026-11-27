@@ -4,7 +4,13 @@ on:
   push:
     paths:
       - '.github/workflows/voicebank-tensorrt-probe.yml'
-      - 'crates/vc-core/src/model_rvc/native_tensorrt_shim.cpp'
+      - 'crates/vc-core/src/**'
+      - 'crates/vc-vst3/**'
+      - 'crates/vc-cli/**'
+      - 'crates/vc-convert/**'
+      - 'Cargo.lock'
+      - 'scripts/voicebank-benchmark.ps1'
+      - 'docs/voicebank-final-ja.md'
 permissions:
   contents: read
 env:
