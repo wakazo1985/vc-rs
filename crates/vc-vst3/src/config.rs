@@ -176,8 +176,10 @@ impl PluginConfig {
             Some(provider) if provider.is_cuda() || provider.is_tensorrt() => {
                 gpu_provider(provider.label())
             }
-            Some(provider) => provider,
-            None => Provider::Cpu,
+            Some(provider) if provider.available_in_build() => provider,
+            // A persisted Windows ML/CPU choice must never invoke an absent
+            // backend in the native TensorRT-only replacement package.
+            Some(_) | None => vc_core::default_provider(),
         }
     }
 
@@ -377,6 +379,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(windows, feature = "windowsml"))]
     #[test]
     fn openvino_device_selection_survives_plugin_state_round_trip() {
         for name in [
@@ -393,6 +396,15 @@ mod tests {
         }
     }
     use super::*;
+
+    #[cfg(all(feature = "tensorrt", not(any(feature = "cuda", feature = "windowsml"))))]
+    #[test]
+    fn old_windowsml_profile_uses_native_tensorrt() {
+        for name in ["windowsml", "windowsml-directml", "windowsml-cpu", "cpu", "cuda", "tensorrt"] {
+            let config: PluginConfig = toml::from_str(&format!("provider = '{name}'")).unwrap();
+            assert_eq!(config.provider(), Provider::TensorRt);
+        }
+    }
 
     #[test]
     fn gpu_priority_defaults_high_and_parses_normal() {

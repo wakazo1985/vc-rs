@@ -1381,7 +1381,27 @@ pub(super) fn tensor_rt_profile_shapes(inputs: &[TensorRtInputShape]) -> String 
         .join(",")
 }
 
+thread_local! {
+    static LOCAL_ENGINE_CACHE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Apply a bundle-local engine-cache path only on the current loading thread.
+pub fn with_engine_cache_root<T>(root: &Path, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LOCAL_ENGINE_CACHE.with(|cell| { cell.replace(self.0.take()); });
+        }
+    }
+    let previous = LOCAL_ENGINE_CACHE.with(|cell| cell.replace(Some(root.to_path_buf())));
+    let _restore = Restore(previous);
+    f()
+}
+
 pub(super) fn tensor_rt_cache_root() -> Result<PathBuf> {
+    if let Some(root) = LOCAL_ENGINE_CACHE.with(|cell| cell.borrow().clone()) {
+        return Ok(root);
+    }
     let override_dir = env::var_os(TENSORRT_CACHE_DIR_ENV);
     tensor_rt_cache_root_from_override(override_dir.as_deref())
 }

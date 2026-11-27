@@ -691,7 +691,7 @@ impl WorkerCtx {
         let mut last_profile_flush = std::time::Instant::now();
         let mut last_chunk_log = std::time::Instant::now();
         let mut last_selection = self.params.selected_voice();
-        self.params.diagnostics.event("WORKER_START", &format!("rate={} provider={}", self.sample_rate, initial_settings.provider));
+        self.params.diagnostics.event("WORKER_START", &format!("rate={} provider={}", self.sample_rate, initial_settings.provider().label()));
         let initial_chunk = initial_settings.validated_chunk_samples(self.sample_rate);
         // Invalid persisted settings never load a model. The fallback only
         // sizes the idle/silent worker until the user submits valid settings.
@@ -1222,6 +1222,18 @@ impl WorkerCtx {
         provider: vc_core::Provider,
         chunk_samples: usize,
     ) -> anyhow::Result<RvcPipeline> {
+        if provider.is_tensorrt() {
+            // Engine creation runs on this worker, never the audio thread.
+            // Keep derived engines inside this plugin's folder, without
+            // mutating the host process environment or global DLL search.
+            if let Some(root) = crate::diagnostics::local_dir() {
+                let cache = root.join("engine-cache");
+                self.params.diagnostics.event("TENSORRT_CACHE", &cache.display().to_string());
+                return vc_core::model_rvc::with_engine_cache_root(&cache, || {
+                    self.load_pipeline_inner(settings, provider, chunk_samples)
+                });
+            }
+        }
         if provider.is_cuda() {
             // This is deliberately on the worker's explicit Load / Reload path,
             // not plugin initialization or the realtime callback. It prevents a

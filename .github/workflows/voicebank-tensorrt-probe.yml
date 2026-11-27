@@ -109,6 +109,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           'GPU_INFERENCE_TESTS_PASSED' | Tee-Object -FilePath gpu-result.txt
           Add-Content $env:GITHUB_STEP_SUMMARY 'Native RVC GPU smoke tests passed.'
+      - name: Test saved provider migration
+        shell: pwsh
+        run: |
+          . scripts/activate.ps1
+          cargo test -p vc-vst3 --no-default-features --features tensorrt --locked old_windowsml_profile_uses_native_tensorrt -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build integrated VST3 using native TensorRT
         shell: pwsh
         run: |
@@ -117,6 +123,47 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (!(Test-Path 'target/bundled/vc-vst3.vst3/Contents/x86_64-win/vc-vst3.vst3')) { throw 'VST3 binary missing' }
           Write-Host 'VST3_NATIVE_BUILD_OK'
+      - name: Package TensorRT runtime and engine builder with existing VoiceBank features
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          . scripts/activate.ps1
+          $helper=(Resolve-Path 'tools/tensorrt_builder/target/release/vc-tensorrt-builder.exe').Path
+          pwsh -File crates/vc-vst3/package-tensorrt.ps1 -BuilderExe $helper
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build -p vc-convert --example voicebank_convert --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $stage='release/RVCVoiceBank-TensorRT'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target/bundled/vc-vst3.vst3 $stage/ -Recurse
+          $bundle=Join-Path $stage 'vc-vst3.vst3'
+          $bin=Join-Path $bundle 'Contents/x86_64-win'
+          foreach ($dll in @('nvinfer_11.dll','nvinfer_plugin_11.dll','nvonnxparser_11.dll','cudart64_13.dll','vc-tensorrt-builder.exe','vc-vst3.vst3')) {
+            if (!(Test-Path (Join-Path $bin $dll))) { throw "Missing runtime file $dll" }
+          }
+          if (!(Get-ChildItem $bin -Filter 'nvinfer_builder_resource_*_11.dll')) { throw 'Missing engine builder resources' }
+          if (Get-ChildItem $bin -Filter '*WindowsAppRuntime*') { throw 'Unexpected Windows App SDK dependency' }
+          foreach ($slot in @('toddler','girl','male','robot','common')) {
+            $folder=Join-Path $bundle "models/$slot"
+            New-Item -ItemType Directory -Force $folder | Out-Null
+            'Keep your existing ONNX/PTH/INDEX files here.' | Set-Content "$folder/README.txt"
+          }
+          $tools=Join-Path $bundle 'tools'
+          New-Item -ItemType Directory -Force $tools | Out-Null
+          Copy-Item target/release/examples/voicebank_convert.exe $tools/
+          Copy-Item crates/vc-convert/LICENSE-*.txt $tools/
+          Copy-Item crates/vc-convert/THIRD_PARTY.md $tools/
+          Copy-Item crates/vc-vst3/src/control.html $stage/
+          Copy-Item LICENSE $stage/
+          Get-Content -LiteralPath docs/voicebank-final-ja.md -Raw -Encoding UTF8 | Set-Content -LiteralPath "$stage/使い方.txt" -Encoding utf8BOM
+          Copy-Item gpu-result.txt "$stage/GPU検証結果.txt"
+          Get-ChildItem $bin -File | Select-Object Name,Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RVCVoiceBank-TensorRT
+          path: release/RVCVoiceBank-TensorRT/
+          compression-level: 0
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: always()
         with:

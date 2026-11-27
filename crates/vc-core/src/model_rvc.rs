@@ -49,6 +49,7 @@ pub use pipeline::{
     F0Config, InputDenoiserConfig, LiveParams, LoadModelRole, LoadProgress, NoiseGateShaping,
     OutputDynamicsConfig, PreparedInputDenoiser, RvcPipeline, RvcPipelineConfig,
 };
+pub use tensorrt::with_engine_cache_root;
 pub use process_priority::{set_process_gpu_priority, set_process_power_throttling};
 
 #[cfg(test)]
