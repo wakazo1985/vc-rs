@@ -20,6 +20,8 @@ mod voice_bank;
 mod echo;
 mod hotkeys;
 mod diagnostics;
+#[cfg(windows)]
+mod http_control;
 
 // Share the standalone GUI's test-only renderer to exercise both real editors
 // with the same Vulkan setup, without changing shipped plugin dependencies.
@@ -72,6 +74,8 @@ pub struct VcRvcPlugin {
     echo: Option<echo::HoldEcho>,
     #[cfg(windows)]
     hotkeys: Option<hotkeys::HotkeyWorker>,
+    #[cfg(windows)]
+    http_control: Option<http_control::HttpControl>,
     was_original: bool,
     last_host_latency: Option<u32>,
     /// GUI → worker: request a pipeline rebuild from the current settings.
@@ -102,6 +106,8 @@ impl Default for VcRvcPlugin {
             echo: None,
             #[cfg(windows)]
             hotkeys: None,
+            #[cfg(windows)]
+            http_control: None,
             was_original: false,
             last_host_latency: None,
             reload: Arc::new(AtomicBool::new(false)),
@@ -201,6 +207,7 @@ impl Plugin for VcRvcPlugin {
         {
             if buffer_config.process_mode == ProcessMode::Offline {
                 self.hotkeys = None;
+                self.http_control = None;
             } else if self.hotkeys.is_none() {
                 match hotkeys::HotkeyWorker::start(self.params.clone(), self.reload_waker.clone()) {
                     Ok(worker) => self.hotkeys = Some(worker),
@@ -209,6 +216,13 @@ impl Plugin for VcRvcPlugin {
             }
         }
 
+        #[cfg(windows)]
+        if !cfg!(test) && buffer_config.process_mode != ProcessMode::Offline && self.http_control.is_none() {
+            match http_control::HttpControl::start(self.params.clone(), self.reload_waker.clone()) {
+                Ok(control) => self.http_control = Some(control),
+                Err(error) => self.params.diagnostics.event("HTTP_ERROR", &format!("127.0.0.1:18765: {error}")),
+            }
+        }
         let sample_rate = buffer_config.sample_rate.round() as u32;
         let max_block = buffer_config.max_buffer_size as usize;
         self.echo = Some(echo::HoldEcho::new(sample_rate));
@@ -296,7 +310,7 @@ impl Plugin for VcRvcPlugin {
 
     fn deactivate(&mut self) {
         #[cfg(windows)]
-        { self.hotkeys = None; }
+        { self.http_control = None; self.hotkeys = None; }
         self.params.echo_hotkey.store(false, Ordering::Release);
         self.applied_settings = self
             .runtime

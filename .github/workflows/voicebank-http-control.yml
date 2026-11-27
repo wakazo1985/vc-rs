@@ -1,0 +1,54 @@
+name: VoiceBank HTTP control and HTML
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-http-control.yml'
+      - 'crates/vc-vst3/src/http_control.rs'
+      - 'crates/vc-vst3/src/control.html'
+permissions:
+  contents: read
+env:
+  VC_RS_ENABLE_NATIVE_TENSORRT: "0"
+  CARGO_TERM_COLOR: never
+jobs:
+  compile:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build Windows ML VST3
+        shell: pwsh
+        run: |
+          cargo xtask bundle vc-vst3 --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -File crates/vc-vst3/package-windowsml.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Include standalone control HTML
+        shell: pwsh
+        run: Copy-Item crates/vc-vst3/src/control.html target/bundled/vc-vst3.vst3/control.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voicebank-http-windowsml
+          path: target/bundled/vc-vst3.vst3/
+          if-no-files-found: error
+  tests:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run VST3 unit tests
+        shell: pwsh
+        run: |
+          cargo test -p vc-vst3 --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
