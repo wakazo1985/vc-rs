@@ -1,0 +1,77 @@
+name: Validate actual released TensorRT VST3 host loading
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-tensorrt-host-check.yml'
+permissions:
+  contents: read
+jobs:
+  host-check:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download exact public release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          curl.exe --fail --location --retry 2 --silent --show-error 'https://github.com/wakazo1985/vc-rs/releases/download/voicebank-tensorrt-rtx5070ti-20261127/RVCVoiceBank-TensorRT-RTX5070Ti.zip' -o release.zip
+          if ($LASTEXITCODE -ne 0) { throw 'Release download failed' }
+          7z x release.zip '-orelease-test' -y
+          if ($LASTEXITCODE -ne 0) { throw 'Release extraction failed' }
+          New-Item -ItemType Directory -Force host-logs | Out-Null
+      - name: Check Windows loader and VST3 exports without GPU
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $bundle=(Resolve-Path 'release-test/vc-vst3.vst3').Path
+          $dll=Join-Path $bundle 'Contents/x86_64-win/vc-vst3.vst3'
+          $source=@'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class VstLoad {
+            [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern IntPtr LoadLibraryEx(string path, IntPtr reserved, uint flags);
+            [DllImport("kernel32.dll", CharSet=CharSet.Ansi, SetLastError=true)]
+            public static extern IntPtr GetProcAddress(IntPtr module, string name);
+          }
+          '@
+          Add-Type -TypeDefinition $source
+          $h=[VstLoad]::LoadLibraryEx($dll,[IntPtr]::Zero,0x1100)
+          $err=[Runtime.InteropServices.Marshal]::GetLastWin32Error()
+          "MODULE_LOAD handle=$h win32=$err" | Tee-Object host-logs/loader.txt
+          if ($h -eq [IntPtr]::Zero) { throw "VST3 LoadLibraryEx failed: $err" }
+          foreach ($name in @('GetPluginFactory','InitDll','ExitDll')) {
+            $p=[VstLoad]::GetProcAddress($h,$name)
+            "EXPORT $name address=$p" | Tee-Object host-logs/loader.txt -Append
+            if ($p -eq [IntPtr]::Zero) { throw "Missing export: $name" }
+          }
+          $probe=Join-Path $bundle 'write-test.tmp'
+          [IO.File]::WriteAllText($probe,'test')
+          Remove-Item $probe
+          'BUNDLE_WRITE_OK' | Tee-Object host-logs/loader.txt -Append
+      - name: Build official Steinberg validator
+        shell: pwsh
+        run: |
+          pwsh -File scripts/install-vst3-validator.ps1 *> host-logs/validator-build.log
+          $code=$LASTEXITCODE
+          Get-Content host-logs/validator-build.log -Tail 40
+          if ($code -ne 0) { exit $code }
+      - name: Run actual host initialization
+        shell: pwsh
+        run: |
+          $v=Get-ChildItem external/steinberg/vst3sdk-build -Recurse -Filter validator.exe | Select-Object -First 1
+          if (!$v) { throw 'Validator missing' }
+          $bundle=(Resolve-Path 'release-test/vc-vst3.vst3').Path
+          & $v.FullName $bundle *> host-logs/validator.log
+          $code=$LASTEXITCODE
+          Get-Content host-logs/validator.log -Tail 100
+          if (Test-Path "$bundle/logs") { Copy-Item "$bundle/logs" host-logs/plugin-logs -Recurse; Get-ChildItem "$bundle/logs" -File | Select-String 'INITIALIZE|HTTP_START|HTTP_ERROR|HTTP_STOP' | Select-Object -First 30 }
+          if ($code -ne 0) { exit $code }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: released-vst3-host-check
+          path: host-logs/
+          if-no-files-found: warn
