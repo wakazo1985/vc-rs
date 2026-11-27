@@ -1,0 +1,37 @@
+name: Stage 01 reference SHA256 metadata
+on:
+  push:
+    branches: [rebuild-stage01-audit]
+    paths: ['.github/workflows/rebuild-stage01-hash.yml']
+permissions:
+  contents: read
+jobs:
+  reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Read published hashes, no model transfer
+        run: |
+          python - <<'PY'
+          import json, urllib.request
+          sources=[
+           ("toddler","VofVoices/maxwell-young-fantastic-max-RVC-v2","main","","maxwellyoung(FantasticMax).zip",160446052),
+           ("robot","analogspiderweb/analogspiderweb_RVC","17a331f0ecdc9cbb52b0b7d599b36300a38fc413","","speakandspell.zip",96253214),
+           ("D.pth","ttttdiva/rvc_okiba","main","/models/D","models/D/D.pth",55232523),
+           ("D.index","ttttdiva/rvc_okiba","main","/models/D","models/D/D.index",454130739)]
+          for name,repo,ref,folder,path,size in sources:
+              try:
+                  with urllib.request.urlopen("https://huggingface.co/api/models/"+repo+"/tree/"+ref+folder,timeout=20) as r:
+                      entries=json.load(r)
+                  e=next(e for e in entries if e["path"]==path)
+                  sha=e.get("lfs",{}).get("oid")
+                  print("REFERENCE",name,e.get("size"),sha,"size_match",e.get("size")==size,"public metadata only")
+              except Exception as e:
+                  print("ERROR",name,type(e).__name__,str(e))
+          try:
+              req=urllib.request.Request("https://amitaro.net/download/others/rvc_amitaro_runrun_1.0.zip",method="HEAD")
+              with urllib.request.urlopen(req,timeout=20) as r:
+                  print("GIRL_HEADERS",json.dumps({k:v for k,v in r.headers.items() if k.lower() in ("content-length","etag","digest","content-digest","repr-digest","last-modified")}))
+          except Exception as e: print("ERROR girl",type(e).__name__,str(e))
+          print("No original library files accessed. No identity verdict.")
+          PY
