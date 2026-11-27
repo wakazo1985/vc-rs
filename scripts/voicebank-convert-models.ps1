@@ -3,8 +3,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $exe = Join-Path $PSScriptRoot 'voicebank_convert.exe'
 $root = Join-Path $env:LOCALAPPDATA 'RVCVoiceBank'
-$models = Join-Path $root 'models'
-New-Item -ItemType Directory -Force -Path $models | Out-Null
+New-Item -ItemType Directory -Force -Path $root | Out-Null
 $log = Join-Path $root ('conversion-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
 $results = @()
 function Log([string]$message) {
@@ -21,7 +20,7 @@ $slots = @(
 )
 foreach ($slot in $slots) {
     $work = $null
-    $output = Join-Path $models ($slot.Key + '.onnx')
+    $output = $null
     try {
         Log ("SELECT: " + $slot.Name)
         $dialog = New-Object System.Windows.Forms.OpenFileDialog
@@ -33,6 +32,7 @@ foreach ($slot in $slots) {
                 throw 'Selection cancelled'
             }
             $inputPath = $dialog.FileName
+            $output = Join-Path ([IO.Path]::GetDirectoryName($inputPath)) ($slot.Key + '.onnx')
         } finally { $dialog.Dispose() }
         if (Test-Path -LiteralPath $output) { throw "Output exists; move it before reconverting: $output" }
         if ([IO.Path]::GetExtension($inputPath) -ieq '.zip') {

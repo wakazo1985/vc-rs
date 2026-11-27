@@ -80,7 +80,7 @@ jobs:
             'Run START_CONVERSION.cmd on Windows.',
             'Choose the original ZIP or PTH for each of the four requested voice slots.',
             'All conversion happens on your PC. No model is uploaded.',
-            'Outputs: %LOCALAPPDATA%\RVCVoiceBank\models',
+            'Outputs: next to the selected ZIP or PTH, as toddler.onnx, girl.onnx, male.onnx or robot.onnx.',
             'Results and detailed logs: %LOCALAPPDATA%\RVCVoiceBank',
             'RVC v2 with F0 only; incompatible checkpoints are rejected.',
             'Index files are preserved in your source files and are not converted by this tool.',
