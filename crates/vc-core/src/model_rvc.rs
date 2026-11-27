@@ -3,6 +3,7 @@ mod cache;
 mod chunk_converter;
 mod f0_postprocess;
 mod feature;
+mod retrieval;
 mod finite;
 mod inspect;
 pub(crate) mod native_tensorrt;

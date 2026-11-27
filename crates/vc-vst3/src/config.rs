@@ -33,6 +33,7 @@ pub struct CustomEmbedder {
 #[serde(default)]
 pub struct VoiceSlot {
     pub model: PathBuf,
+    pub index: PathBuf,
     pub embedder: PathBuf,
     pub f0_model: PathBuf,
 }
@@ -42,6 +43,8 @@ pub struct VoiceSlot {
 #[serde(default)]
 pub struct PluginConfig {
     pub model: PathBuf,
+    pub index_path: PathBuf,
+    pub index_rate: f32,
     pub voice_slots: [VoiceSlot; 4],
     pub hotkeys: crate::hotkeys::HotkeyConfig,
     pub startup_voice: i32,
@@ -93,6 +96,8 @@ impl Default for PluginConfig {
         // Defaults track `crates/vc-cli/src/cli.rs` RunArgs.
         Self {
             model: PathBuf::new(),
+            index_path: PathBuf::new(),
+            index_rate: 0.5,
             voice_slots: std::array::from_fn(|_| VoiceSlot::default()),
             hotkeys: Default::default(),
             startup_voice: 1,
@@ -149,6 +154,7 @@ impl PluginConfig {
         let voice = &self.voice_slots[slot];
         let mut config = self.clone();
         config.model = voice.model.clone();
+        config.index_path = voice.index.clone();
         if !voice.embedder.as_os_str().is_empty() {
             config.embedder = voice.embedder.clone();
             config.embedder_output = None;
@@ -195,6 +201,7 @@ impl PluginConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!((0..=4).contains(&self.startup_voice), "Invalid startup voice");
         self.hotkeys.validate().map_err(anyhow::Error::msg)?;
+        validate_unit_interval("INDEX mix rate", self.index_rate)?;
         let limits = ConversionTimingLimits {
             min_extra_convert_ms: PLUGIN_MIN_EXTRA_CONVERT_MS,
             ..CONVERSION_TIMING_LIMITS

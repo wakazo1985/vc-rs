@@ -21,7 +21,8 @@ pub(crate) fn discover(root:&Path, config:&mut PluginConfig, running:&AtomicBool
         let dest=dir.join(format!("{name}.onnx"));
         let pths=files(&dir,"pth");
         let indices=files(&dir,"index");
-        if !indices.is_empty(){log.event("INDEX_UNSUPPORTED",&format!("{name}: {} index file(s) retained but not used",indices.len()));}
+        if indices.len()==1 {config.voice_slots[i].index=indices[0].clone();log.event("INDEX_REGISTERED",name);}
+        else if indices.len()>1 {log.event("INDEX_ERROR",&format!("{name}: multiple INDEX files; keep one"));}
         if !dest.is_file() && pths.len()==1 {
             #[cfg(windows)]
             {

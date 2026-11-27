@@ -6,6 +6,8 @@ on:
       - '.github/workflows/voicebank-stage12.yml'
       - 'crates/vc-vst3/src/managed_models.rs'
       - 'crates/vc-vst3/src/control.html'
+      - 'crates/vc-core/src/model_rvc/retrieval.rs'
+      - 'crates/vc-vst3/src/config.rs'
 permissions:
   contents: read
 env:
@@ -25,6 +27,8 @@ jobs:
       - name: Test integrated plugin
         shell: pwsh
         run: |
+          cargo test -p vc-core --no-default-features --features ort --locked --lib retrieval::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p vc-vst3 --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p vc-convert --locked
@@ -56,7 +60,7 @@ jobs:
             $folder=Join-Path $bundle "models/$slot"
             New-Item -ItemType Directory -Force $folder | Out-Null
             if ($slot -eq 'common') {'Place ContentVec and RMVPE ONNX here.' | Set-Content "$folder/README.txt"}
-            else {'Place exactly one PTH and its INDEX here. INDEX is retained but not used in this build.' | Set-Content "$folder/README.txt"}
+            else {'Place exactly one PTH and its INDEX here. Supported INDEX: L2 Flat / IVFFlat (up to 512 MiB).' | Set-Content "$folder/README.txt"}
           }
           $tools=Join-Path $bundle 'tools'
           New-Item -ItemType Directory -Force $tools | Out-Null

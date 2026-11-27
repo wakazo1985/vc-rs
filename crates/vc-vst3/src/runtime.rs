@@ -741,7 +741,7 @@ impl WorkerCtx {
                             if settings.has_models() { self.reload.store(true, Ordering::Release); }
                             else { self.loading.store(false, Ordering::Release); self.set_idle_status(); }
                         }
-                    } else if settings.has_models() && settings.model.is_file() && settings.embedder.is_file() && settings.f0_model.is_file() {
+                    } else if settings.has_models() && (settings.has_voice_bank() || (settings.model.is_file() && settings.embedder.is_file() && settings.f0_model.is_file())) {
                         self.loading.store(true, Ordering::Release);
                         self.reload.store(true, Ordering::Release);
                     }
@@ -1216,7 +1216,7 @@ impl WorkerCtx {
     ) -> anyhow::Result<RvcPipeline> {
         self.params.diagnostics.event("MODEL_LOAD", &format!("provider={} model={} embedder={} f0={} chunk_samples={} sample_rate={}", provider.label(), settings.model.display(), settings.embedder.display(), settings.f0_model.display(), chunk_samples, self.sample_rate));
         let report_progress = |progress| self.report_load_progress(progress);
-        RvcPipeline::load(RvcPipelineConfig {
+        let mut pipeline = RvcPipeline::load(RvcPipelineConfig {
             model: &settings.model,
             embedder: &settings.embedder,
             embedder_output: settings.embedder_output.as_deref(),
@@ -1259,7 +1259,12 @@ impl WorkerCtx {
                 max_output_gain: settings.max_output_gain,
             },
             progress: Some(&report_progress),
-        })
+        })?;
+        if !settings.index_path.as_os_str().is_empty() && settings.index_rate > 0.0 {
+            pipeline.set_retrieval_index(&settings.index_path, settings.index_rate)?;
+            self.params.diagnostics.event("INDEX_LOADED", &format!("{} rate={}", settings.index_path.display(),settings.index_rate));
+        }
+        Ok(pipeline)
     }
 }
 

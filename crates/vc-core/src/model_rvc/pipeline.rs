@@ -244,6 +244,8 @@ pub struct RvcPipeline {
     // Reused embedder output tensor, refilled in place each chunk by
     // `extract_into` so the per-chunk ContentVec output is not reallocated.
     feature_tensor: FeatureTensor,
+    retrieval: Option<super::retrieval::RetrievalIndex>,
+    retrieval_rate: f32,
     input_reference_scratch: Vec<f32>,
     rms_mix_scratch: dsp::RmsMixScratch,
     pitchf_untrimmed_scratch: Vec<f32>,
@@ -675,6 +677,8 @@ impl RvcPipeline {
             phase_out_scratch: Vec::new(),
             input_scratch: Vec::new(),
             feature_tensor: FeatureTensor::default(),
+            retrieval: None,
+            retrieval_rate: 0.0,
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -1183,6 +1187,8 @@ impl RvcPipeline {
             phase_out_scratch: Vec::new(),
             input_scratch: Vec::new(),
             feature_tensor: FeatureTensor::default(),
+            retrieval: None,
+            retrieval_rate: 0.0,
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -1196,6 +1202,18 @@ impl RvcPipeline {
     /// Runtime-mutable conversion parameters. These mirror the matching
     /// `RvcPipelineConfig` fields and let a host (e.g. the VST3 plugin) drive
     /// them from automation between chunks without reloading the pipeline.
+    /// Optional FAISS L2 Flat/IVFFlat retrieval. Load on the inference worker,
+    /// before processing. No Python or dynamically loaded FAISS library.
+    pub fn set_retrieval_index(&mut self, path: &Path, rate: f32) -> Result<()> {
+        ensure!(rate.is_finite() && (0.0..=1.0).contains(&rate), "invalid index rate");
+        if rate == 0.0 { self.retrieval = None; self.retrieval_rate = 0.0; return Ok(()); }
+        let index = super::retrieval::RetrievalIndex::load(path)?;
+        ensure!(i64::try_from(index.dimension())? == i64::from(self.rvc.expected_feat_channels), "INDEX dimension differs from RVC model");
+        self.retrieval = Some(index);
+        self.retrieval_rate = rate;
+        Ok(())
+    }
+
     pub fn set_pitch_shift(&mut self, pitch_shift: f32) {
         self.pitch_shift = pitch_shift;
     }
@@ -1429,6 +1447,11 @@ impl VoiceModel for RvcPipeline {
             &self.stream_state.audio_16k_buffer,
             &mut self.feature_tensor,
         )?;
+        if let Some(index) = self.retrieval.as_ref() {
+            let shape = &self.feature_tensor.shape;
+            ensure!(shape.len() == 3 && shape[0] == 1 && usize::try_from(shape[2])? == index.dimension(), "INDEX feature dimension mismatch");
+            index.blend(&mut self.feature_tensor.data, self.retrieval_rate)?;
+        }
         let raw_feature_len = self
             .feature_tensor
             .shape
