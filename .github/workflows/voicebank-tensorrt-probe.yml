@@ -30,22 +30,47 @@ jobs:
           $sdk = Resolve-TensorRtSdk -RepoRoot $PWD.Path
           if (-not $sdk) { throw 'TensorRT SDK headers, import libraries or runtime DLLs missing.' }
           "TENSORRT_ROOT=$($sdk.Root)" >> $env:GITHUB_ENV
-      - name: Install CUDA 13.3 toolkit components
+      - name: Extract verified official CUDA component archives
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
-          curl.exe --fail --location --retry 2 --output $installer 'https://developer.download.nvidia.com/compute/cuda/13.3.1/local_installers/cuda_13.3.1_windows.exe'
-          if ($LASTEXITCODE -ne 0) { throw 'CUDA Toolkit download failed.' }
-          $p = Start-Process -FilePath $installer -ArgumentList '-s','cudart_13.3','nvcc_13.3','crt_13.3','cccl_13.3' -Wait -PassThru
-          if ($p.ExitCode -notin @(0,3010)) { throw "CUDA installer exit $($p.ExitCode)" }
-          $root = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3'
-          if (-not (Test-Path "$root\include\cuda_runtime_api.h") -or -not (Test-Path "$root\lib\x64\cudart.lib")) { throw 'CUDA headers or import libraries missing.' }
-          foreach ($file in @('include\cuda_runtime_api.h','include\crt\host_defines.h','lib\x64\cudart.lib')) {
+          $ErrorActionPreference='Stop'
+          $base='https://developer.download.nvidia.com/compute/cuda/redist'
+          $manifest=Invoke-RestMethod "$base/redistrib_13.3.1.json"
+          $root=Join-Path $env:RUNNER_TEMP 'CUDA/v13.3'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          foreach ($component in @('cuda_cudart','cuda_crt','cuda_nvcc','cuda_cccl')) {
+            $entry=$manifest.$component.'windows-x86_64'
+            if (!$entry.relative_path -or !$entry.sha256) { throw "Missing official manifest entry: $component" }
+            $archive=Join-Path $env:RUNNER_TEMP "$component.zip"
+            curl.exe --fail --location --retry 2 --silent --show-error --output $archive "$base/$($entry.relative_path)"
+            if ($LASTEXITCODE -ne 0) { throw "Download failed: $component" }
+            if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $entry.sha256) { throw "SHA256 mismatch: $component" }
+            $out=Join-Path $env:RUNNER_TEMP "extract-$component"
+            7z x $archive "-o$out" -y
+            if ($LASTEXITCODE -ne 0) { throw "Extraction failed: $component" }
+            $dir=Get-ChildItem $out -Directory | Select-Object -First 1
+            if (!$dir) { throw "Missing archive directory: $component" }
+            foreach ($sub in @('include','lib','bin','nvvm')) {
+              $from=Join-Path $dir.FullName $sub
+              if (Test-Path $from) {
+                $dest=Join-Path $root $sub
+                New-Item -ItemType Directory -Force $dest | Out-Null
+                Copy-Item "$from/*" $dest -Recurse -Force
+              }
+            }
+            Get-ChildItem $dir.FullName -File | Where-Object Name -Match 'LICENSE|EULA' | ForEach-Object { Copy-Item $_.FullName (Join-Path $root "$component-$($_.Name)") -Force }
+            Write-Host "CUDA_COMPONENT_OK $component $($manifest.$component.version)"
+          }
+          if (!(Test-Path "$root/lib/x64/cudart.lib") -and (Test-Path "$root/lib/cudart.lib")) {
+            New-Item -ItemType Directory -Force "$root/lib/x64" | Out-Null
+            Copy-Item "$root/lib/cudart.lib" "$root/lib/x64/"
+          }
+          foreach ($file in @('include/cuda_runtime_api.h','include/crt/host_defines.h','lib/x64/cudart.lib')) {
             if (!(Test-Path (Join-Path $root $file))) { throw "CUDA component missing: $file" }
             Write-Host "SDK_FILE_OK $file"
           }
           "CUDA_PATH=$root" >> $env:GITHUB_ENV
+          "CUDA_HOME=$root" >> $env:GITHUB_ENV
       - name: Build native core and RVC smoke tests
         shell: pwsh
         run: |
