@@ -6,6 +6,7 @@ on:
       - '.github/workflows/voicebank-http-control.yml'
       - 'crates/vc-vst3/src/http_control.rs'
       - 'crates/vc-vst3/src/control.html'
+      - 'crates/vc-vst3/src/hotkeys.rs'
 permissions:
   contents: read
 env:

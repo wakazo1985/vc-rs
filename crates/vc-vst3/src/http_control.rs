@@ -158,10 +158,10 @@ mod tests {
         assert_eq!(voice("/api/voice/unknown"),None);
     }
     #[test] fn shortcuts_validate_duplicates_and_ranges() {
-        let c=decode_shortcuts("1;116:0;117:0;118:0;119:0;120:0;121:0").unwrap();
+        let c=decode_shortcuts("1;118:0;119:0;120:0;121:0;122:0;123:0").unwrap();
         assert_eq!(c,HotkeyConfig::default());
-        assert!(decode_shortcuts("1;116:0;116:0;118:0;119:0;120:0;121:0").is_err());
-        assert!(decode_shortcuts("1;116:16;117:0;118:0;119:0;120:0;121:0").is_err());
+        assert!(decode_shortcuts("1;118:0;118:0;120:0;121:0;122:0;123:0").is_err());
+        assert!(decode_shortcuts("1;118:16;119:0;120:0;121:0;122:0;123:0").is_err());
     }
     #[test] fn local_http_request_updates_voice_and_rejects_foreign_origin() {
         let params=VcRvcParams::default();

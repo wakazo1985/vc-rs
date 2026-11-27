@@ -22,7 +22,7 @@ impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            bindings: std::array::from_fn(|i| Binding { key: 0x74 + i as u16, modifiers: 0 }),
+            bindings: std::array::from_fn(|i| Binding { key: 0x76 + i as u16, modifiers: 0 }),
         }
     }
 }
@@ -155,7 +155,7 @@ mod tests {
     fn defaults_and_voice_edges() {
         let c = HotkeyConfig::default();
         assert!(c.validate().is_ok());
-        assert_eq!(c.bindings.map(|b| b.key), [0x74,0x75,0x76,0x77,0x78,0x79]);
+        assert_eq!(c.bindings.map(|b| b.key), [0x76,0x77,0x78,0x79,0x7a,0x7b]);
         let mut s = KeyTracker::default();
         assert_eq!(s.update(c,0, |_| false), Events::default());
         for i in 0..5 {
@@ -170,17 +170,17 @@ mod tests {
         let c = HotkeyConfig::default();
         let mut s = KeyTracker::default();
         s.update(c,0, |_| false);
-        let e = s.update(c,0,|k|k==0x79);
+        let e = s.update(c,0,|k|k==0x7b);
         assert!(e.echo && e.voice.is_none());
-        assert!(s.update(c,0,|k|k==0x79).echo);
+        assert!(s.update(c,0,|k|k==0x7b).echo);
         assert!(!s.update(c,0, |_| false).echo);
-        assert!(!s.update(c,1,|k|k==0x79).echo);
+        assert!(!s.update(c,1,|k|k==0x7b).echo);
     }
     #[test]
     fn remap_disable_duplicate_and_startup() {
         let mut c = HotkeyConfig::default();
         let mut s = KeyTracker::default();
-        assert_eq!(s.update(c,0,|k|k==0x74).voice,None);
+        assert_eq!(s.update(c,0,|k|k==0x76).voice,None);
         c.bindings[0] = Binding {key:0x41, modifiers:1};
         s.update(c,0, |_| false);
         assert_eq!(s.update(c,0,|k|k==0x41).voice,None);
