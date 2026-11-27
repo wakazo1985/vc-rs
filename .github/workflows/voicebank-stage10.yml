@@ -1,0 +1,80 @@
+name: VoiceBank stage 10 quality and load validation
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-stage10.yml'
+permissions:
+  contents: read
+env:
+  VC_RS_ENABLE_NATIVE_TENSORRT: "0"
+  CARGO_TERM_COLOR: never
+jobs:
+  dsp-tests:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Core DSP and ONNX contract tests
+        shell: pwsh
+        run: |
+          cargo test -p vc-core --no-default-features --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Plugin realtime, echo, settings and shortcut tests
+        shell: pwsh
+        run: |
+          cargo test -p vc-vst3 --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  benchmark-tool:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test WAV metrics
+        shell: pwsh
+        run: |
+          cargo test -p vc-cli --no-default-features --features windowsml --example voicebank_wav_metrics --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build real RVC offline inference and metrics
+        shell: pwsh
+        run: |
+          cargo build -p vc-cli --no-default-features --features windowsml --release --bin vc-rs --example voicebank_wav_metrics --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -File crates/vc-cli/package-windowsml.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check CLI and benchmark script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & target/release/vc-rs.exe wav --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tokens=$null; $errors=$null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'scripts/voicebank-benchmark.ps1').Path,[ref]$tokens,[ref]$errors)
+          if ($errors.Count) { $errors | Out-String | Write-Host; throw 'Invalid benchmark script' }
+      - name: Package offline benchmark without models
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force stage10 | Out-Null
+          Copy-Item target/release/vc-rs.exe stage10/
+          Copy-Item target/release/examples/voicebank_wav_metrics.exe stage10/
+          Copy-Item target/release/Microsoft.WindowsAppRuntime.Bootstrap.dll stage10/
+          Copy-Item target/release/licenses stage10/ -Recurse
+          Copy-Item LICENSE stage10/
+          Copy-Item scripts/voicebank-benchmark.ps1 stage10/
+          Copy-Item scripts/START_VOICEBANK_BENCHMARK.cmd stage10/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage10-local-quality-benchmark
+          path: stage10/
+          if-no-files-found: error
