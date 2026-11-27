@@ -31,6 +31,12 @@ pub(crate) fn missing_shared_message(config:&PluginConfig,root:&Path)->String{
 }
 
 pub(crate) fn discover(root:&Path, config:&mut PluginConfig, running:&AtomicBool, log:&Diagnostics){
+    // The local profile is authoritative for per-character settings, even if
+    // Wave Link restores an older host preset. Do not overwrite paths or keys.
+    if let Ok(saved) = crate::diagnostics::load_profile() {
+        config.voice_profiles = saved.voice_profiles;
+        log.event("VOICE_PROFILES_RESTORED", "4 independent local profiles");
+    }
     let models=root.join("models");
     let shared=models.join("common");
     log.event("MODEL_SCAN",&format!("root={} common={} onnx_files={:?}",root.display(),shared.display(),files(&shared,"onnx")));

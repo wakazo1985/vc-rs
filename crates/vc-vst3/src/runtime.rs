@@ -90,6 +90,7 @@ impl Drop for WorkerExit {
 }
 
 trait WorkerConversion: Send {
+    fn profile_hop(&self) -> Option<usize> { None }
     fn available_mask(&self)->u32 { 0b11110 }
     fn active_slot(&self)->Option<usize>{None}
     fn select_voice(&mut self, _requested: usize) -> anyhow::Result<bool> { Ok(false) }
@@ -106,6 +107,7 @@ trait WorkerConversion: Send {
 }
 
 impl WorkerConversion for VoiceBank<Box<dyn WorkerConversion>> {
+    fn profile_hop(&self) -> Option<usize> { self.current().profile_hop() }
     fn available_mask(&self)->u32 { VoiceBank::available_mask(self) }
     fn active_slot(&self)->Option<usize>{Some(self.active())}
     fn select_voice(&mut self, requested: usize) -> anyhow::Result<bool> { self.select(requested) }
@@ -120,6 +122,23 @@ impl WorkerConversion for VoiceBank<Box<dyn WorkerConversion>> {
     fn content_delay(&self) -> usize { self.current().content_delay() }
 }
 
+/// A bank slot owns its loaded timing and live parameters. Host automation
+/// remains available only for the legacy single-model path.
+struct ProfiledConversion {
+    inner: ChunkConverter<RvcPipeline>,
+    live: LiveParams,
+    hop: usize,
+}
+impl WorkerConversion for ProfiledConversion {
+    fn profile_hop(&self) -> Option<usize> { Some(self.hop) }
+    fn apply_live(&mut self, _: &LiveParams) { self.inner.model_mut().apply_live(&self.live); }
+    fn reset(&mut self) -> anyhow::Result<()> { WorkerConversion::reset(&mut self.inner) }
+    fn prime(&mut self, input: &[f32], rate: u32) -> anyhow::Result<()> { WorkerConversion::prime(&mut self.inner,input,rate) }
+    fn process(&mut self,input:&[f32],rate:u32,output:&mut Vec<f32>)->anyhow::Result<ChunkStats>{
+        WorkerConversion::process(&mut self.inner,input,rate,output)
+    }
+    fn content_delay(&self)->usize { WorkerConversion::content_delay(&self.inner) }
+}
 impl WorkerConversion for ChunkConverter<RvcPipeline> {
     fn apply_live(&mut self, live: &LiveParams) {
         self.model_mut().apply_live(live);
@@ -723,6 +742,12 @@ impl WorkerCtx {
             }
         }
         if let Some(current) = converter.as_mut() {
+            if let Some(hop) = current.profile_hop() {
+                chunk_samples = hop;
+                zero_input.resize(hop, 0.0);
+                self.state.input_hop.store(hop, Ordering::Release);
+                self.latency.store(u32::try_from(hop.saturating_add(current.content_delay())).unwrap_or(u32::MAX), Ordering::Relaxed);
+            }
             if let Err(err) = self.prepare_offline(current.as_mut(), &zero_input) {
                 self.set_error("offline preroll failed", format!("{err:#}"));
                 converter = None;
@@ -804,6 +829,12 @@ impl WorkerCtx {
                 self.publish_conversion(&settings, None);
                 converter = self.load_conversion(&settings, chunk_samples);
                 if let Some(current) = converter.as_mut() {
+                    if let Some(hop) = current.profile_hop() {
+                chunk_samples = hop;
+                zero_input.resize(hop, 0.0);
+                self.state.input_hop.store(hop, Ordering::Release);
+                self.latency.store(u32::try_from(hop.saturating_add(current.content_delay())).unwrap_or(u32::MAX), Ordering::Relaxed);
+            }
                     if let Err(err) = self.prepare_offline(current.as_mut(), &zero_input) {
                         self.set_error("offline preroll failed", format!("{err:#}"));
                         converter = None;
@@ -835,6 +866,12 @@ impl WorkerCtx {
                     match current.select_voice(requested_voice) {
                         Ok(changed) => {
                             if changed {
+                                if let Some(hop) = current.profile_hop() {
+                chunk_samples = hop;
+                zero_input.resize(hop, 0.0);
+                self.state.input_hop.store(hop, Ordering::Release);
+                self.latency.store(u32::try_from(hop.saturating_add(current.content_delay())).unwrap_or(u32::MAX), Ordering::Relaxed);
+            }
                                 self.state.generation.fetch_add(1, Ordering::AcqRel);
                                 self.set_status(format!("Voice: {}", LABELS[requested_voice]));
                             }
@@ -1021,9 +1058,16 @@ impl WorkerCtx {
                     continue;
                 }
                 self.set_status(format!("Loading {}", LABELS[i]));
-                match self.load_pipeline(&config, config.provider(), chunk_samples) {
+                let hop = match config.validated_chunk_samples(self.sample_rate) {
+                    Ok(hop) => hop,
+                    Err(e) => { errors.push(format!("{}: {e}",LABELS[i])); continue; }
+                };
+                let profile = &settings.voice_profiles[i];
+                self.params.diagnostics.event("VOICE_PROFILE", &format!("slot={} pitch={} index_rate={} chunk_ms={} crossfade_ms={} f0_threshold={} extra_convert_ms={} input_gain_db={} output_gain_db={} protect_reserved={} formant_reserved={}", i+1, profile.pitch_shift,profile.index_rate,profile.chunk_ms,profile.crossfade_ms,profile.f0_threshold,profile.extra_convert_ms,profile.input_gain_db,profile.output_gain_db,profile.protect,profile.formant_shift));
+                match self.load_pipeline(&config, config.provider(), hop) {
                     Ok(pipeline) => {
-                        *slot = Some(Box::new(self.chunk_converter(pipeline, config.smoothing_kind(), chunk_samples)));
+                        let inner = self.chunk_converter(pipeline, config.smoothing_kind(), hop, &config);
+                        *slot = Some(Box::new(ProfiledConversion { inner, live: profile.live(), hop }));
                     }
                     Err(err) => {
                         nice_plug::nice_error!("vc-vst3: {} load failed: {err:#}", LABELS[i]);
@@ -1044,7 +1088,7 @@ impl WorkerCtx {
         }
         match self.load_current(settings, chunk_samples) {
             Ok((pipeline, kind)) => pipeline.map(|pipeline| {
-                Box::new(self.chunk_converter(pipeline, kind, chunk_samples))
+                Box::new(self.chunk_converter(pipeline, kind, chunk_samples, settings))
                     as Box<dyn WorkerConversion>
             }),
             Err(()) => {
@@ -1174,6 +1218,7 @@ impl WorkerCtx {
         pipeline: RvcPipeline,
         kind: SmoothingKind,
         chunk_samples: usize,
+        settings: &PluginConfig,
     ) -> ChunkConverter<RvcPipeline> {
         ChunkConverter::new(
             pipeline,
@@ -1181,9 +1226,9 @@ impl WorkerCtx {
                 kind,
                 output_sample_rate: self.sample_rate,
                 output_chunk_samples: chunk_samples,
-                crossfade_ms: self.crossfade_ms,
-                sola_search_ms: self.sola_search_ms,
-                tail_discard_ms: self.tail_discard_ms,
+                crossfade_ms: settings.crossfade_ms,
+                sola_search_ms: settings.sola_search_ms,
+                tail_discard_ms: settings.rvc_output_tail_discard_ms,
             },
         )
     }
@@ -1295,8 +1340,8 @@ impl WorkerCtx {
                 release_ms: settings.noise_gate_release_ms,
                 floor: settings.noise_gate_floor,
             },
-            output_extra_ms: self.output_extra_ms(),
-            volume_excluded_ms: self.crossfade_ms,
+            output_extra_ms: settings.crossfade_ms.saturating_add(settings.sola_search_ms).saturating_add(settings.rvc_output_tail_discard_ms),
+            volume_excluded_ms: settings.crossfade_ms,
             extra_convert_ms: settings.extra_convert_ms,
             output_gain: 1.0,
             output_dynamics: OutputDynamicsConfig {

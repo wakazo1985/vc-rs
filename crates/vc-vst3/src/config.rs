@@ -37,6 +37,99 @@ pub struct VoiceSlot {
     pub embedder: PathBuf,
     pub f0_model: PathBuf,
 }
+/// Each slot owns all conversion settings. Protect and formant are persisted
+/// for phase 02; their DSP is not enabled in this phase.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct VoiceProfile {
+    pub index_rate: f32,
+    pub f0_threshold: f32,
+    pub silence_threshold: f32,
+    pub noise_gate_attack_ms: f32,
+    pub noise_gate_release_ms: f32,
+    pub noise_gate_floor: f32,
+    pub chunk_ms: u32,
+    pub crossfade_ms: u32,
+    pub sola_search_ms: u32,
+    pub rvc_output_tail_discard_ms: u32,
+    pub extra_convert_ms: u32,
+    pub smoother: String,
+    pub volume_envelope: bool,
+    pub rms_mix_rate: f32,
+    pub auto_output_gain: bool,
+    pub target_output_rms: f32,
+    pub max_output_gain: f32,
+    pub pitch_shift: f32,
+    pub speaker_id: i64,
+    pub input_gain_db: f32,
+    pub output_gain_db: f32,
+    pub noise_gate_enabled: bool,
+    pub noise_gate_threshold_db: f32,
+    pub protect: f32,
+    pub formant_shift: f32,
+}
+impl Default for VoiceProfile {
+    fn default() -> Self {
+        Self {
+            index_rate: 0.5,
+            f0_threshold: 0.3,
+            silence_threshold: 0.0001,
+            noise_gate_attack_ms: 5.0,
+            noise_gate_release_ms: 50.0,
+            noise_gate_floor: 0.0,
+            chunk_ms: 200,
+            crossfade_ms: 40,
+            sola_search_ms: 12,
+            rvc_output_tail_discard_ms: 10,
+            extra_convert_ms: 100,
+            smoother: "phase-vocoder".to_string(),
+            volume_envelope: false,
+            rms_mix_rate: 0.0,
+            auto_output_gain: false,
+            target_output_rms: 0.03,
+            max_output_gain: 512.0,
+            pitch_shift: 0.0,
+            speaker_id: 0,
+            input_gain_db: 0.0,
+            output_gain_db: 0.0,
+            noise_gate_enabled: false,
+            noise_gate_threshold_db: -40.0,
+            protect: 0.33,
+            formant_shift: 0.0,
+        }
+    }
+}
+impl VoiceProfile {
+    pub fn initial(slot: usize) -> Self {
+        let mut p = Self::default();
+        p.pitch_shift = [14.0, 12.0, 0.0, 0.0][slot];
+        p.index_rate = [0.4, 0.4, 0.5, 0.7][slot];
+        p.protect = [0.25, 0.25, 0.33, 0.33][slot];
+        p
+    }
+    pub fn live(&self) -> vc_core::model_rvc::LiveParams {
+        vc_core::model_rvc::LiveParams {
+            pitch_shift: self.pitch_shift,
+            speaker_id: self.speaker_id,
+            input_gain: 10.0_f32.powf(self.input_gain_db / 20.0),
+            output_gain: 10.0_f32.powf(self.output_gain_db / 20.0),
+            noise_gate_enabled: self.noise_gate_enabled,
+            noise_gate_threshold: 10.0_f32.powf(self.noise_gate_threshold_db / 20.0),
+        }
+    }
+    fn validate_live(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.pitch_shift.is_finite() && (-24.0..=24.0).contains(&self.pitch_shift), "Invalid voice pitch");
+        anyhow::ensure!((0..=255).contains(&self.speaker_id), "Invalid voice speaker");
+        for gain in [self.input_gain_db, self.output_gain_db] {
+            anyhow::ensure!(gain.is_finite() && (-36.0..=36.0).contains(&gain), "Invalid voice gain");
+        }
+        anyhow::ensure!(self.noise_gate_threshold_db.is_finite() && (-80.0..=0.0).contains(&self.noise_gate_threshold_db), "Invalid voice gate threshold");
+        anyhow::ensure!(self.protect.is_finite() && (0.0..=0.5).contains(&self.protect), "Invalid Protect");
+        anyhow::ensure!(self.formant_shift.is_finite() && (-12.0..=12.0).contains(&self.formant_shift), "Invalid formant shift");
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 // Lenient: unknown/legacy keys (e.g. `pitch_shift`, now a DAW parameter) are
 // ignored rather than rejected, so older config files keep parsing.
@@ -46,6 +139,7 @@ pub struct PluginConfig {
     pub index_path: PathBuf,
     pub index_rate: f32,
     pub voice_slots: [VoiceSlot; 4],
+    pub voice_profiles: [VoiceProfile; 4],
     pub hotkeys: crate::hotkeys::HotkeyConfig,
     pub startup_voice: i32,
     pub detailed_diagnostics: bool,
@@ -99,6 +193,7 @@ impl Default for PluginConfig {
             index_path: PathBuf::new(),
             index_rate: 0.5,
             voice_slots: std::array::from_fn(|_| VoiceSlot::default()),
+            voice_profiles: std::array::from_fn(VoiceProfile::initial),
             hotkeys: Default::default(),
             startup_voice: 1,
             detailed_diagnostics: false,
@@ -155,6 +250,24 @@ impl PluginConfig {
         let mut config = self.clone();
         config.model = voice.model.clone();
         config.index_path = voice.index.clone();
+        let profile = &self.voice_profiles[slot];
+        config.index_rate = profile.index_rate;
+        config.f0_threshold = profile.f0_threshold;
+        config.silence_threshold = profile.silence_threshold;
+        config.noise_gate_attack_ms = profile.noise_gate_attack_ms;
+        config.noise_gate_release_ms = profile.noise_gate_release_ms;
+        config.noise_gate_floor = profile.noise_gate_floor;
+        config.chunk_ms = profile.chunk_ms;
+        config.crossfade_ms = profile.crossfade_ms;
+        config.sola_search_ms = profile.sola_search_ms;
+        config.rvc_output_tail_discard_ms = profile.rvc_output_tail_discard_ms;
+        config.extra_convert_ms = profile.extra_convert_ms;
+        config.smoother = profile.smoother.clone();
+        config.volume_envelope = profile.volume_envelope;
+        config.rms_mix_rate = profile.rms_mix_rate;
+        config.auto_output_gain = profile.auto_output_gain;
+        config.target_output_rms = profile.target_output_rms;
+        config.max_output_gain = profile.max_output_gain;
         if !voice.embedder.as_os_str().is_empty() {
             config.embedder = voice.embedder.clone();
             config.embedder_output = None;
@@ -203,6 +316,13 @@ impl PluginConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!((0..=4).contains(&self.startup_voice), "Invalid startup voice");
         self.hotkeys.validate().map_err(anyhow::Error::msg)?;
+        if self.has_voice_bank() {
+            for i in 0..4 {
+                self.voice_profiles[i].validate_live().map_err(|e| anyhow::anyhow!("Voice {}: {e}", i+1))?;
+                self.for_voice(i).validate().map_err(|e| anyhow::anyhow!("Voice {}: {e}", i+1))?;
+            }
+            return Ok(());
+        }
         validate_unit_interval("INDEX mix rate", self.index_rate)?;
         let limits = ConversionTimingLimits {
             min_extra_convert_ms: PLUGIN_MIN_EXTRA_CONVERT_MS,
@@ -232,6 +352,12 @@ impl PluginConfig {
 
     pub fn validated_chunk_samples(&self, sample_rate: u32) -> anyhow::Result<usize> {
         self.validate()?;
+        if self.has_voice_bank() {
+            // Validate every profile on the current host sample grid.
+            for i in 0..4 { self.for_voice(i).validated_chunk_samples(sample_rate)?; }
+            let slot = (self.startup_voice.saturating_sub(1) as usize).min(3);
+            return self.for_voice(slot).validated_chunk_samples(sample_rate);
+        }
         Ok(
             vc_core::validation::RvcChunkTiming::from_ms(self.chunk_ms, sample_rate)?
                 .input_chunk_samples,
@@ -414,6 +540,30 @@ mod tests {
         assert_eq!(config.gpu_priority(), GpuPriority::Normal);
         let config: PluginConfig = toml::from_str("gpu_device_id = 2").unwrap();
         assert_eq!(config.gpu_device_id, 2);
+    }
+
+    #[test]
+    fn independent_profiles_are_migrated_and_persisted() {
+        let mut c: PluginConfig = toml::from_str("index_rate = 0.9").unwrap();
+        for i in 0..4 { c.voice_slots[i].model = PathBuf::from(format!("voice-{i}.onnx")); }
+        assert_eq!(std::array::from_fn::<_,4,_>(|i| c.voice_profiles[i].pitch_shift), [14.0, 12.0, 0.0, 0.0]);
+        let before = c.voice_profiles.clone();
+        c.voice_profiles[1].pitch_shift = 9.0;
+        c.voice_profiles[1].chunk_ms = 100;
+        c.voice_profiles[1].crossfade_ms = 20;
+        c.voice_profiles[1].index_rate = 0.2;
+        c.voice_profiles[1].output_gain_db = -6.0;
+        for i in [0,2,3] { assert_eq!(c.voice_profiles[i], before[i]); }
+        let d: PluginConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert_eq!(c,d);
+        assert_eq!(d.for_voice(1).validated_chunk_samples(48_000).unwrap(),4800);
+        assert_eq!(d.for_voice(0).validated_chunk_samples(48_000).unwrap(),9600);
+        assert_eq!(d.for_voice(1).index_rate,0.2);
+        assert_eq!(d.voice_profiles[1].live().pitch_shift,9.0);
+        assert!((d.voice_profiles[1].live().output_gain-0.5011872).abs()<0.00001);
+        assert_eq!(d.for_voice(0).index_rate,0.4);
+        c.voice_profiles[1].chunk_ms = 19;
+        assert!(c.validate().is_err());
     }
 
     #[test]

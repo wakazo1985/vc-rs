@@ -1,0 +1,22 @@
+name: VoiceBank 01 independent profiles tests
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-stage01-independent.yml'
+permissions:
+  contents: read
+env:
+  VC_RS_ENABLE_NATIVE_TENSORRT: "0"
+  CARGO_TERM_COLOR: never
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test independent profiles and existing VST3 functions
+        shell: pwsh
+        run: |
+          cargo test -p vc-vst3 --no-default-features --features tensorrt --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
