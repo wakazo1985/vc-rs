@@ -110,6 +110,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           'GPU_INFERENCE_TESTS_PASSED' | Tee-Object -FilePath gpu-result.txt
           Add-Content $env:GITHUB_STEP_SUMMARY 'Native RVC GPU smoke tests passed.'
+      - name: Integrated native-build tests (model-free)
+        shell: pwsh
+        run: |
+          . scripts/activate.ps1
+          cargo test -p vc-vst3 --no-default-features --features tensorrt --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p vc-cli --no-default-features --features tensorrt --locked --bin vc-rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test saved provider migration
         shell: pwsh
         run: |
@@ -163,6 +171,18 @@ jobs:
           Copy-Item LICENSE $stage/
           Get-Content -LiteralPath docs/voicebank-final-ja.md -Raw -Encoding UTF8 | Set-Content -LiteralPath "$stage/使い方.txt" -Encoding utf8BOM
           Copy-Item gpu-result.txt "$stage/GPU検証結果.txt"
+          # Retain the RTX 5070 Ti SM120 and PTX resources, not unrelated architectures.
+          foreach ($f in @('nvinfer_builder_resource_sm120_11.dll','nvinfer_builder_resource_ptx_11.dll')) {
+            if (!(Test-Path (Join-Path $bin $f))) { throw "Missing required builder resource $f" }
+          }
+          Get-ChildItem $bin -Filter 'nvinfer_builder_resource_sm*_11.dll' | Where-Object Name -ne 'nvinfer_builder_resource_sm120_11.dll' | Remove-Item
+          foreach ($f in @('vc-rs.exe','voicebank_wav_metrics.exe','vc-vst3.vst3')) {
+            if (!(Test-Path (Join-Path $bin $f))) { throw "Missing $f" }
+          }
+          if ((Get-ChildItem $stage -Recurse -Filter control.html).Count -ne 1) { throw 'Expected exactly one external HTML file' }
+          if (!(Test-Path "$tools/voicebank-benchmark.ps1")) { throw 'Missing benchmark' }
+          if ((Get-ChildItem $bundle/models -Recurse -File | Where-Object Extension -In @('.onnx','.pth','.index')).Count -gt 0) { throw 'Unexpected trained model in package' }
+          "${{ github.sha }}" | Set-Content "$stage/BUILD-COMMIT.txt" -Encoding ascii
           Get-ChildItem $bin -File | Select-Object Name,Length
       - uses: actions/upload-artifact@v4
         with:
@@ -176,3 +196,109 @@ jobs:
           name: TensorRT-probe-result
           path: gpu-result.txt
           if-no-files-found: ignore
+
+  host-check:
+    needs: native-probe
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: RVCVoiceBank-TensorRT
+          path: release-test
+      - name: Verify exact build
+        shell: pwsh
+        run: |
+          if ((Get-Content release-test/BUILD-COMMIT.txt -Raw).Trim() -ne "${{ github.sha }}") { throw 'Wrong build commit' }
+          New-Item -ItemType Directory -Force host-logs | Out-Null
+      - name: Check Windows loader and VST3 exports without GPU
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $bundle=(Resolve-Path 'release-test/vc-vst3.vst3').Path
+          $dll=Join-Path $bundle 'Contents/x86_64-win/vc-vst3.vst3'
+          $source=@'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class VstLoad {
+            [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern IntPtr LoadLibraryEx(string path, IntPtr reserved, uint flags);
+            [DllImport("kernel32.dll", CharSet=CharSet.Ansi, SetLastError=true)]
+            public static extern IntPtr GetProcAddress(IntPtr module, string name);
+          }
+          '@
+          Add-Type -TypeDefinition $source
+          $h=[VstLoad]::LoadLibraryEx($dll,[IntPtr]::Zero,0x1100)
+          $err=[Runtime.InteropServices.Marshal]::GetLastWin32Error()
+          "MODULE_LOAD handle=$h win32=$err" | Tee-Object host-logs/loader.txt
+          if ($h -eq [IntPtr]::Zero) { throw "VST3 LoadLibraryEx failed: $err" }
+          foreach ($name in @('GetPluginFactory','InitDll','ExitDll')) {
+            $p=[VstLoad]::GetProcAddress($h,$name)
+            "EXPORT $name address=$p" | Tee-Object host-logs/loader.txt -Append
+            if ($p -eq [IntPtr]::Zero) { throw "Missing export: $name" }
+          }
+          $probe=Join-Path $bundle 'write-test.tmp'
+          [IO.File]::WriteAllText($probe,'test')
+          Remove-Item $probe
+          'BUNDLE_WRITE_OK' | Tee-Object host-logs/loader.txt -Append
+      - name: Build official Steinberg validator
+        shell: pwsh
+        run: |
+          pwsh -File scripts/install-vst3-validator.ps1 *> host-logs/validator-build.log
+          $code=$LASTEXITCODE
+          Get-Content host-logs/validator-build.log -Tail 40
+          if ($code -ne 0) { exit $code }
+      - name: Run actual host initialization
+        shell: pwsh
+        run: |
+          $v=Get-ChildItem external/steinberg/vst3sdk-build -Recurse -Filter validator.exe | Select-Object -First 1
+          if (!$v) { throw 'Validator missing' }
+          $bundle=(Resolve-Path 'release-test/vc-vst3.vst3').Path
+          & $v.FullName $bundle *> host-logs/validator.log
+          $code=$LASTEXITCODE
+          Get-Content host-logs/validator.log -Tail 100
+          if (Test-Path "$bundle/logs") { Copy-Item "$bundle/logs" host-logs/plugin-logs -Recurse; Get-ChildItem "$bundle/logs" -File | Select-String 'INITIALIZE|HTTP_START|HTTP_ERROR|HTTP_STOP' | Select-Object -First 30 }
+          if ($code -ne 0) { exit $code }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage07-host-check
+          path: host-logs/
+  publish:
+    needs: [native-probe, host-check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: RVCVoiceBank-TensorRT
+          path: package
+      - name: Verify ZIP and publish exact build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$(tr -d '\r\n' < package/BUILD-COMMIT.txt)" = "$GITHUB_SHA"
+          bin=package/vc-vst3.vst3/Contents/x86_64-win
+          for f in nvinfer_11.dll nvinfer_plugin_11.dll nvonnxparser_11.dll cudart64_13.dll vc-tensorrt-builder.exe vc-vst3.vst3 vc-rs.exe voicebank_wav_metrics.exe nvinfer_builder_resource_sm120_11.dll nvinfer_builder_resource_ptx_11.dll; do test -s "$bin/$f"; done
+          test -s package/control.html
+          test -s package/使い方.txt
+          test -s package/vc-vst3.vst3/tools/voicebank_convert.exe
+          test -s package/vc-vst3.vst3/tools/voicebank-benchmark.ps1
+          (cd package && zip -1 -q -r ../RVCVoiceBank-TensorRT-RTX5070Ti.zip .)
+          unzip -tq RVCVoiceBank-TensorRT-RTX5070Ti.zip
+          test "$(stat -c %s RVCVoiceBank-TensorRT-RTX5070Ti.zip)" -lt 2147483648
+          sha256sum RVCVoiceBank-TensorRT-RTX5070Ti.zip > RVCVoiceBank-TensorRT-RTX5070Ti.zip.sha256
+          tag="voicebank-stage07-${GITHUB_SHA:0:12}"
+          notes="Windows native TensorRT build, host validator and package checks passed. Actual RTX 5070 Ti audio quality and Wave Link behavior not verified. No trained models included."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" RVCVoiceBank-TensorRT-RTX5070Ti.zip RVCVoiceBank-TensorRT-RTX5070Ti.zip.sha256 --clobber
+          else
+            gh release create "$tag" RVCVoiceBank-TensorRT-RTX5070Ti.zip RVCVoiceBank-TensorRT-RTX5070Ti.zip.sha256 --target "$GITHUB_SHA" --prerelease --title "RVC VoiceBank Stage 07 RTX 5070 Ti" --notes "$notes"
+          fi
+          gh release view "$tag" --json assets,url
