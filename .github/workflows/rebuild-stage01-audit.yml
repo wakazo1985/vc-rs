@@ -1,0 +1,106 @@
+name: Rebuild stage 01 public model metadata audit
+on:
+  push:
+    branches: [rebuild-stage01-audit]
+    paths: ['.github/workflows/rebuild-stage01-audit.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Inspect public sources without copying model weights into repository
+        shell: bash
+        run: |
+          python - <<'PY'
+          import io, json, struct, zipfile, urllib.request, re, pickletools, zlib
+          from urllib.parse import quote
+          def get(url, start=None, end=None):
+              headers = {"User-Agent":"RVC-stage01-metadata-audit/1.0","Accept-Encoding":"identity"}
+              if start is not None: headers["Range"]=f"bytes={start}-{end}"
+              with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=25) as r:
+                  if start is not None and r.status != 206: raise ValueError("Range unsupported; full download forbidden")
+                  return r.read(8*1024*1024+1), r.headers
+          class Remote(io.RawIOBase):
+              def __init__(self,url):
+                  self.url=url; self.pos=0; self.transferred=0
+                  _,h=get(url,0,0)
+                  self.size=int(h["Content-Range"].split("/")[-1])
+              def readable(self): return True
+              def seekable(self): return True
+              def tell(self): return self.pos
+              def seek(self,off,whence=0):
+                  self.pos=off if whence==0 else self.pos+off if whence==1 else self.size+off
+                  return self.pos
+              def read(self,n=-1):
+                  n=self.size-self.pos if n<0 else min(n,self.size-self.pos)
+                  if n<=0: return b""
+                  if n>8*1024*1024 or self.transferred+n>16*1024*1024: raise ValueError("metadata transfer limit")
+                  data,h=get(self.url,self.pos,self.pos+n-1)
+                  if len(data)!=n: raise ValueError("invalid range response")
+                  self.pos+=n; self.transferred+=n
+                  return data
+          def pth_meta(f):
+              head=f.read(30)
+              if head[:4]!=b"PK\x03\x04":
+                  print("PTH non-ZIP or legacy format; no unsafe unpickle")
+                  return
+              sig,ver,flag,comp,mt,md,crc,cs,us,nl,xl=struct.unpack("<4s5H3I2H",head)
+              name=f.read(nl).decode("utf-8","replace"); f.read(xl)
+              if not name.endswith("data.pkl"):
+                  print("first checkpoint record",name,"metadata not decoded")
+                  return
+              if comp==0: buf=f.read(min(cs or 1048576,1048576))
+              elif comp==8: buf=zlib.decompressobj(-15).decompress(f.read(min(cs or 1048576,1048576)),1048576)
+              else: print("unsupported compression",comp); return
+              ops=[]
+              try:
+                  for op,arg,pos in pickletools.genops(buf):
+                      ops.append((op.name,arg))
+              except Exception as e: print("partial pickle inspection",str(e))
+              for i,(op,arg) in enumerate(ops):
+                  if isinstance(arg,str) and arg in ("config","version","f0","sr","info","embedder_name","model_name"):
+                      print("PTH field tokens",arg,repr(ops[i+1:i+35 if arg=="config" else i+5])[:1800])
+          def inspect_index(f):
+              head=f.read(24)
+              if len(head)>=16:
+                  print("INDEX raw header",head.hex(),"magic",repr(head[:4]),"d_candidate",struct.unpack_from("<i",head,4)[0],"ntotal_candidate",struct.unpack_from("<q",head,8)[0])
+          sources=[
+              ("toddler","https://huggingface.co/VofVoices/maxwell-young-fantastic-max-RVC-v2/resolve/main/"+quote("maxwellyoung(FantasticMax).zip"),160446052),
+              ("girl","https://amitaro.net/download/others/rvc_amitaro_runrun_1.0.zip",365440882),
+              ("robot candidate","https://huggingface.co/juuxn/RVCModels/resolve/75fc6d2/speakandspell2333333.zip",96253214),
+          ]
+          for name,url,expected in sources:
+              print("\nSOURCE",name,url)
+              try:
+                  r=Remote(url)
+                  print("public archive bytes",r.size,"library size match",r.size==expected,"not proof of identity")
+                  with zipfile.ZipFile(r) as z:
+                      for item in z.infolist():
+                          print("ENTRY",repr(item.filename),item.file_size,"CRC32",format(item.CRC,"08x"))
+                      for item in z.infolist():
+                          ext=item.filename.lower().rsplit(".",1)[-1]
+                          if ext in ("txt","md","json") and item.file_size<=65536:
+                              with z.open(item) as f: print("TEXT (bounded)",repr(f.read(65536).decode("utf-8","replace"))[:8000])
+                          elif ext=="pth":
+                              with z.open(item) as f: pth_meta(f)
+                          elif ext=="index":
+                              with z.open(item) as f: inspect_index(f)
+                  print("range bytes read",r.transferred)
+              except Exception as e: print("FAILED",name,type(e).__name__,str(e))
+          for folder in ("D","man-D"):
+              url="https://huggingface.co/api/models/ttttdiva/rvc_okiba/tree/main/models/"+folder
+              print("\nMALE CANDIDATE",folder)
+              try:
+                  raw,_=get(url); entries=json.loads(raw)
+                  for e in entries:
+                      print("FILE",e.get("path"),e.get("size"),"sha256",e.get("lfs",{}).get("oid"))
+                      if e.get("size")==55232523 and str(e.get("path","")).endswith(".pth"):
+                          r=Remote("https://huggingface.co/ttttdiva/rvc_okiba/resolve/main/"+quote(e["path"],safe="/")); pth_meta(r)
+                      if e.get("size")==454130739 and str(e.get("path","")).endswith(".index"):
+                          r=Remote("https://huggingface.co/ttttdiva/rvc_okiba/resolve/main/"+quote(e["path"],safe="/")); inspect_index(r)
+              except Exception as e: print("FAILED",folder,type(e).__name__,str(e))
+          print("Public-source metadata only. User archive hashes and exact identity remain unverified. No model conversion or artifact publication.")
+          PY
