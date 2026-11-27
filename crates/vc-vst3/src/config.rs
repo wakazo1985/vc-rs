@@ -29,12 +29,20 @@ pub struct CustomEmbedder {
     pub output: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct VoiceSlot {
+    pub model: PathBuf,
+    pub embedder: PathBuf,
+    pub f0_model: PathBuf,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 // Lenient: unknown/legacy keys (e.g. `pitch_shift`, now a DAW parameter) are
 // ignored rather than rejected, so older config files keep parsing.
 #[serde(default)]
 pub struct PluginConfig {
     pub model: PathBuf,
+    pub voice_slots: [VoiceSlot; 4],
     pub embedder: PathBuf,
     pub f0_model: PathBuf,
     pub embedder_output: Option<String>,
@@ -82,6 +90,7 @@ impl Default for PluginConfig {
         // Defaults track `crates/vc-cli/src/cli.rs` RunArgs.
         Self {
             model: PathBuf::new(),
+            voice_slots: std::array::from_fn(|_| VoiceSlot::default()),
             embedder: PathBuf::new(),
             f0_model: PathBuf::new(),
             embedder_output: None,
@@ -115,9 +124,35 @@ impl PluginConfig {
     /// True when all three required model paths are set. When false the plugin
     /// runs in silent mode (the worker never loads a pipeline).
     pub fn has_models(&self) -> bool {
-        !self.model.as_os_str().is_empty()
-            && !self.embedder.as_os_str().is_empty()
-            && !self.f0_model.as_os_str().is_empty()
+        if self.has_voice_bank() {
+            self.voice_slots.iter().any(|slot| !slot.model.as_os_str().is_empty()
+                && (!slot.embedder.as_os_str().is_empty() || !self.embedder.as_os_str().is_empty())
+                && (!slot.f0_model.as_os_str().is_empty() || !self.f0_model.as_os_str().is_empty()))
+        } else {
+            !self.model.as_os_str().is_empty()
+                && !self.embedder.as_os_str().is_empty()
+                && !self.f0_model.as_os_str().is_empty()
+        }
+    }
+
+    pub fn has_voice_bank(&self) -> bool {
+        self.voice_slots.iter().any(|slot| !slot.model.as_os_str().is_empty())
+    }
+
+    pub fn for_voice(&self, slot: usize) -> Self {
+        let voice = &self.voice_slots[slot];
+        let mut config = self.clone();
+        config.model = voice.model.clone();
+        if !voice.embedder.as_os_str().is_empty() {
+            config.embedder = voice.embedder.clone();
+            config.embedder_output = None;
+            config.embedder_package = None;
+        }
+        if !voice.f0_model.as_os_str().is_empty() {
+            config.f0_model = voice.f0_model.clone();
+        }
+        config.voice_slots = std::array::from_fn(|_| VoiceSlot::default());
+        config
     }
 
     pub fn provider(&self) -> Provider {

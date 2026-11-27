@@ -1,0 +1,37 @@
+name: VoiceBank stage 06 four voice model bank
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-stage06.yml'
+      - 'crates/vc-vst3/src/**'
+permissions:
+  contents: read
+jobs:
+  test-build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      VC_RS_ENABLE_NATIVE_TENSORRT: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test VST3 including voice bank
+        shell: pwsh
+        run: |
+          cargo test -p vc-vst3 --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile four-voice VST3
+        shell: pwsh
+        run: |
+          cargo xtask bundle vc-vst3 --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage06-voice-bank-compile
+          path: target/bundled/vc-vst3.vst3/
+          if-no-files-found: error

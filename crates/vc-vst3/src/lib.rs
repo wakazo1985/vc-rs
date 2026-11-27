@@ -16,6 +16,7 @@ mod dll_path;
 mod editor;
 mod params;
 mod runtime;
+mod voice_bank;
 
 // Share the standalone GUI's test-only renderer to exercise both real editors
 // with the same Vulkan setup, without changing shipped plugin dependencies.

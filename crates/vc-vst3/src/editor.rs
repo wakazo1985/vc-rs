@@ -150,6 +150,19 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
     }
     ui.separator();
 
+    ui.heading("Voice bank");
+    ui.horizontal_wrapped(|ui| {
+        for (i, name) in crate::voice_bank::LABELS.iter().enumerate() {
+            let value = i as i32 + 1;
+            if ui.selectable_label(state.params.voice_slot.value() == value, *name).clicked() {
+                setter.begin_set_parameter(&state.params.voice_slot);
+                setter.set_parameter(&state.params.voice_slot, value);
+                setter.end_set_parameter(&state.params.voice_slot);
+                state.reload_waker.wake();
+            }
+        }
+    });
+    ui.small("Select a loaded voice. Register files and press Load / Reload first.");
     ui.heading("Live controls");
     ui.small("Changes apply immediately and can be automated in your DAW.");
     egui::Grid::new("params").num_columns(2).show(ui, |ui| {
@@ -197,6 +210,28 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
 
 fn draw_setup(ui: &mut egui::Ui, state: &mut EditorState) {
     ui.heading("Setup");
+    egui::CollapsingHeader::new("Four voice models").show(ui, |ui| {
+        ui.small("Optional per-voice embedder and F0 override the common paths below.");
+        let slots = state.params.settings.read().unwrap().voice_slots.clone();
+        for (i, slot) in slots.iter().enumerate() {
+            ui.push_id(i, |ui| {
+                ui.separator();
+                if file_row(ui, crate::voice_bank::LABELS[i], &slot.model) {
+                    spawn_picker(state, ModelKind::Voice(i));
+                }
+                if file_row(ui, "Embedder override", &slot.embedder) {
+                    spawn_picker(state, ModelKind::VoiceEmbedder(i));
+                }
+                if file_row(ui, "F0 override", &slot.f0_model) {
+                    spawn_picker(state, ModelKind::VoiceF0(i));
+                }
+                if ui.button("Clear slot").clicked() {
+                    state.params.settings.write().unwrap().voice_slots[i] = Default::default();
+                    mark_dirty(state);
+                }
+            });
+        }
+    });
     ui.small("Models, backend, chunk, Extra convert, and gate timing apply on Load / Reload.");
     ui.horizontal_wrapped(|ui| {
         let loading = state.loading.load(Ordering::SeqCst);
@@ -228,9 +263,7 @@ fn draw_setup(ui: &mut egui::Ui, state: &mut EditorState) {
     // The apply action stays outside the fold so pending edits remain actionable.
     let needs_models = {
         let settings = state.params.settings.read().unwrap();
-        settings.model.as_os_str().is_empty()
-            || settings.embedder.as_os_str().is_empty()
-            || settings.f0_model.as_os_str().is_empty()
+        !settings.has_models()
     };
     egui::CollapsingHeader::new("Models and conversion settings")
         .default_open(needs_models)
@@ -496,6 +529,9 @@ enum ModelKind {
     Rvc,
     Embedder,
     F0,
+    Voice(usize),
+    VoiceEmbedder(usize),
+    VoiceF0(usize),
 }
 
 /// Open the native file dialog on a plugin-owned thread and stage the chosen path
@@ -520,6 +556,9 @@ fn spawn_picker(state: &EditorState, kind: ModelKind) {
                         settings.embedder_package = None;
                     }
                     ModelKind::F0 => settings.f0_model = path,
+                    ModelKind::Voice(i) => settings.voice_slots[i].model = path,
+                    ModelKind::VoiceEmbedder(i) => settings.voice_slots[i].embedder = path,
+                    ModelKind::VoiceF0(i) => settings.voice_slots[i].f0_model = path,
                 }
             }
             dirty.store(true, Ordering::SeqCst);

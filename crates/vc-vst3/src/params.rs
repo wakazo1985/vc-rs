@@ -72,6 +72,8 @@ impl nice_plug::params::persist::PersistentField<'_, PluginConfig> for SettingsS
 
 #[derive(Params)]
 pub struct VcRvcParams {
+    #[id = "voice-slot"]
+    pub voice_slot: IntParam,
     #[id = "pitch"]
     pub pitch_shift: FloatParam,
     #[id = "speaker"]
@@ -100,6 +102,7 @@ pub struct VcRvcParams {
 impl Default for VcRvcParams {
     fn default() -> Self {
         Self {
+            voice_slot: IntParam::new("Voice slot", 1, IntRange::Linear { min: 1, max: 4 }),
             pitch_shift: FloatParam::new(
                 "Pitch",
                 0.0,

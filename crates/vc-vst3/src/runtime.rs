@@ -23,6 +23,7 @@ use vc_core::validation::CONVERSION_TIMING_LIMITS;
 
 use crate::config::PluginConfig;
 use crate::params::VcRvcParams;
+use crate::voice_bank::{VoiceBank, LABELS};
 
 #[derive(Clone, Debug)]
 pub(crate) struct PluginStatus {
@@ -85,6 +86,7 @@ impl Drop for WorkerExit {
 }
 
 trait WorkerConversion: Send {
+    fn select_voice(&mut self, _requested: usize) -> anyhow::Result<bool> { Ok(false) }
     fn apply_live(&mut self, live: &LiveParams);
     fn reset(&mut self) -> anyhow::Result<()>;
     fn prime(&mut self, input: &[f32], rate: u32) -> anyhow::Result<()>;
@@ -95,6 +97,19 @@ trait WorkerConversion: Send {
         output: &mut Vec<f32>,
     ) -> anyhow::Result<ChunkStats>;
     fn content_delay(&self) -> usize;
+}
+
+impl WorkerConversion for VoiceBank<Box<dyn WorkerConversion>> {
+    fn select_voice(&mut self, requested: usize) -> anyhow::Result<bool> { self.select(requested) }
+    fn apply_live(&mut self, live: &LiveParams) { self.current_mut().apply_live(live); }
+    fn reset(&mut self) -> anyhow::Result<()> { self.current_mut().reset() }
+    fn prime(&mut self, input: &[f32], rate: u32) -> anyhow::Result<()> {
+        self.current_mut().prime(input, rate)
+    }
+    fn process(&mut self, input: &[f32], rate: u32, output: &mut Vec<f32>) -> anyhow::Result<ChunkStats> {
+        self.current_mut().process(input, rate, output)
+    }
+    fn content_delay(&self) -> usize { self.current().content_delay() }
 }
 
 impl WorkerConversion for ChunkConverter<RvcPipeline> {
@@ -654,6 +669,7 @@ impl WorkerCtx {
             running: Arc::clone(&self.running),
             state: Arc::clone(&self.state),
         };
+        let mut last_voice_request = self.params.voice_slot.value().saturating_sub(1) as usize;
         let initial_settings = self.initial_settings.clone();
         let initial_chunk = initial_settings.validated_chunk_samples(self.sample_rate);
         // Invalid persisted settings never load a model. The fallback only
@@ -755,6 +771,20 @@ impl WorkerCtx {
                 self.state.notify_offline();
             }
 
+            let requested_voice = self.params.voice_slot.value().saturating_sub(1) as usize;
+            if requested_voice != last_voice_request {
+                last_voice_request = requested_voice;
+                if let Some(current) = converter.as_mut() {
+                    match current.select_voice(requested_voice) {
+                        Ok(true) => {
+                            self.state.generation.fetch_add(1, Ordering::AcqRel);
+                            self.set_status(format!("Voice: {}", LABELS[requested_voice]));
+                        }
+                        Ok(false) => {}
+                        Err(err) => self.set_error("Voice switch rejected; previous voice retained", format!("{err:#}")),
+                    }
+                }
+            }
             let requested_generation = self.state.generation.load(Ordering::Acquire);
             if requested_generation != generation {
                 input_acc.clear();
@@ -894,6 +924,41 @@ impl WorkerCtx {
         settings: &PluginConfig,
         chunk_samples: usize,
     ) -> Option<Box<dyn WorkerConversion>> {
+        if settings.has_voice_bank() {
+            let mut slots: [Option<Box<dyn WorkerConversion>>; 4] = std::array::from_fn(|_| None);
+            let mut errors = Vec::new();
+            for (i, slot) in slots.iter_mut().enumerate() {
+                let config = settings.for_voice(i);
+                if config.model.as_os_str().is_empty() {
+                    errors.push(format!("{}: model not registered", LABELS[i]));
+                    continue;
+                }
+                if !config.has_models() {
+                    errors.push(format!("{}: embedder or F0 path missing", LABELS[i]));
+                    continue;
+                }
+                self.set_status(format!("Loading {}", LABELS[i]));
+                match self.load_pipeline(&config, config.provider(), chunk_samples) {
+                    Ok(pipeline) => {
+                        *slot = Some(Box::new(self.chunk_converter(pipeline, config.smoothing_kind(), chunk_samples)));
+                    }
+                    Err(err) => {
+                        nice_plug::nice_error!("vc-vst3: {} load failed: {err:#}", LABELS[i]);
+                        errors.push(format!("{}: {err:#}", LABELS[i]));
+                    }
+                }
+            }
+            let requested = self.params.voice_slot.value().saturating_sub(1) as usize;
+            let Some(bank) = VoiceBank::new(slots, requested) else {
+                self.set_error("No voice bank model could load", errors.join("\n"));
+                self.dirty.store(true, Ordering::SeqCst);
+                return None;
+            };
+            let summary = format!("Voice: {} ({} of 4 loaded)", LABELS[bank.active()], 4 - errors.len());
+            if errors.is_empty() { self.set_status(summary); }
+            else { self.set_error(summary, errors.join("\n")); }
+            return Some(Box::new(bank));
+        }
         match self.load_current(settings, chunk_samples) {
             Ok((pipeline, kind)) => pipeline.map(|pipeline| {
                 Box::new(self.chunk_converter(pipeline, kind, chunk_samples))
