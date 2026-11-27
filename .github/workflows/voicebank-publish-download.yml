@@ -1,0 +1,52 @@
+name: Publish VoiceBank direct ZIP download
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-publish-download.yml'
+permissions:
+  actions: read
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45999496317
+          name: RVCVoiceBank-TensorRT
+          path: package
+      - name: Prepare single ZIP for RTX 5070 Ti
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=package/vc-vst3.vst3/Contents/x86_64-win
+          test -f "$bin/nvinfer_builder_resource_sm120_11.dll"
+          test -f "$bin/nvinfer_builder_resource_ptx_11.dll"
+          find "$bin" -maxdepth 1 -type f -name 'nvinfer_builder_resource_sm*_11.dll' ! -name 'nvinfer_builder_resource_sm120_11.dll' -print -delete
+          for f in nvinfer_11.dll nvinfer_plugin_11.dll nvonnxparser_11.dll cudart64_13.dll vc-tensorrt-builder.exe vc-vst3.vst3 nvinfer_builder_resource_sm120_11.dll nvinfer_builder_resource_ptx_11.dll; do test -s "$bin/$f"; done
+          test -s package/control.html
+          test -s package/vc-vst3.vst3/tools/voicebank_convert.exe
+          cd package
+          zip -1 -q -r ../RVCVoiceBank-TensorRT-RTX5070Ti.zip .
+          cd ..
+          unzip -tq RVCVoiceBank-TensorRT-RTX5070Ti.zip
+          test "$(stat -c %s RVCVoiceBank-TensorRT-RTX5070Ti.zip)" -lt 2147483648
+          sha256sum RVCVoiceBank-TensorRT-RTX5070Ti.zip > RVCVoiceBank-TensorRT-RTX5070Ti.zip.sha256
+          ls -lh RVCVoiceBank-TensorRT-RTX5070Ti.zip
+      - name: Publish public direct download
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag=voicebank-tensorrt-rtx5070ti-20261127
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" RVCVoiceBank-TensorRT-RTX5070Ti.zip RVCVoiceBank-TensorRT-RTX5070Ti.zip.sha256 --clobber
+          else
+            gh release create "$tag" RVCVoiceBank-TensorRT-RTX5070Ti.zip RVCVoiceBank-TensorRT-RTX5070Ti.zip.sha256 --target 171564a9e12a14d81f2e8ff68362d4ab8b2766c7 --prerelease --title "RVC VoiceBank TensorRT RTX 5070 Ti" --notes "Built from the successful Windows build. GPU inference not tested on hardware. Includes runtime, SM120 and PTX builder resources. No trained models included."
+          fi
+          gh release view "$tag" --json assets,url
