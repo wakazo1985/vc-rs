@@ -47,6 +47,24 @@ pub struct F0PostprocessConfig {
     pub clamp_after_pitch_shift: bool,
 }
 
+impl F0PostprocessConfig {
+    /// RMVPE estimates on its trained grid; these limits validate the estimate,
+    /// not change the neural detector or RVC's trained coarse pitch encoding.
+    pub fn with_input_range(min: f32, max: f32) -> anyhow::Result<Self> {
+        anyhow::ensure!(min.is_finite() && max.is_finite() && min >= 50.0 && max <= 1100.0 && min < max, "F0 range must satisfy 50 <= min < max <= 1100 Hz");
+        Ok(Self {
+            enabled: true,
+            min_f0_hz: min,
+            max_f0_hz: max,
+            remove_short_voiced_islands: false,
+            fill_short_unvoiced_gaps: false,
+            fix_octave_jumps: false,
+            median_filter: false,
+            ..Self::default()
+        })
+    }
+}
+
 impl Default for F0PostprocessConfig {
     fn default() -> Self {
         Self {
@@ -321,6 +339,16 @@ mod tests {
     }
 
     // 1. disabled mode: no smoothing, shift applied once, input untouched.
+    #[test]
+    fn voice_input_limits_and_output_limits_are_separate() {
+        let cfg=F0PostprocessConfig::with_input_range(70.0,450.0).unwrap();
+        let out=run(cfg,&[0.0,69.0,70.0,220.0,450.0,451.0,f32::NAN],12.0);
+        assert_eq!(out,vec![0.0,0.0,140.0,440.0,900.0,0.0,0.0]);
+        for (min,max) in [(49.0,450.0),(100.0,100.0),(500.0,400.0),(70.0,1101.0),(f32::NAN,400.0)] {
+            assert!(F0PostprocessConfig::with_input_range(min,max).is_err());
+        }
+    }
+
     #[test]
     fn disabled_passthrough_and_shift() {
         let cfg = F0PostprocessConfig::default(); // enabled = false

@@ -245,6 +245,7 @@ pub fn run_wav(args: WavArgs) -> Result<()> {
         model.set_retrieval_index(index, args.index_rate)?;
     }
     model.set_protect(args.protect)?;
+    if args.voice_f0_limits { model.set_f0_ranges(args.input_f0_min_hz,args.input_f0_max_hz,args.output_f0_min_hz,args.output_f0_max_hz)?; }
     model.set_formant_shift(args.formant_shift)?;
     model.set_peak_protection(args.peak_protection);
     let load_duration = load_started.elapsed();

@@ -1143,6 +1143,11 @@ impl WorkerCtx {
                             errors.push(format!("{}: {e}", LABELS[i]));
                             continue;
                         }
+                        if let Err(e) = pipeline.set_f0_ranges(profile.input_f0_min_hz,profile.input_f0_max_hz,profile.output_f0_min_hz,profile.output_f0_max_hz) {
+                            errors.push(format!("{}: {e}", LABELS[i]));
+                            continue;
+                        }
+                        self.params.diagnostics.event("VOICE_F0_RANGE",&format!("slot={} input_min_hz={} input_max_hz={} output_min_hz={} output_max_hz={}",i+1,profile.input_f0_min_hz,profile.input_f0_max_hz,profile.output_f0_min_hz,profile.output_f0_max_hz));
                         if let Err(e) = pipeline.set_formant_shift(profile.formant_shift) {
                             errors.push(format!("{}: {e}", LABELS[i]));
                             continue;

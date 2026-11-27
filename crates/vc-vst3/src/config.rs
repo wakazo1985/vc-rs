@@ -44,6 +44,10 @@ pub struct VoiceSlot {
 pub struct VoiceProfile {
     pub index_rate: f32,
     pub f0_threshold: f32,
+    pub input_f0_min_hz: f32,
+    pub input_f0_max_hz: f32,
+    pub output_f0_min_hz: f32,
+    pub output_f0_max_hz: f32,
     pub silence_threshold: f32,
     pub noise_gate_attack_ms: f32,
     pub noise_gate_release_ms: f32,
@@ -73,6 +77,10 @@ impl Default for VoiceProfile {
         Self {
             index_rate: 0.5,
             f0_threshold: 0.3,
+            input_f0_min_hz: 50.0,
+            input_f0_max_hz: 1100.0,
+            output_f0_min_hz: 50.0,
+            output_f0_max_hz: 1100.0,
             silence_threshold: 0.0001,
             noise_gate_attack_ms: 5.0,
             noise_gate_release_ms: 50.0,
@@ -127,6 +135,8 @@ impl VoiceProfile {
         }
     }
     fn validate_live(&self) -> anyhow::Result<()> {
+        vc_core::model_rvc::F0PostprocessConfig::with_input_range(self.input_f0_min_hz,self.input_f0_max_hz)?;
+        vc_core::model_rvc::F0PostprocessConfig::with_input_range(self.output_f0_min_hz,self.output_f0_max_hz)?;
         anyhow::ensure!(self.pitch_shift.is_finite() && (-24.0..=24.0).contains(&self.pitch_shift), "Invalid voice pitch");
         anyhow::ensure!((0..=255).contains(&self.speaker_id), "Invalid voice speaker");
         for gain in [self.input_gain_db, self.output_gain_db] {
@@ -575,6 +585,10 @@ mod tests {
         c.voice_profiles[1].crossfade_ms = 20;
         c.voice_profiles[1].index_rate = 0.2;
         c.voice_profiles[1].output_gain_db = -6.0;
+        c.voice_profiles[1].input_f0_min_hz=70.0;
+        c.voice_profiles[1].input_f0_max_hz=450.0;
+        c.voice_profiles[1].output_f0_min_hz=100.0;
+        c.voice_profiles[1].output_f0_max_hz=800.0;
         for i in [0,2,3] { assert_eq!(c.voice_profiles[i], before[i]); }
         let d: PluginConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
         assert_eq!(c,d);
@@ -587,6 +601,13 @@ mod tests {
         assert_eq!(d.voice_profiles[1].live().pitch_shift,9.0);
         assert!((d.voice_profiles[1].live().output_gain-0.5011872).abs()<0.00001);
         assert_eq!(d.for_voice(0).index_rate,0.4);
+        assert_eq!(d.voice_profiles[1].input_f0_min_hz,70.0);
+        assert_eq!(d.voice_profiles[0].input_f0_min_hz,50.0);
+        assert_eq!(d.voice_profiles[1].output_f0_max_hz,800.0);
+        assert!(c.validate().is_ok());
+        c.voice_profiles[1].output_f0_max_hz=90.0;
+        assert!(c.validate().is_err());
+        c.voice_profiles[1].output_f0_max_hz=800.0;
         c.voice_profiles[1].chunk_ms = 19;
         assert!(c.validate().is_err());
     }

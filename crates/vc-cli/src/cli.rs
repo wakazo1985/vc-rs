@@ -360,6 +360,17 @@ pub struct WavArgs {
     pub formant_shift: f32,
     #[arg(long)]
     pub peak_protection: bool,
+    /// Enable separate accepted RMVPE and converted F0 bounds (VoiceBank mode).
+    #[arg(long)]
+    pub voice_f0_limits: bool,
+    #[arg(long,default_value_t=50.0)]
+    pub input_f0_min_hz: f32,
+    #[arg(long,default_value_t=1100.0)]
+    pub input_f0_max_hz: f32,
+    #[arg(long,default_value_t=50.0)]
+    pub output_f0_min_hz: f32,
+    #[arg(long,default_value_t=1100.0)]
+    pub output_f0_max_hz: f32,
     #[arg(long)]
     pub embedder: PathBuf,
     #[arg(long)]
@@ -632,6 +643,10 @@ impl WavArgs {
             self.max_output_gain,
         )
         .and_then(|()| validate_wav_live_conversion_options(self))?;
+        if self.voice_f0_limits {
+            vc_core::model_rvc::F0PostprocessConfig::with_input_range(self.input_f0_min_hz,self.input_f0_max_hz).map_err(|e| e.to_string())?;
+            vc_core::model_rvc::F0PostprocessConfig::with_input_range(self.output_f0_min_hz,self.output_f0_max_hz).map_err(|e| e.to_string())?;
+        }
         if !self.protect.is_finite() || !(0.0..=0.5).contains(&self.protect) {
             return Err("Protect must be in 0..=0.5".into());
         }

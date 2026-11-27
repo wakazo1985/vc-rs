@@ -6,6 +6,9 @@ on:
       - '.github/workflows/voicebank-stage04-latency.yml'
       - 'crates/vc-vst3/src/runtime.rs'
       - 'crates/vc-vst3/src/lib.rs'
+      - 'crates/vc-vst3/src/config.rs'
+      - 'crates/vc-core/src/model_rvc/f0_postprocess.rs'
+      - 'crates/vc-core/src/model_rvc/pipeline.rs'
 permissions:
   contents: read
 env:
@@ -19,5 +22,9 @@ jobs:
       - uses: actions/checkout@v4
       - shell: pwsh
         run: |
+          cargo test -p vc-core --no-default-features --features tensorrt --locked --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p vc-cli --no-default-features --features tensorrt --locked --bin vc-rs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p vc-vst3 --no-default-features --features tensorrt --locked -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

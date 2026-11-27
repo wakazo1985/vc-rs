@@ -253,6 +253,7 @@ pub struct RvcPipeline {
     prevent_hard_clip: bool,
     formant: Option<super::formant::Formant>,
     formant_shift: f32,
+    output_f0_range: Option<(f32, f32)>,
     input_reference_scratch: Vec<f32>,
     rms_mix_scratch: dsp::RmsMixScratch,
     pitchf_untrimmed_scratch: Vec<f32>,
@@ -693,6 +694,7 @@ impl RvcPipeline {
             prevent_hard_clip: false,
             formant: None,
             formant_shift: 0.0,
+            output_f0_range: None,
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -1210,6 +1212,7 @@ impl RvcPipeline {
             prevent_hard_clip: false,
             formant: None,
             formant_shift: 0.0,
+            output_f0_range: None,
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -1247,6 +1250,15 @@ impl RvcPipeline {
         ensure!(shift.is_finite() && (-12.0..=12.0).contains(&shift), "Invalid formant shift");
         self.formant = if shift == 0.0 { None } else { Some(super::formant::Formant::new(self.rvc_sample_rate, shift)?) };
         self.formant_shift = shift;
+        Ok(())
+    }
+    /// Independent raw-F0 acceptance and post-transposition output limits.
+    /// The original RVC 50..1100 Hz coarse quantization remains unchanged.
+    pub fn set_f0_ranges(&mut self, input_min: f32, input_max: f32, output_min: f32, output_max: f32) -> Result<()> {
+        let cfg = F0PostprocessConfig::with_input_range(input_min, input_max)?;
+        F0PostprocessConfig::with_input_range(output_min, output_max)?;
+        self.f0_postprocess.set_config(cfg);
+        self.output_f0_range = Some((output_min, output_max));
         Ok(())
     }
     pub fn quality_report(&self) -> &str { &self.quality_report }
@@ -1594,6 +1606,9 @@ impl VoiceModel for RvcPipeline {
             self.pitch_shift,
             &mut self.pitchf_postprocessed_scratch,
         );
+        if let Some((min,max)) = self.output_f0_range {
+            clamp_voiced_output_f0(&mut self.pitchf_postprocessed_scratch,min,max);
+        }
         let pitchf = self.pitchf_postprocessed_scratch.as_slice();
         ensure!(pitchf.iter().all(|v| v.is_finite() && *v >= 0.0), "RMVPE/F0 processing returned invalid pitch");
         let feature_change = if preserve_features && self.quality_enabled {
@@ -1822,6 +1837,13 @@ impl VoiceModel for RvcPipeline {
     }
 }
 
+// Preserve unvoiced frames; do not turn a clipped high note into silence.
+fn clamp_voiced_output_f0(pitch: &mut [f32], min: f32, max: f32) {
+    for f in pitch {
+        if f.is_finite() && *f > 0.0 { *f = f.clamp(min,max); }
+    }
+}
+
 fn validate_process_timing(
     timing: RvcChunkTiming,
     configured_rate: u32,
@@ -1956,6 +1978,18 @@ fn apply_output_gain(
 #[cfg(test)]
 mod output_gain_tests {
     use super::*;
+
+    #[test]
+    fn output_f0_limits_preserve_unvoiced_and_rvc_quantization() {
+        let mut f = [0.0,40.0,100.0,220.0,700.0,1300.0];
+        clamp_voiced_output_f0(&mut f,80.0,600.0);
+        assert_eq!(f,[0.0,80.0,100.0,220.0,600.0,600.0]);
+        let mut coarse=Vec::new();
+        coarse_pitch_into(&f,&mut coarse);
+        assert_eq!(coarse[0],1);
+        assert_eq!(coarse[4],coarse[5]);
+        assert!(coarse.windows(2).all(|p|p[0]<=p[1]));
+    }
 
     #[test]
     fn peak_protection_preserves_waveform_instead_of_flattening_peaks() {
