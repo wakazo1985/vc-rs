@@ -28,7 +28,7 @@ Python、DAW、仮想オーディオケーブル、Stream Deckは不要です。
       common
         contentvec.onnx
         rmvpe.onnx
-commonの共有モデルはONNX形式です。ファイル名にcontentvec（またはhubert）、rmvpeを含めてください。各種1個ずつ置きます。
+commonの共有モデルは必須です。以前のファイル contentvec-f.onnx と rmvpe_20231006.onnx を2つとも入れてください。ファイル名を変える必要はありません。4キャラのPTH/INDEXだけではRVC変換できません。
 キャラモデルはRVC v2・F0ありの対応形式に限ります。INDEXはFAISS L2 Flat／IVFFlat、512 MiB以下。元のPTH/INDEXは削除しません。
 ONNXをすでに所有している場合、対応するキャラフォルダにtoddler.onnx、girl.onnx、male.onnx、robot.onnxを配置できます。
 同じキャラフォルダに複数のPTHやINDEXを混在させないでください。
@@ -100,8 +100,8 @@ WindowsのコマンドプロンプトでHTTPの受付を確認する例:
 詳細ログを確認する場合はプラグイン設定の診断機能を利用します。
 
 【8. トラブル対処】
-・設定画面にアクセスできない: Wave Link内のプラグインが有効か確認し、実際のインストール先logsのHTTP_START、HTTP_ERROR、HTTP_REJECTを確認。ポート18765を複数インスタンスで共有できません。
-・声が出ない: F7で元の声が出るか確認。モデルの配置、共通ONNX、MODEL_LOADとERRORを確認。ロードされていないモデルは正常な変換を保証できません。
+・設定画面にアクセスできない: Wave Link内のプラグインが有効か確認し、実際のインストール先logsのHTTP_START、HTTP_ERROR、HTTP_REJECTを確認。同じプロセス内の複数インスタンスはポート18765を共有します。別プロセスや旧版がポートを使用している場合は終了してください。
+・キャラの声が出ない: control.htmlの読み込み済み数とエラーを確認。COMMON_MODEL_MISSINGがあれば共通ONNXをmodels/commonに配置。未準備のキャラでは元の声へフォールバックします。新規設定のチャンクは200ms・クロスフェード40ms。以前の500ms/85ms標準設定も移行します。実際の遅延は推論負荷によって変わります。
 ・変換に失敗: PTHがRVC v2・F0ありか、重複ファイルがないか、フォルダ書き込み権限とconversionログを確認。
 ・INDEX読み込み失敗: 対応形式、512 MiB以下、モデルの特徴次元との一致を確認。
 ・モデルを変更する: Wave Linkを終了し、旧PTH/INDEX/ONNXを別フォルダへ退避して新しいデータを配置。古いONNXがあると再変換されません。再起動後にログを確認。

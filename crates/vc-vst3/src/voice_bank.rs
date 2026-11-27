@@ -15,6 +15,7 @@ impl<T> VoiceBank<T> {
         Some(Self { slots, active })
     }
     pub(crate) fn active(&self) -> usize { self.active }
+    pub(crate) fn available_mask(&self)->u32 { self.slots.iter().enumerate().fold(0,|mask,(i,slot)|if slot.is_some(){mask|(1u32<<(i+1))}else{mask}) }
     pub(crate) fn select(&mut self, slot: usize) -> anyhow::Result<bool> {
         if !self.slots.get(slot).is_some_and(Option::is_some) {
             anyhow::bail!("Voice slot {} is not loaded", slot + 1);

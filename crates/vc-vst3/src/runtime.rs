@@ -76,17 +76,22 @@ impl RuntimeState {
 struct WorkerExit {
     running: Arc<AtomicBool>,
     state: Arc<RuntimeState>,
+    params: Arc<VcRvcParams>,
 }
 
 impl Drop for WorkerExit {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
         self.state.has_converter.store(false, Ordering::Release);
+        self.params.loaded_voice_mask.store(0, Ordering::Release);
+        self.params.active_voice.store(0, Ordering::Release);
         self.state.notify_offline();
     }
 }
 
 trait WorkerConversion: Send {
+    fn available_mask(&self)->u32 { 0b11110 }
+    fn active_slot(&self)->Option<usize>{None}
     fn select_voice(&mut self, _requested: usize) -> anyhow::Result<bool> { Ok(false) }
     fn apply_live(&mut self, live: &LiveParams);
     fn reset(&mut self) -> anyhow::Result<()>;
@@ -101,6 +106,8 @@ trait WorkerConversion: Send {
 }
 
 impl WorkerConversion for VoiceBank<Box<dyn WorkerConversion>> {
+    fn available_mask(&self)->u32 { VoiceBank::available_mask(self) }
+    fn active_slot(&self)->Option<usize>{Some(self.active())}
     fn select_voice(&mut self, requested: usize) -> anyhow::Result<bool> { self.select(requested) }
     fn apply_live(&mut self, live: &LiveParams) { self.current_mut().apply_live(live); }
     fn reset(&mut self) -> anyhow::Result<()> { self.current_mut().reset() }
@@ -438,6 +445,9 @@ impl PluginRuntime {
         self.state.applied_settings.lock().unwrap().clone()
     }
 
+    pub(crate) fn realtime(&self)->bool { !self.state.offline.load(Ordering::Acquire) }
+    pub(crate) fn wake(&self){ self.worker_thread.unpark(); }
+    pub(crate) fn converter_ready(&self)->bool { self.state.has_converter.load(Ordering::Acquire) && !self.loading.load(Ordering::Acquire) }
     pub fn current_latency(&self) -> u32 {
         self.latency.load(Ordering::Relaxed)
     }
@@ -674,6 +684,7 @@ impl WorkerCtx {
         let _exit = WorkerExit {
             running: Arc::clone(&self.running),
             state: Arc::clone(&self.state),
+            params: self.params.clone(),
         };
         let mut last_voice_request = self.params.selected_voice().saturating_sub(1) as usize;
         let initial_settings = self.initial_settings.clone();
@@ -717,7 +728,7 @@ impl WorkerCtx {
                 converter = None;
             }
         }
-        self.publish_conversion(&initial_settings, converter.is_some());
+        self.publish_conversion(&initial_settings, converter.as_deref());
         let mut generation = self.state.generation.load(Ordering::Acquire);
         self.state
             .ready_generation
@@ -739,7 +750,7 @@ impl WorkerCtx {
                             *self.params.settings.write().unwrap() = settings.clone();
                             self.params.request_save();
                             if settings.has_models() { self.reload.store(true, Ordering::Release); }
-                            else { self.loading.store(false, Ordering::Release); self.set_idle_status(); }
+                            else { self.loading.store(false, Ordering::Release); self.set_error("共通モデルまたはキャラクターが未設定",crate::managed_models::missing_shared_message(&settings,&root)); }
                         }
                     } else if settings.has_models() && (settings.has_voice_bank() || (settings.model.is_file() && settings.embedder.is_file() && settings.f0_model.is_file())) {
                         self.loading.store(true, Ordering::Release);
@@ -747,7 +758,7 @@ impl WorkerCtx {
                     }
                 }
             }
-            if last_profile_flush.elapsed() >= Duration::from_millis(500) {
+            if last_profile_flush.elapsed() >= Duration::from_secs(2) {
                 self.params.flush_profile();
                 last_profile_flush = std::time::Instant::now();
             }
@@ -790,7 +801,7 @@ impl WorkerCtx {
                 // building the new one, so the two never coexist.
                 drop(converter.take());
                 self.state.generation.fetch_add(1, Ordering::AcqRel);
-                self.publish_conversion(&settings, false);
+                self.publish_conversion(&settings, None);
                 converter = self.load_conversion(&settings, chunk_samples);
                 if let Some(current) = converter.as_mut() {
                     if let Err(err) = self.prepare_offline(current.as_mut(), &zero_input) {
@@ -803,7 +814,9 @@ impl WorkerCtx {
                 // Loading made a fresh model timeline. A host reset issued
                 // during the load is covered by that same fresh initialization.
                 generation = self.state.generation.load(Ordering::Acquire);
-                self.publish_conversion(&settings, converter.is_some());
+                self.publish_conversion(&settings, converter.as_deref());
+                // The requested slot may have changed while loading.
+                last_voice_request=usize::MAX;
                 self.state
                     .ready_generation
                     .store(generation, Ordering::Release);
@@ -813,17 +826,29 @@ impl WorkerCtx {
 
             let selected = self.params.selected_voice();
             let requested_voice = selected.saturating_sub(1) as usize;
-            if selected > 0 && requested_voice != last_voice_request {
+            if selected == 0 {
+                self.params.active_voice.store(0, Ordering::Release);
+                last_voice_request=usize::MAX;
+            } else if requested_voice != last_voice_request {
                 last_voice_request = requested_voice;
                 if let Some(current) = converter.as_mut() {
                     match current.select_voice(requested_voice) {
-                        Ok(true) => {
-                            self.state.generation.fetch_add(1, Ordering::AcqRel);
-                            self.set_status(format!("Voice: {}", LABELS[requested_voice]));
+                        Ok(changed) => {
+                            if changed {
+                                self.state.generation.fetch_add(1, Ordering::AcqRel);
+                                self.set_status(format!("Voice: {}", LABELS[requested_voice]));
+                            }
+                            self.params.active_voice.store(selected, Ordering::Release);
+                            self.params.diagnostics.event("VOICE_SELECTED",&format!("slot={selected} ready=true changed={changed}"));
                         }
-                        Ok(false) => {}
-                        Err(err) => self.set_error("Voice switch rejected; previous voice retained", format!("{err:#}")),
+                        Err(err) => {
+                            self.params.active_voice.store(0, Ordering::Release);
+                            self.set_error("Voice switch rejected; original voice fallback", format!("{err:#}"));
+                        }
                     }
+                }else{
+                    self.params.active_voice.store(0,Ordering::Release);
+                    self.params.diagnostics.event("VOICE_UNAVAILABLE",&format!("slot={selected}: converter not loaded"));
                 }
             }
             let requested_generation = self.state.generation.load(Ordering::Acquire);
@@ -962,6 +987,8 @@ impl WorkerCtx {
         // offline waiters. Keep this worker alive to service explicit Reload;
         // retain the last successful settings for host-driven reinitialization.
         self.state.has_converter.store(false, Ordering::Release);
+        self.params.loaded_voice_mask.store(0, Ordering::Release);
+        self.params.active_voice.store(0, Ordering::Release);
         let generation = self
             .state
             .generation
@@ -1058,7 +1085,14 @@ impl WorkerCtx {
         }
     }
 
-    fn publish_conversion(&self, settings: &PluginConfig, loaded: bool) {
+    fn publish_conversion(&self, settings: &PluginConfig, converter: Option<&dyn WorkerConversion>) {
+        let loaded=converter.is_some();
+        let mask=converter.map_or(0,|c|c.available_mask());
+        let requested=self.params.selected_voice();
+        let active=converter.map_or(0,|c|if requested==0{0}else if let Some(slot)=c.active_slot(){if slot+1==requested as usize{requested}else{0}}else{requested});
+        self.params.loaded_voice_mask.store(mask, Ordering::Release);
+        self.params.active_voice.store(active, Ordering::Release);
+        self.params.diagnostics.event("VOICE_READY",&format!("mask={mask:#06b} requested={requested} active={active}"));
         if loaded || !settings.has_models() {
             // A failed rebuild/reload does not erase the last successful Load
             // authorization. Explicitly clearing the model set does revoke it.
@@ -1080,6 +1114,7 @@ impl WorkerCtx {
     fn set_status(&self, text: impl Into<String>) {
         let text = text.into();
         self.params.diagnostics.event("STATUS", &text);
+        *self.params.model_message.lock().unwrap_or_else(|e|e.into_inner())=text.clone();
         if let Ok(mut status) = self.status.lock() {
             *status = PluginStatus::new(text);
         }
@@ -1089,6 +1124,7 @@ impl WorkerCtx {
         let summary = summary.into();
         let detail = detail.into();
         self.params.diagnostics.event("ERROR", &format!("{summary}: {detail}"));
+        *self.params.model_message.lock().unwrap_or_else(|e|e.into_inner())=format!("{summary}: {detail}");
         if let Ok(mut status) = self.status.lock() {
             *status = PluginStatus {
                 summary,
@@ -1261,8 +1297,10 @@ impl WorkerCtx {
             progress: Some(&report_progress),
         })?;
         if !settings.index_path.as_os_str().is_empty() && settings.index_rate > 0.0 {
-            pipeline.set_retrieval_index(&settings.index_path, settings.index_rate)?;
-            self.params.diagnostics.event("INDEX_LOADED", &format!("{} rate={}", settings.index_path.display(),settings.index_rate));
+            match pipeline.set_retrieval_index(&settings.index_path, settings.index_rate){
+                Ok(())=>self.params.diagnostics.event("INDEX_LOADED", &format!("{} rate={}", settings.index_path.display(),settings.index_rate)),
+                Err(err)=>self.params.diagnostics.event("INDEX_ERROR",&format!("{}: {err:#}; continuing RVC without retrieval",settings.index_path.display())),
+            }
         }
         Ok(pipeline)
     }

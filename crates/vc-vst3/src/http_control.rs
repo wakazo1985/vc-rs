@@ -1,40 +1,61 @@
 //! Loopback HTTP control, independent from audio processing. One active instance
 //! owns the fixed port; never bind to a LAN address. No CORS or external assets.
 use crate::{hotkeys::{Binding, HotkeyConfig, supported_keys, key_name}, params::VcRvcParams, runtime::ReloadWaker};
-use std::{io::{self, Read, Write}, net::{TcpListener, TcpStream}, sync::{Arc, atomic::{AtomicBool, Ordering}}, thread::{self, JoinHandle}, time::{Duration, Instant}};
+use std::{io::{self, Read, Write}, net::{TcpListener, TcpStream}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, thread::{self, JoinHandle}, time::{Duration, Instant}};
 const HOST: &str = "127.0.0.1:18765";
 const ORIGIN: &str = "http://127.0.0.1:18765";
 const HTML: &str = include_str!("control.html");
 const MAX: usize = 8192;
 
-pub(crate) struct HttpControl { stop: Arc<AtomicBool>, worker: Option<JoinHandle<()>> }
+type Target=(Arc<VcRvcParams>,Arc<ReloadWaker>);
+struct SharedHttp { clients:Arc<Mutex<Vec<Target>>>, stop:Arc<AtomicBool>, worker:JoinHandle<()> }
+static SERVER:Mutex<Option<SharedHttp>>=Mutex::new(None);
+pub(crate) struct HttpControl { params:Arc<VcRvcParams> }
 impl HttpControl {
     pub(crate) fn start(params: Arc<VcRvcParams>, waker: Arc<ReloadWaker>) -> io::Result<Self> {
+        let mut server=SERVER.lock().unwrap_or_else(|e|e.into_inner());
+        if let Some(shared)=server.as_ref(){
+            shared.clients.lock().unwrap_or_else(|e|e.into_inner()).push((params.clone(),waker));
+            params.diagnostics.event("HTTP_JOIN","shared localhost:18765");
+            return Ok(Self{params});
+        }
         let listener = TcpListener::bind(HOST)?;
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
+        let clients=Arc::new(Mutex::new(vec![(params.clone(),waker)]));
+        let targets=clients.clone();
+        let diag=params.diagnostics.clone();
         let worker = thread::Builder::new().name("voicebank-http".into()).spawn(move || {
-            params.diagnostics.event("HTTP_START", ORIGIN);
+            diag.event("HTTP_START", ORIGIN);
             while !flag.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let result = handle(&mut stream, &params, &waker);
-                        if let Err(err) = result { params.diagnostics.event("HTTP_ERROR", &err.to_string()); }
+                        let snapshot=targets.lock().unwrap_or_else(|e|e.into_inner()).clone();
+                        if let Some((p,w))=snapshot.iter().max_by_key(|(p,_)|(p.loaded_voice_mask.load(Ordering::Acquire).count_ones(),p.audio_seen.load(Ordering::Acquire))){
+                            let result = handle(&mut stream,p,w,&snapshot);
+                            if let Err(err) = result { p.diagnostics.event("HTTP_ERROR", &err.to_string()); }
+                        }
                     }
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => thread::park_timeout(Duration::from_millis(30)),
-                    Err(err) => { params.diagnostics.event("HTTP_ERROR", &err.to_string()); break; }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => thread::park_timeout(Duration::from_millis(10)),
+                    Err(err) => { diag.event("HTTP_ERROR", &err.to_string()); break; }
                 }
             }
-            params.diagnostics.event("HTTP_STOP", ORIGIN);
+            diag.event("HTTP_STOP", ORIGIN);
         })?;
-        Ok(Self { stop, worker: Some(worker) })
+        *server=Some(SharedHttp{clients,stop,worker});
+        Ok(Self { params })
     }
 }
 impl Drop for HttpControl {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() { worker.thread().unpark(); let _ = worker.join(); }
+        let mut server=SERVER.lock().unwrap_or_else(|e|e.into_inner());
+        let empty=if let Some(shared)=server.as_ref(){
+            let mut clients=shared.clients.lock().unwrap_or_else(|e|e.into_inner());
+            clients.retain(|(p,_)|!Arc::ptr_eq(p,&self.params));
+            clients.is_empty()
+        }else{false};
+        if empty {if let Some(shared)=server.take(){shared.stop.store(true,Ordering::Release);shared.worker.thread().unpark();let _=shared.worker.join();}}
     }
 }
 
@@ -57,10 +78,23 @@ fn decode_shortcuts(body: &str) -> Result<HotkeyConfig, String> {
     config.validate()?;
     Ok(config)
 }
+fn json_string(value:&str)->String{
+    let mut result=String::from("\"");
+    for c in value.chars(){match c{
+        '"' => result.push_str("\\\""), '\\'=>result.push_str("\\\\"), '\n'=>result.push_str("\\n"), '\r'=>result.push_str("\\r"), '\t'=>result.push_str("\\t"),
+        c if c.is_control()=>result.push_str(&format!("\\u{:04x}",c as u32)),
+        c=>result.push(c),
+    }}
+    result.push('"');result
+}
 fn state(params: &VcRvcParams) -> String {
     let settings = params.settings.read().unwrap_or_else(|e|e.into_inner());
     let bindings = settings.hotkeys.bindings.iter().map(|b| format!("[{},{}]", b.key, b.modifiers)).collect::<Vec<_>>().join(",");
-    format!("{{\"selected\":{},\"enabled\":{},\"bindings\":[{}]}}", params.selected_voice(), settings.hotkeys.enabled, bindings)
+    let requested=params.selected_voice();
+    let mask=params.loaded_voice_mask.load(Ordering::Acquire);
+    let active=params.active_voice.load(Ordering::Acquire);
+    let status=params.model_message.lock().unwrap_or_else(|e|e.into_inner()).clone();
+    format!("{{\"selected\":{},\"active\":{},\"ready_mask\":{},\"status\":{},\"enabled\":{},\"bindings\":[{}]}}", requested,active,mask,json_string(&status),settings.hotkeys.enabled,bindings)
 }
 fn keys() -> String {
     // Labels generated by key_name are fixed ASCII without quotes.
@@ -84,7 +118,9 @@ fn allowed_request(method: &str, path: &str, host: Option<&str>, origin: Option<
     origin.is_none_or(|value| value == expected_origin)
         && site.is_none_or(|value| value == "same-origin" || value == "none")
 }
-fn handle(stream: &mut TcpStream, params: &VcRvcParams, waker: &ReloadWaker) -> io::Result<()> {
+fn handle(stream: &mut TcpStream, params: &VcRvcParams, waker: &ReloadWaker, targets:&[Target]) -> io::Result<()> {
+    // Accepted sockets inherit nonblocking mode on some Windows hosts.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
     stream.set_write_timeout(Some(Duration::from_millis(200)))?;
     let deadline = Instant::now() + Duration::from_millis(800);
@@ -143,6 +179,8 @@ fn handle(stream: &mut TcpStream, params: &VcRvcParams, waker: &ReloadWaker) -> 
     if let Some(slot)=voice(&path) {
         params.set_selected_voice(slot);
         waker.wake();
+        for (p,w) in targets {if !std::ptr::eq(p.as_ref(),params){p.set_selected_voice(slot);w.wake();}}
+        if !params.voice_loaded(slot){params.diagnostics.event("HTTP_VOICE_UNAVAILABLE",&format!("slot={slot}: model not ready"));}
         params.diagnostics.event("HTTP_VOICE",&format!("Requested voice slot {slot}"));
         return reply(stream,"202 Accepted","application/json",&state(params));
     }
@@ -151,6 +189,7 @@ fn handle(stream: &mut TcpStream, params: &VcRvcParams, waker: &ReloadWaker) -> 
         return match parsed {
             Ok(config)=>{
                 params.settings.write().unwrap_or_else(|e|e.into_inner()).hotkeys=config;
+                for (p,_) in targets {if !std::ptr::eq(p.as_ref(),params){p.settings.write().unwrap_or_else(|e|e.into_inner()).hotkeys=config;}}
                 params.request_save();
                 params.flush_profile();
                 let error=params.diagnostics.profile_error();
@@ -205,7 +244,7 @@ mod tests {
                 response
             });
             let (mut stream,_)=listener.accept().unwrap();
-            handle(&mut stream,&params,&waker).unwrap();
+            handle(&mut stream,&params,&waker,&[]).unwrap();
             drop(stream);
             assert!(client.join().unwrap().contains(expected));
         }

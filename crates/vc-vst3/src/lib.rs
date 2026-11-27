@@ -271,7 +271,11 @@ impl Plugin for VcRvcPlugin {
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         if !cfg!(test) { self.params.audio_seen.store(true, Ordering::Release); }
-        let original = self.params.selected_voice() == 0;
+        let requested=self.params.selected_voice();
+        let fallback=self.runtime.as_ref().is_some_and(|r|r.realtime() && (!r.converter_ready() || !self.params.voice_loaded(requested)));
+        // A missing or failed model must never mute the microphone indefinitely.
+        // The HTTP screen reports fallback separately from the requested voice.
+        let original = requested == 0 || fallback;
         if original != self.was_original {
             if let Some(runtime) = self.runtime.as_mut() { runtime.reset(); }
             if let Some(echo) = self.echo.as_mut() { echo.clear(); }
@@ -282,7 +286,14 @@ impl Plugin for VcRvcPlugin {
             // resample, infer, or apply RVC gain to the original voice.
             0
         } else if let Some(runtime) = self.runtime.as_mut() {
-            runtime.process_block(buffer.as_slice());
+            if runtime.realtime() && self.params.active_voice.load(Ordering::Acquire)!=requested {
+                // Do not play queued audio of the previous voice while the worker
+                // acknowledges the new selection.
+                runtime.wake();
+                for channel in buffer.as_slice(){channel.fill(0.0);}
+            }else{
+                runtime.process_block(buffer.as_slice());
+            }
             runtime.current_latency()
         } else {
             for channel in buffer.as_slice() { channel.fill(0.0); }
@@ -314,6 +325,8 @@ impl Plugin for VcRvcPlugin {
         #[cfg(windows)]
         { self.http_control = None; self.hotkeys = None; }
         self.params.audio_seen.store(false, Ordering::Release);
+        self.params.loaded_voice_mask.store(0,Ordering::Release);
+        self.params.active_voice.store(0,Ordering::Release);
         self.params.echo_hotkey.store(false, Ordering::Release);
         self.applied_settings = self
             .runtime

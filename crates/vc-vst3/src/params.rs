@@ -6,8 +6,8 @@
 //!   window size are non-parameter state persisted via `#[persist]`, so they
 //!   are saved/restored with the project too.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use nice_plug::prelude::*;
 use nice_plug_egui::EguiState;
@@ -80,6 +80,9 @@ pub struct VcRvcParams {
     pub diagnostics: Arc<crate::diagnostics::Diagnostics>,
     pub save_requested: AtomicBool,
     pub audio_seen: AtomicBool,
+    pub loaded_voice_mask: AtomicU32,
+    pub active_voice: AtomicI32,
+    pub model_message: Mutex<String>,
     selected_voice: Arc<AtomicI32>,
     #[id = "pitch"]
     pub pitch_shift: FloatParam,
@@ -108,7 +111,8 @@ pub struct VcRvcParams {
 
 impl VcRvcParams {
     pub(crate) fn selected_voice(&self) -> i32 { self.selected_voice.load(Ordering::Acquire) }
-    pub(crate) fn set_selected_voice(&self, voice: i32) { self.selected_voice.store(voice.clamp(0,4), Ordering::Release); self.save_requested.store(true, Ordering::Release); }
+    pub(crate) fn set_selected_voice(&self, voice: i32) { let voice=voice.clamp(0,4); if self.selected_voice.swap(voice, Ordering::AcqRel)!=voice { self.save_requested.store(true, Ordering::Release); } }
+    pub(crate) fn voice_loaded(&self, voice:i32)->bool { voice==0 || ((1..=4).contains(&voice) && self.loaded_voice_mask.load(Ordering::Acquire)&(1u32<<voice as u32)!=0) }
     pub(crate) fn request_save(&self) { self.save_requested.store(true, Ordering::Release); }
     pub(crate) fn flush_profile(&self) {
         if !self.save_requested.swap(false, Ordering::AcqRel) || cfg!(test) { return; }
@@ -140,6 +144,9 @@ impl Default for VcRvcParams {
             diagnostics: Arc::new(crate::diagnostics::Diagnostics::default()),
             save_requested: AtomicBool::new(false),
             audio_seen: AtomicBool::new(false),
+            loaded_voice_mask: AtomicU32::new(0),
+            active_voice: AtomicI32::new(0),
+            model_message: Mutex::new("Initializing".into()),
             echo_held: AtomicBool::new(false),
             pitch_shift: FloatParam::new(
                 "Pitch",

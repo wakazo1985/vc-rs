@@ -116,8 +116,8 @@ impl Default for PluginConfig {
             noise_gate_attack_ms: 5.0,
             noise_gate_release_ms: 50.0,
             noise_gate_floor: 0.0,
-            chunk_ms: 500,
-            crossfade_ms: 85,
+            chunk_ms: 200,
+            crossfade_ms: 40,
             sola_search_ms: 12,
             rvc_output_tail_discard_ms: 10,
             extra_convert_ms: 100,
@@ -437,7 +437,7 @@ mod tests {
             PluginConfig::default()
                 .validated_chunk_samples(48_000)
                 .unwrap(),
-            24_000
+            9_600
         );
     }
 }
