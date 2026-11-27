@@ -1,0 +1,37 @@
+name: VoiceBank 06 HTML profile control tests
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-stage06-control.yml'
+      - 'crates/vc-vst3/src/control.html'
+      - 'crates/vc-vst3/src/http_control.rs'
+permissions:
+  contents: read
+env:
+  VC_RS_ENABLE_NATIVE_TENSORRT: "0"
+  CARGO_TERM_COLOR: never
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check HTML script syntax and profile field coverage
+        shell: pwsh
+        run: |
+          $html=Get-Content crates/vc-vst3/src/control.html -Raw
+          $js=[regex]::Match($html,'(?s)<script>(.*?)</script>').Groups[1].Value
+          Set-Content -Path "$env:RUNNER_TEMP/voicebank-control.js" -Value $js -Encoding utf8
+          node --check "$env:RUNNER_TEMP/voicebank-control.js"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $config=Get-Content crates/vc-vst3/src/config.rs -Raw
+          $profile=[regex]::Match($config,'(?s)pub struct VoiceProfile \{(.*?)\n\}').Groups[1].Value
+          foreach ($m in [regex]::Matches($profile,'pub (\w+):')) {
+            if (!$js.Contains("'"+$m.Groups[1].Value+"'")) { throw "Missing UI field: $($m.Groups[1].Value)" }
+          }
+      - name: Test Rust HTTP validation and existing host functions
+        shell: pwsh
+        run: |
+          cargo test -p vc-vst3 --no-default-features --features tensorrt --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

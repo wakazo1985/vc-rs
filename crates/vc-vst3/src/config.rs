@@ -134,7 +134,8 @@ impl VoiceProfile {
             noise_gate_threshold: 10.0_f32.powf(self.noise_gate_threshold_db / 20.0),
         }
     }
-    fn validate_live(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate_live(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(matches!(self.smoother.as_str(), "sola" | "psola" | "phase-vocoder"), "Invalid smoother");
         vc_core::model_rvc::F0PostprocessConfig::with_input_range(self.input_f0_min_hz,self.input_f0_max_hz)?;
         vc_core::model_rvc::F0PostprocessConfig::with_input_range(self.output_f0_min_hz,self.output_f0_max_hz)?;
         anyhow::ensure!(self.pitch_shift.is_finite() && (-24.0..=24.0).contains(&self.pitch_shift), "Invalid voice pitch");

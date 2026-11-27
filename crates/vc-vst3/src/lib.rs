@@ -225,6 +225,7 @@ impl Plugin for VcRvcPlugin {
             }
         }
         let sample_rate = buffer_config.sample_rate.round() as u32;
+        self.params.diagnostics.host_sample_rate.store(sample_rate as u64,Ordering::Relaxed);
         let max_block = buffer_config.max_buffer_size as usize;
         self.echo = Some(echo::HoldEcho::new(sample_rate));
         self.was_original = self.params.selected_voice() == 0;
@@ -295,6 +296,7 @@ impl Plugin for VcRvcPlugin {
             for channel in buffer.as_slice() { channel.fill(0.0); }
             0
         };
+        self.params.diagnostics.host_latency_samples.store(latency as u64,Ordering::Relaxed);
         if self.last_host_latency != Some(latency) {
             context.set_latency_samples(latency);
             self.last_host_latency = Some(latency);

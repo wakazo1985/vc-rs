@@ -64,6 +64,11 @@ pub(crate) struct Diagnostics {
     file_guard: Mutex<()>,
     last_error: Mutex<Option<String>>,
     profile_error: Mutex<Option<String>>,
+    pub runtime_error: Mutex<Option<String>>,
+    pub host_latency_samples: AtomicU64,
+    pub host_sample_rate: AtomicU64,
+    pub last_switch_us: AtomicU64,
+    pub switch_count: AtomicU64,
     pub input_dropped: AtomicU64,
     pub output_missing: AtomicU64,
     pub output_dropped: AtomicU64,
@@ -79,6 +84,7 @@ impl Default for Diagnostics {
         )));
         Self {
             path, file_guard: Mutex::new(()), last_error: Mutex::new(None), profile_error: Mutex::new(None),
+            runtime_error: Mutex::new(None), host_latency_samples: AtomicU64::new(0), host_sample_rate: AtomicU64::new(0), last_switch_us: AtomicU64::new(0), switch_count: AtomicU64::new(0),
             input_dropped: AtomicU64::new(0), output_missing: AtomicU64::new(0),
             output_dropped: AtomicU64::new(0), chunks: AtomicU64::new(0),
             last_processing_us: AtomicU64::new(0),
@@ -101,6 +107,9 @@ impl Diagnostics {
     }
     /// Worker/UI/control thread only. Rotate at 8 MiB, retaining one previous file.
     pub(crate) fn event(&self, category: &str, detail: &str) {
+        if matches!(category,"ERROR" | "VOICE_LOAD_ERROR" | "INDEX_ERROR" | "HTTP_ERROR" | "GPU_MEMORY_UNAVAILABLE") {
+            *self.runtime_error.lock().unwrap_or_else(|e|e.into_inner())=Some(format!("{category}: {detail}"));
+        }
         if cfg!(test) { return; }
         let _guard = self.file_guard.lock().unwrap_or_else(|e| e.into_inner());
         let result = (|| -> anyhow::Result<()> {

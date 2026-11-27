@@ -78,23 +78,86 @@ fn decode_shortcuts(body: &str) -> Result<HotkeyConfig, String> {
     config.validate()?;
     Ok(config)
 }
-fn json_string(value:&str)->String{
-    let mut result=String::from("\"");
-    for c in value.chars(){match c{
-        '"' => result.push_str("\\\""), '\\'=>result.push_str("\\\\"), '\n'=>result.push_str("\\n"), '\r'=>result.push_str("\\r"), '\t'=>result.push_str("\\t"),
-        c if c.is_control()=>result.push_str(&format!("\\u{:04x}",c as u32)),
-        c=>result.push(c),
-    }}
-    result.push('"');result
-}
 fn state(params: &VcRvcParams) -> String {
     let settings = params.settings.read().unwrap_or_else(|e|e.into_inner());
-    let bindings = settings.hotkeys.bindings.iter().map(|b| format!("[{},{}]", b.key, b.modifiers)).collect::<Vec<_>>().join(",");
-    let requested=params.selected_voice();
-    let mask=params.loaded_voice_mask.load(Ordering::Acquire);
-    let active=params.active_voice.load(Ordering::Acquire);
-    let status=params.model_message.lock().unwrap_or_else(|e|e.into_inner()).clone();
-    format!("{{\"selected\":{},\"active\":{},\"ready_mask\":{},\"status\":{},\"enabled\":{},\"bindings\":[{}]}}", requested,active,mask,json_string(&status),settings.hotkeys.enabled,bindings)
+    let diag=&params.diagnostics;
+    let rate=diag.host_sample_rate.load(Ordering::Relaxed);
+    let chunks=diag.chunks.load(Ordering::Relaxed);
+    let switches=diag.switch_count.load(Ordering::Acquire);
+    serde_json::json!({
+        "selected":params.selected_voice(),
+        "active":params.active_voice.load(Ordering::Acquire),
+        "ready_mask":params.loaded_voice_mask.load(Ordering::Acquire),
+        "status":params.model_message.lock().unwrap_or_else(|e|e.into_inner()).clone(),
+        "enabled":settings.hotkeys.enabled,
+        "bindings":settings.hotkeys.bindings.iter().map(|b|[b.key as u32,b.modifiers as u32]).collect::<Vec<_>>(),
+        "diagnostics":{
+            "host_latency_samples":diag.host_latency_samples.load(Ordering::Relaxed),
+            "host_sample_rate":rate,
+            "processing_ms":(chunks>0).then(||diag.last_processing_us.load(Ordering::Relaxed) as f64/1000.0),
+            "switch_enqueue_ms":(switches>0).then(||diag.last_switch_us.load(Ordering::Relaxed) as f64/1000.0),
+            "chunks":chunks,
+            "input_dropped":diag.input_dropped.load(Ordering::Relaxed),
+            "output_missing":diag.output_missing.load(Ordering::Relaxed),
+            "output_dropped":diag.output_dropped.load(Ordering::Relaxed),
+            "error":diag.runtime_error.lock().unwrap_or_else(|e|e.into_inner()).clone(),
+            "profile_error":diag.profile_error(),
+            "log_error":diag.error(),
+            "log_path":diag.path()
+        }
+    }).to_string()
+}
+fn profile_slot(path:&str)->Option<usize>{
+    match path.strip_prefix("/api/profile/")? {"toddler"=>Some(0),"girl"=>Some(1),"male"=>Some(2),"robot"=>Some(3),_=>None}
+}
+fn profiles(params:&VcRvcParams)->String {
+    let settings=params.settings.read().unwrap_or_else(|e|e.into_inner());
+    serde_json::json!({"saved":settings.voice_profiles,"defaults":std::array::from_fn::<_,4,_>(crate::config::VoiceProfile::initial)}).to_string()
+}
+fn decode_profile(body:&str,slot:usize,settings:&crate::config::PluginConfig)->anyhow::Result<crate::config::VoiceProfile> {
+    use crate::config::VoiceProfile;
+    let value:serde_json::Value=serde_json::from_str(body)?;
+    let expected=serde_json::to_value(VoiceProfile::initial(slot))?;
+    let actual=value.as_object().ok_or_else(||anyhow::anyhow!("Profile must be a JSON object"))?;
+    let fields=expected.as_object().expect("profile object");
+    anyhow::ensure!(actual.len()==fields.len() && fields.keys().all(|k|actual.contains_key(k)),"Profile fields missing or unknown");
+    let profile:VoiceProfile=serde_json::from_value(value)?;
+    profile.validate_live()?;
+    let mut candidate=settings.clone();
+    candidate.voice_profiles[slot]=profile.clone();
+    candidate.for_voice(slot).validate()?;
+    Ok(profile)
+}
+fn save_voice_profile(params:&VcRvcParams,waker:&ReloadWaker,targets:&[Target],slot:usize,body:&str)->Result<(),( &'static str,String)> {
+    // Validate and persist before publishing changes to the live settings.
+    // Only this slot is modified; shortcuts, model paths and other slots stay intact.
+    let mut settings=params.settings.write().unwrap_or_else(|e|e.into_inner());
+    let profile=decode_profile(body,slot,&settings).map_err(|e|("400 Bad Request",e.to_string()))?;
+    let mut next=settings.clone();
+    next.voice_profiles[slot]=profile.clone();
+    next.startup_voice=params.selected_voice();
+    if !cfg!(test) {
+        crate::diagnostics::save_profile(&next).map_err(|e|{
+            params.diagnostics.set_profile_error(Some(e.to_string()));
+            ("500 Internal Server Error",e.to_string())
+        })?;
+    }
+    *settings=next;
+    let reload=settings.has_voice_bank();
+    drop(settings);
+    params.diagnostics.set_profile_error(None);
+    if reload {params.profile_reload_requested.store(true,Ordering::Release);waker.wake();}
+    for (p,w) in targets {
+        if !std::ptr::eq(p.as_ref(),params) {
+            let mut config=p.settings.write().unwrap_or_else(|e|e.into_inner());
+            config.voice_profiles[slot]=profile.clone();
+            let reload=config.has_voice_bank() && (p.audio_seen.load(Ordering::Acquire)||p.loaded_voice_mask.load(Ordering::Acquire)!=0);
+            drop(config);
+            if reload {p.profile_reload_requested.store(true,Ordering::Release);w.wake();}
+        }
+    }
+    params.diagnostics.event("HTTP_PROFILE",&format!("slot={} saved; reload_requested={reload}",slot+1));
+    Ok(())
 }
 fn keys() -> String {
     // Labels generated by key_name are fixed ASCII without quotes.
@@ -172,6 +235,7 @@ fn handle(stream: &mut TcpStream, params: &VcRvcParams, waker: &ReloadWaker, tar
             "/"|"/control.html"=>reply(stream,"200 OK","text/html",HTML),
             "/api/state"=>reply(stream,"200 OK","application/json",&state(params)),
             "/api/keys"=>reply(stream,"200 OK","application/json",&keys()),
+            "/api/profiles"=>reply(stream,"200 OK","application/json",&profiles(params)),
             _=>reply(stream,"404 Not Found","text/plain","Not found"),
         };
     }
@@ -183,6 +247,13 @@ fn handle(stream: &mut TcpStream, params: &VcRvcParams, waker: &ReloadWaker, tar
         if !params.voice_loaded(slot){params.diagnostics.event("HTTP_VOICE_UNAVAILABLE",&format!("slot={slot}: model not ready"));}
         params.diagnostics.event("HTTP_VOICE",&format!("Requested voice slot {slot}"));
         return reply(stream,"202 Accepted","application/json",&state(params));
+    }
+    if let Some(slot)=profile_slot(&path) {
+        let body=match std::str::from_utf8(&data[head_end..head_end+len]) {Ok(s)=>s,Err(_)=>return reply(stream,"400 Bad Request","text/plain","Invalid UTF-8")};
+        return match save_voice_profile(params,waker,targets,slot,body) {
+            Ok(())=>reply(stream,"200 OK","application/json",&profiles(params)),
+            Err((status,err))=>reply(stream,status,"text/plain",&err),
+        };
     }
     if path=="/api/shortcuts" {
         let parsed=std::str::from_utf8(&data[head_end..head_end+len]).map_err(|_|"Invalid UTF-8".to_owned()).and_then(decode_shortcuts);
@@ -216,6 +287,29 @@ mod tests {
         assert!(!allowed_request("POST", "/api/voice/girl", Some(HOST), Some("https://example.com"), None));
         assert!(!allowed_request("GET", "/api/state", Some(HOST), None, Some("cross-site")));
         assert!(!allowed_request("GET", "/control.html", Some("example.com:18765"), None, None));
+    }
+    #[test] fn profile_api_changes_only_one_slot_and_rejects_invalid_payloads() {
+        let p=VcRvcParams::default();
+        let w=ReloadWaker::default();
+        let before=p.settings.read().unwrap().clone();
+        let mut profile=before.voice_profiles[1].clone();
+        profile.pitch_shift=9.0;
+        profile.input_f0_min_hz=70.0;
+        profile.formant_shift=1.0;
+        let body=serde_json::to_string(&profile).unwrap();
+        save_voice_profile(&p,&w,&[],1,&body).unwrap();
+        let after=p.settings.read().unwrap().clone();
+        assert_eq!(after.voice_profiles[1],profile);
+        for i in [0,2,3] {assert_eq!(after.voice_profiles[i],before.voice_profiles[i]);}
+        assert_eq!(after.hotkeys,before.hotkeys);
+        assert!(save_voice_profile(&p,&w,&[],1,"{}").is_err());
+        profile.chunk_ms=19;
+        assert!(save_voice_profile(&p,&w,&[],1,&serde_json::to_string(&profile).unwrap()).is_err());
+        assert_eq!(*p.settings.read().unwrap(),after);
+        let response:serde_json::Value=serde_json::from_str(&profiles(&p)).unwrap();
+        assert_eq!(response["saved"][1]["pitch_shift"],9.0);
+        assert_eq!(response["defaults"][1]["pitch_shift"],12.0);
+        assert!(serde_json::from_str::<serde_json::Value>(&state(&p)).unwrap()["diagnostics"]["processing_ms"].is_null());
     }
     #[test] fn all_voice_routes() {
         for (i,name) in ["original","toddler","girl","male","robot"].iter().enumerate() {

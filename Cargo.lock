@@ -4438,6 +4438,7 @@ dependencies = [
  "rfd",
  "rtrb",
  "serde",
+ "serde_json",
  "toml",
  "vc-core",
  "vc-models",

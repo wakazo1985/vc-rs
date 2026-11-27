@@ -825,7 +825,7 @@ impl WorkerCtx {
             }
             // The editor prevents another request while this one is loading, so
             // the worker can act immediately without a debounce timer.
-            if self.reload.swap(false, Ordering::SeqCst) {
+            if self.reload.swap(false, Ordering::SeqCst) | self.params.profile_reload_requested.swap(false, Ordering::AcqRel) {
                 // Clear before taking the snapshot. An edit after this point
                 // re-sets dirty and remains visibly staged for the next load.
                 self.dirty.store(false, Ordering::SeqCst);
@@ -1071,6 +1071,7 @@ impl WorkerCtx {
                 // it before sleeping even if the host has stopped sending audio.
                 if self.params.selected_voice() != selected
                     || self.reload.load(Ordering::Acquire)
+                    || self.params.profile_reload_requested.load(Ordering::Acquire)
                     || self.state.generation.load(Ordering::Acquire) != generation {
                     continue;
                 }
@@ -1160,7 +1161,10 @@ impl WorkerCtx {
             }
             if pushed > 0 {
                 if let Some((slot, started)) = pending_switch.take() {
-                    self.params.diagnostics.event("VOICE_SWITCH_OUTPUT", &format!("slot={slot} first_enqueue_ms={:.2} queued_samples={pushed} {}",started.elapsed().as_secs_f64()*1000.0,self.params.diagnostics.counters()));
+                    let elapsed=started.elapsed();
+                    self.params.diagnostics.last_switch_us.store(elapsed.as_micros().min(u64::MAX as u128) as u64,Ordering::Relaxed);
+                    self.params.diagnostics.switch_count.fetch_add(1,Ordering::Release);
+                    self.params.diagnostics.event("VOICE_SWITCH_OUTPUT", &format!("slot={slot} first_enqueue_ms={:.2} queued_samples={pushed} {}",elapsed.as_secs_f64()*1000.0,self.params.diagnostics.counters()));
                 }
             }
         }
