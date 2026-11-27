@@ -1,0 +1,68 @@
+name: VoiceBank stage 11 VST3 host conformance
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-stage11.yml'
+permissions:
+  contents: read
+env:
+  VC_RS_ENABLE_NATIVE_TENSORRT: "0"
+  CARGO_TERM_COLOR: never
+jobs:
+  host-validation:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build Windows x64 VST3 and bootstrapper
+        shell: pwsh
+        run: |
+          cargo xtask bundle vc-vst3 --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -File crates/vc-vst3/package-windowsml.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify bundle layout and writable settings folder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force stage11-logs | Out-Null
+          pwsh -File scripts/voicebank-host-preflight.ps1 -Bundle target/bundled/vc-vst3.vst3 *> stage11-logs/preflight.json
+          $code=$LASTEXITCODE
+          Get-Content stage11-logs/preflight.json
+          if ($code -ne 0) { exit $code }
+      - name: Build official Steinberg VST3 validator
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          pwsh -File scripts/install-vst3-validator.ps1 *> stage11-logs/validator-build.log
+          $code=$LASTEXITCODE
+          Get-Content stage11-logs/validator-build.log -Tail 60
+          if ($code -ne 0) { exit $code }
+      - name: Run native VST3 host conformance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $v=Get-ChildItem external/steinberg/vst3sdk-build -Recurse -Filter validator.exe | Select-Object -First 1
+          if (!$v) { throw 'Validator not found' }
+          $bundle=(Resolve-Path target/bundled/vc-vst3.vst3).Path
+          & $v.FullName $bundle *> stage11-logs/validator.log
+          $code=$LASTEXITCODE
+          Get-Content stage11-logs/validator.log
+          if ($code -ne 0) { exit $code }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage11-host-validation-logs
+          path: stage11-logs/
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: stage11-host-validated-windowsml
+          path: target/bundled/vc-vst3.vst3/
+          if-no-files-found: error
