@@ -44,6 +44,8 @@ pub struct PluginConfig {
     pub model: PathBuf,
     pub voice_slots: [VoiceSlot; 4],
     pub hotkeys: crate::hotkeys::HotkeyConfig,
+    pub startup_voice: i32,
+    pub detailed_diagnostics: bool,
     pub embedder: PathBuf,
     pub f0_model: PathBuf,
     pub embedder_output: Option<String>,
@@ -93,6 +95,8 @@ impl Default for PluginConfig {
             model: PathBuf::new(),
             voice_slots: std::array::from_fn(|_| VoiceSlot::default()),
             hotkeys: Default::default(),
+            startup_voice: 1,
+            detailed_diagnostics: false,
             embedder: PathBuf::new(),
             f0_model: PathBuf::new(),
             embedder_output: None,
@@ -189,6 +193,8 @@ impl PluginConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!((0..=4).contains(&self.startup_voice), "Invalid startup voice");
+        self.hotkeys.validate().map_err(anyhow::Error::msg)?;
         let limits = ConversionTimingLimits {
             min_extra_convert_ms: PLUGIN_MIN_EXTRA_CONVERT_MS,
             ..CONVERSION_TIMING_LIMITS
@@ -262,6 +268,9 @@ impl PluginConfig {
             if path.is_file() {
                 return Some(path);
             }
+        }
+        if let Some(path) = crate::diagnostics::profile_path() {
+            if path.is_file() { return Some(path); }
         }
         if let Some(dir) = os_config_dir() {
             let path = dir.join("vc-rs").join("vst3.toml");

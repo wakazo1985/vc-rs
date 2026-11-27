@@ -121,10 +121,14 @@ mod worker {
                         drop(settings);
                         let events = tracker.update(config, modifiers(), down);
                         if let Some(voice) = events.voice {
+                            worker_params.diagnostics.event("SHORTCUT", &format!("Voice slot {voice}"));
                             worker_params.set_selected_voice(voice);
                             waker.wake();
                         }
-                        worker_params.echo_hotkey.store(events.echo, Ordering::Release);
+                        let previous = worker_params.echo_hotkey.swap(events.echo, Ordering::AcqRel);
+                        if previous != events.echo {
+                            worker_params.diagnostics.event("SHORTCUT", if events.echo { "Echo pressed" } else { "Echo released" });
+                        }
                     }
                     thread::park_timeout(Duration::from_millis(10));
                 }

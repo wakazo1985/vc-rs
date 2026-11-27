@@ -172,6 +172,7 @@ fn draw_contents(ui: &mut egui::Ui, setter: &ParamSetter, state: &mut EditorStat
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
     ui.small("Echo applies only while held. Select a loaded voice after Load / Reload.");
     draw_hotkeys(ui, state);
+    draw_diagnostics(ui, setter, state);
     ui.heading("Live controls");
     ui.small("Changes apply immediately and can be automated in your DAW.");
     egui::Grid::new("params").num_columns(2).show(ui, |ui| {
@@ -248,11 +249,77 @@ fn draw_hotkeys(ui: &mut egui::Ui, state: &EditorState) {
         if ui.button("Reset F5 - F10").clicked() { config = Default::default(); }
         if config != original {
             match config.validate() {
-                Ok(()) => state.params.settings.write().unwrap().hotkeys = config,
+                Ok(()) => {
+                    state.params.settings.write().unwrap().hotkeys = config;
+                    state.params.request_save();
+                    state.params.diagnostics.event("SHORTCUT_CONFIG", "Bindings updated");
+                    state.reload_waker.wake();
+                },
                 Err(error) => { ui.colored_label(egui::Color32::RED, error); }
             }
         }
         ui.small("Changes apply immediately. Host shortcuts may still receive the same key.");
+    });
+}
+
+fn draw_diagnostics(ui: &mut egui::Ui, setter: &ParamSetter, state: &EditorState) {
+    egui::CollapsingHeader::new("Settings backup / Diagnostics").show(ui, |ui| {
+        ui.label("Local settings");
+        let path = crate::diagnostics::profile_path().map(|p|p.display().to_string()).unwrap_or_else(|| "Unavailable".into());
+        ui.monospace(&path);
+        let loading = state.loading.load(Ordering::Acquire);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Save settings").clicked() {
+                state.params.request_save();
+                state.reload_waker.wake();
+            }
+            if ui.add_enabled(!loading, egui::Button::new("Restore saved settings")).clicked() {
+                match crate::diagnostics::load_profile() {
+                    Ok(config) => {
+                        let voice = config.startup_voice;
+                        *state.params.settings.write().unwrap() = config;
+                        setter.begin_set_parameter(&state.params.voice_slot);
+                        setter.set_parameter(&state.params.voice_slot, voice);
+                        setter.end_set_parameter(&state.params.voice_slot);
+                        state.params.set_selected_voice(voice);
+                        state.dirty.store(true, Ordering::Release);
+                        state.reload_waker.wake();
+                        state.params.diagnostics.event("SETTINGS_RESTORED", "Local profile restored; apply with Load / Reload");
+                    }
+                    Err(error) => {
+                        state.params.diagnostics.event("ERROR", &format!("Restore settings: {error:#}"));
+                        *state.status.lock().unwrap() = PluginStatus { summary:"Local settings restore failed".into(), detail:Some(format!("{error:#}")) };
+                    }
+                }
+            }
+        });
+        let mut detailed = state.params.settings.read().unwrap().detailed_diagnostics;
+        if ui.checkbox(&mut detailed, "Log every inference chunk").changed() {
+            state.params.settings.write().unwrap().detailed_diagnostics = detailed;
+            state.params.request_save();
+            state.reload_waker.wake();
+        }
+        ui.label("Log file (local only)");
+        let log_path = state.params.diagnostics.path();
+        ui.monospace(&log_path);
+        ui.horizontal(|ui| {
+            if ui.button("Copy log path").clicked() { ui.ctx().copy_text(log_path.clone()); }
+            #[cfg(windows)]
+            if ui.button("Open log folder").clicked() {
+                if let Some(dir) = crate::diagnostics::local_dir() {
+                    let folder = dir.join("logs");
+                    if let Err(error) = std::fs::create_dir_all(&folder).and_then(|()| std::process::Command::new("explorer.exe").arg(folder).spawn().map(|_| ())) {
+                        state.params.diagnostics.event("ERROR", &format!("Open log folder: {error}"));
+                    }
+                }
+            }
+        });
+        ui.monospace(state.params.diagnostics.counters());
+        ui.small("Output missing includes startup, resets and underruns; it is not a count of audible errors.");
+        if let Some(error) = state.params.diagnostics.error() {
+            ui.colored_label(egui::Color32::RED, format!("Log write failed: {error}"));
+        }
+        ui.small("Only settings and numeric measurements are stored; no recorded microphone audio.");
     });
 }
 
@@ -294,6 +361,8 @@ fn draw_setup(ui: &mut egui::Ui, state: &mut EditorState) {
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
+            state.params.request_save();
+            state.params.diagnostics.event("LOAD_REQUEST", "Load / Reload pressed");
             state.reload.store(true, Ordering::SeqCst);
             // Wake the worker so it picks up the request immediately, even if the
             // host is idle and not driving process() (no input wakes arriving).
@@ -610,9 +679,12 @@ fn spawn_picker(state: &EditorState, kind: ModelKind) {
                 }
             }
             dirty.store(true, Ordering::SeqCst);
+            params.request_save();
+            params.diagnostics.event("MODEL_PATH", "Model path changed");
         }
     });
     if let Err(error) = result {
+        state.params.diagnostics.event("ERROR", &format!("File picker: {error}"));
         *state.status.lock().unwrap() = PluginStatus {
             summary: "file picker failed".into(),
             detail: Some(error.to_string()),
@@ -730,6 +802,8 @@ fn backend_status_summary(summary: &str) -> String {
 
 fn mark_dirty(state: &EditorState) {
     state.dirty.store(true, Ordering::SeqCst);
+    state.params.request_save();
+    state.reload_waker.wake();
 }
 
 #[cfg(test)]

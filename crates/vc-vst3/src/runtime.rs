@@ -50,6 +50,7 @@ struct QueuedSample {
 }
 
 struct RuntimeState {
+    diagnostics: Arc<crate::diagnostics::Diagnostics>,
     generation: AtomicU32,
     ready_generation: AtomicU32,
     input_hop: AtomicUsize,
@@ -354,6 +355,7 @@ impl PluginRuntime {
         let latency_samples = (chunk_samples + extra_samples) as u32;
         let latency = Arc::new(AtomicU32::new(latency_samples));
         let state = Arc::new(RuntimeState {
+            diagnostics: params.diagnostics.clone(),
             generation: AtomicU32::new(1),
             ready_generation: AtomicU32::new(0),
             input_hop: AtomicUsize::new(chunk_samples),
@@ -523,6 +525,7 @@ impl PluginRuntime {
 
         // Queue input; drop on overflow (worker is behind, audio keeps flowing).
         let (pushed, _) = self.input_producer.push_partial_slice(&self.mono_in);
+        self.state.diagnostics.input_dropped.fetch_add(n.saturating_sub(pushed.len()) as u64, Ordering::Relaxed);
         if !pushed.is_empty() {
             // Wake the worker now that input is queued instead of letting it find
             // the data on a fixed poll. unpark is wait-free (token store, or one
@@ -567,11 +570,14 @@ impl PluginRuntime {
         } else if self.state.ready_generation.load(Ordering::Acquire) == generation
             && !self.loading.load(Ordering::Acquire)
         {
-            read_generation(
+            let read = read_generation(
                 &mut self.output_consumer,
                 generation,
                 &mut self.mono_out[..n],
             );
+            self.state.diagnostics.output_missing.fetch_add(n.saturating_sub(read) as u64, Ordering::Relaxed);
+        } else {
+            self.state.diagnostics.output_missing.fetch_add(n as u64, Ordering::Relaxed);
         }
         if self.state.generation.load(Ordering::Acquire) != generation {
             self.mono_out[..n].fill(0.0);
@@ -671,6 +677,10 @@ impl WorkerCtx {
         };
         let mut last_voice_request = self.params.selected_voice().saturating_sub(1) as usize;
         let initial_settings = self.initial_settings.clone();
+        let mut last_profile_flush = std::time::Instant::now();
+        let mut last_chunk_log = std::time::Instant::now();
+        let mut last_selection = self.params.selected_voice();
+        self.params.diagnostics.event("WORKER_START", &format!("rate={} provider={}", self.sample_rate, initial_settings.provider));
         let initial_chunk = initial_settings.validated_chunk_samples(self.sample_rate);
         // Invalid persisted settings never load a model. The fallback only
         // sizes the idle/silent worker until the user submits valid settings.
@@ -716,6 +726,15 @@ impl WorkerCtx {
         self.state.notify_offline();
 
         while self.running.load(Ordering::SeqCst) {
+            if last_profile_flush.elapsed() >= Duration::from_millis(500) {
+                self.params.flush_profile();
+                last_profile_flush = std::time::Instant::now();
+            }
+            let selection = self.params.selected_voice();
+            if selection != last_selection {
+                self.params.diagnostics.event("VOICE_REQUEST", &format!("slot={} previous={}", selection, last_selection));
+                last_selection = selection;
+            }
             // The editor prevents another request while this one is loading, so
             // the worker can act immediately without a debounce timer.
             if self.reload.swap(false, Ordering::SeqCst) {
@@ -854,11 +873,21 @@ impl WorkerCtx {
             // single `apply_live` entry point rather than diverging set_* calls.
             current.apply_live(&self.live_params());
 
-            if let Err(err) = current.process(chunk, self.sample_rate, &mut chunk_out) {
-                generation = self.fail_conversion("chunk conversion failed", err);
-                converter = None;
-                input_acc.clear();
-                continue;
+            let stats = match current.process(chunk, self.sample_rate, &mut chunk_out) {
+                Ok(stats) => stats,
+                Err(err) => {
+                    generation = self.fail_conversion("chunk conversion failed", err);
+                    converter = None;
+                    input_acc.clear();
+                    continue;
+                }
+            };
+            self.params.diagnostics.record_chunk(&stats);
+            let detailed = self.params.settings.try_read().map(|s|s.detailed_diagnostics).unwrap_or(false);
+            if detailed || last_chunk_log.elapsed() >= Duration::from_secs(5) {
+                let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+                self.params.diagnostics.event("INFERENCE", &format!("voice={} silent={} inference_ms={:.2} embedder_ms={:.2} f0_ms={:.2} rvc_ms={:.2} smoothing_ms={:.2} model_output_samples={} content_delay_samples={:?} {}", self.params.selected_voice(), stats.silent, ms(stats.inference_time), ms(stats.embedder_time), ms(stats.pitch_time), ms(stats.rvc_time), ms(stats.smoothing_time), stats.model_output_samples, stats.content_delay_samples, self.params.diagnostics.counters()));
+                last_chunk_log = std::time::Instant::now();
             }
             // The shared converter now knows the model's native rate, actual
             // capped overlap, and both rate-adapter delays. Report these once
@@ -897,7 +926,12 @@ impl WorkerCtx {
                 // unparks us; realtime retains the bounded drop-on-overflow rule.
                 thread::park_timeout(Duration::from_millis(100));
             }
+            if !self.state.offline.load(Ordering::Acquire) {
+                self.params.diagnostics.output_dropped.fetch_add(queued_output.len().saturating_sub(pushed) as u64, Ordering::Relaxed);
+            }
         }
+        self.params.flush_profile();
+        self.params.diagnostics.event("WORKER_STOP", &self.params.diagnostics.counters());
     }
 
     fn fail_conversion(&self, summary: &str, error: anyhow::Error) -> u32 {
@@ -1023,16 +1057,21 @@ impl WorkerCtx {
     }
 
     fn set_status(&self, text: impl Into<String>) {
+        let text = text.into();
+        self.params.diagnostics.event("STATUS", &text);
         if let Ok(mut status) = self.status.lock() {
             *status = PluginStatus::new(text);
         }
     }
 
     fn set_error(&self, summary: impl Into<String>, detail: impl Into<String>) {
+        let summary = summary.into();
+        let detail = detail.into();
+        self.params.diagnostics.event("ERROR", &format!("{summary}: {detail}"));
         if let Ok(mut status) = self.status.lock() {
             *status = PluginStatus {
-                summary: summary.into(),
-                detail: Some(detail.into()),
+                summary,
+                detail: Some(detail),
             };
         }
     }
@@ -1154,6 +1193,7 @@ impl WorkerCtx {
         provider: vc_core::Provider,
         chunk_samples: usize,
     ) -> anyhow::Result<RvcPipeline> {
+        self.params.diagnostics.event("MODEL_LOAD", &format!("provider={} model={} embedder={} f0={} chunk_samples={} sample_rate={}", provider.label(), settings.model.display(), settings.embedder.display(), settings.f0_model.display(), chunk_samples, self.sample_rate));
         let report_progress = |progress| self.report_load_progress(progress);
         RvcPipeline::load(RvcPipelineConfig {
             model: &settings.model,

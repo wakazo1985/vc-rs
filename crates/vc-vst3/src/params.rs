@@ -35,16 +35,16 @@ impl SettingsState {
         self.restore_revision.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn seed_if_pristine(&self, discover: impl FnOnce() -> PluginConfig) {
+    pub(crate) fn seed_if_pristine(&self, discover: impl FnOnce() -> PluginConfig) -> bool {
         let pristine = |value: &PluginConfig| {
             self.restore_revision() == 0 && *value == PluginConfig::default()
         };
         if !pristine(&self.value.read().unwrap()) {
-            return;
+            return false;
         }
         let seed = discover();
-        if !seed.has_models() {
-            return;
+        if seed == PluginConfig::default() {
+            return false;
         }
         let mut value = self.value.write().unwrap();
         // Config discovery does file I/O without holding the settings lock.
@@ -52,7 +52,8 @@ impl SettingsState {
         // which happened meanwhile always wins over the fresh-instance seed.
         if pristine(&value) {
             *value = seed;
-        }
+            true
+        } else { false }
     }
 }
 
@@ -76,6 +77,8 @@ pub struct VcRvcParams {
     pub voice_slot: IntParam,
     pub echo_held: AtomicBool,
     pub echo_hotkey: AtomicBool,
+    pub diagnostics: Arc<crate::diagnostics::Diagnostics>,
+    pub save_requested: AtomicBool,
     selected_voice: Arc<AtomicI32>,
     #[id = "pitch"]
     pub pitch_shift: FloatParam,
@@ -104,7 +107,17 @@ pub struct VcRvcParams {
 
 impl VcRvcParams {
     pub(crate) fn selected_voice(&self) -> i32 { self.selected_voice.load(Ordering::Acquire) }
-    pub(crate) fn set_selected_voice(&self, voice: i32) { self.selected_voice.store(voice.clamp(0,4), Ordering::Release); }
+    pub(crate) fn set_selected_voice(&self, voice: i32) { self.selected_voice.store(voice.clamp(0,4), Ordering::Release); self.save_requested.store(true, Ordering::Release); }
+    pub(crate) fn request_save(&self) { self.save_requested.store(true, Ordering::Release); }
+    pub(crate) fn flush_profile(&self) {
+        if !self.save_requested.swap(false, Ordering::AcqRel) || cfg!(test) { return; }
+        let mut config = self.settings.read().unwrap().clone();
+        config.startup_voice = self.selected_voice();
+        match crate::diagnostics::save_profile(&config) {
+            Ok(()) => self.diagnostics.event("SETTINGS_SAVED", "Local settings backup updated"),
+            Err(error) => self.diagnostics.event("ERROR", &format!("Save local settings: {error:#}")),
+        }
+    }
 }
 
 impl Default for VcRvcParams {
@@ -116,6 +129,8 @@ impl Default for VcRvcParams {
                 .with_callback(Arc::new(move |value| selection_callback.store(value, Ordering::Release))),
             selected_voice,
             echo_hotkey: AtomicBool::new(false),
+            diagnostics: Arc::new(crate::diagnostics::Diagnostics::default()),
+            save_requested: AtomicBool::new(false),
             echo_held: AtomicBool::new(false),
             pitch_shift: FloatParam::new(
                 "Pitch",

@@ -1,0 +1,49 @@
+name: VoiceBank stage 09 settings and diagnostics
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-stage09.yml'
+permissions:
+  contents: read
+env:
+  VC_RS_ENABLE_NATIVE_TENSORRT: "0"
+  CARGO_TERM_COLOR: never
+jobs:
+  compile:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build Windows ML VST3 and bootstrapper
+        shell: pwsh
+        run: |
+          cargo xtask bundle vc-vst3 --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -File crates/vc-vst3/package-windowsml.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage09-settings-diagnostics-windowsml
+          path: target/bundled/vc-vst3.vst3/
+          if-no-files-found: error
+  tests:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test VST3 and local profile roundtrip
+        shell: pwsh
+        run: |
+          cargo test -p vc-vst3 --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

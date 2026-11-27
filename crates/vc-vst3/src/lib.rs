@@ -19,6 +19,7 @@ mod runtime;
 mod voice_bank;
 mod echo;
 mod hotkeys;
+mod diagnostics;
 
 // Share the standalone GUI's test-only renderer to exercise both real editors
 // with the same Vulkan setup, without changing shipped plugin dependencies.
@@ -120,7 +121,11 @@ impl VcRvcPlugin {
         if !self.config_seed_checked {
             self.config_seed_checked = true;
             if self.runtime.is_none() && self.applied_settings.is_none() {
-                self.params.settings.seed_if_pristine(discover);
+                if self.params.settings.seed_if_pristine(discover) {
+                    let selected = self.params.settings.read().unwrap().startup_voice;
+                    self.params.set_selected_voice(selected);
+                    self.params.save_requested.store(false, Ordering::Release);
+                }
             }
         }
     }
@@ -191,6 +196,7 @@ impl Plugin for VcRvcPlugin {
         // Only untouched fresh instances consult the optional seed, once. A
         // saved project can intentionally contain empty or partial model paths.
         self.seed_settings(PluginConfig::discover);
+        self.params.diagnostics.event("INITIALIZE", &format!("version={} rate={} max_block={} mode={:?}", env!("CARGO_PKG_VERSION"), buffer_config.sample_rate, buffer_config.max_buffer_size, buffer_config.process_mode));
         #[cfg(windows)]
         {
             if buffer_config.process_mode == ProcessMode::Offline {
@@ -198,7 +204,7 @@ impl Plugin for VcRvcPlugin {
             } else if self.hotkeys.is_none() {
                 match hotkeys::HotkeyWorker::start(self.params.clone(), self.reload_waker.clone()) {
                     Ok(worker) => self.hotkeys = Some(worker),
-                    Err(error) => nice_plug::nice_error!("voicebank: shortcut thread start failed: {error}"),
+                    Err(error) => { self.params.diagnostics.event("ERROR", &format!("Shortcut thread start: {error}")); nice_plug::nice_error!("voicebank: shortcut thread start failed: {error}"); },
                 }
             }
         }
@@ -297,6 +303,7 @@ impl Plugin for VcRvcPlugin {
             .as_ref()
             .and_then(PluginRuntime::applied_settings);
         self.runtime = None;
+        self.params.diagnostics.event("DEACTIVATE", &self.params.diagnostics.counters());
         self.echo = None;
         self.params.echo_held.store(false, Ordering::Release);
         self.reload.store(false, Ordering::SeqCst);
