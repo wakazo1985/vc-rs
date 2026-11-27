@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - '.github/workflows/voicebank-stage01-independent.yml'
+      - 'crates/vc-vst3/src/config.rs'
 permissions:
   contents: read
 env:

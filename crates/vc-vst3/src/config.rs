@@ -77,7 +77,7 @@ impl Default for VoiceProfile {
             noise_gate_attack_ms: 5.0,
             noise_gate_release_ms: 50.0,
             noise_gate_floor: 0.0,
-            chunk_ms: 200,
+            chunk_ms: 50,
             crossfade_ms: 40,
             sola_search_ms: 12,
             rvc_output_tail_discard_ms: 10,
@@ -557,7 +557,10 @@ mod tests {
         let d: PluginConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
         assert_eq!(c,d);
         assert_eq!(d.for_voice(1).validated_chunk_samples(48_000).unwrap(),4800);
-        assert_eq!(d.for_voice(0).validated_chunk_samples(48_000).unwrap(),9600);
+        assert_eq!(d.for_voice(0).validated_chunk_samples(48_000).unwrap(),2400);
+        for i in 0..4 {
+            assert_eq!(VoiceProfile::initial(i).chunk_ms, 50);
+        }
         assert_eq!(d.for_voice(1).index_rate,0.2);
         assert_eq!(d.voice_profiles[1].live().pitch_shift,9.0);
         assert!((d.voice_profiles[1].live().output_gain-0.5011872).abs()<0.00001);
