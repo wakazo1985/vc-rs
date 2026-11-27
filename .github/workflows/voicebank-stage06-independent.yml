@@ -1,0 +1,66 @@
+name: VoiceBank stage 06 independent build and tests
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-stage06-independent.yml'
+      - 'crates/vc-vst3/src/**'
+permissions:
+  contents: read
+env:
+  VC_RS_ENABLE_NATIVE_TENSORRT: "0"
+  CARGO_TERM_COLOR: never
+jobs:
+  compile:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile Windows ML VST3 directly
+        shell: pwsh
+        run: |
+          cargo xtask bundle vc-vst3 --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage06-independent-compiled-vst3
+          path: target/bundled/vc-vst3.vst3/
+          if-no-files-found: error
+      - name: Bundle Windows ML bootstrapper
+        shell: pwsh
+        run: |
+          pwsh -File crates/vc-vst3/package-windowsml.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage06-independent-windowsml-vst3
+          path: target/bundled/vc-vst3.vst3/
+          if-no-files-found: error
+  focused-tests:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the real voice bank module without compiling the host or inference stack
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force stage06-check/src | Out-Null
+          Copy-Item crates/vc-vst3/src/voice_bank.rs stage06-check/src/lib.rs
+          @(
+            '[package]',
+            'name = "voice-bank-check"',
+            'version = "0.1.0"',
+            'edition = "2021"',
+            '[dependencies]',
+            'anyhow = "1"'
+          ) | Set-Content stage06-check/Cargo.toml -Encoding ascii
+          cargo test --manifest-path stage06-check/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
