@@ -1,0 +1,43 @@
+name: VoiceBank stage 02 Windows build probe
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-stage02.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      VC_RS_ENABLE_NATIVE_TENSORRT: "0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify toolchain and filesystem
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+          cargo --version
+          Set-Content stage02-probe.txt 'OK'
+          if ((Get-Content stage02-probe.txt) -ne 'OK') { throw 'Filesystem check failed' }
+          Compress-Archive stage02-probe.txt stage02-probe.zip
+          Expand-Archive stage02-probe.zip stage02-check
+          if ((Get-Content stage02-check/stage02-probe.txt) -ne 'OK') { throw 'ZIP check failed' }
+      - name: Compile unmodified Windows ML VST3
+        shell: pwsh
+        run: |
+          cargo xtask bundle vc-vst3 --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $module = Get-ChildItem target/bundled/vc-vst3.vst3 -Recurse -File -Filter '*.vst3'
+          if (-not $module) { throw 'Compiled module not found' }
+          $module | Select-Object FullName,Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage02-windowsml-compile-probe
+          path: target/bundled/vc-vst3.vst3/
+          if-no-files-found: error
