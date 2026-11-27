@@ -37,8 +37,8 @@ pub struct VoiceSlot {
     pub embedder: PathBuf,
     pub f0_model: PathBuf,
 }
-/// Each slot owns all conversion settings. Protect and formant are persisted
-/// for phase 02; their DSP is not enabled in this phase.
+/// Each slot owns all conversion settings. Protect is applied in the RVC
+/// pipeline; formant is reserved until a duration-preserving implementation is validated.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct VoiceProfile {

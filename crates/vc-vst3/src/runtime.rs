@@ -1082,6 +1082,7 @@ impl WorkerCtx {
                             errors.push(format!("{}: {e}", LABELS[i]));
                             continue;
                         }
+                        pipeline.set_peak_protection(true);
                         let inner = self.chunk_converter(pipeline, config.smoothing_kind(), hop, &config);
                         *slot = Some(Box::new(ProfiledConversion { inner, live: profile.live(), hop }));
                     }

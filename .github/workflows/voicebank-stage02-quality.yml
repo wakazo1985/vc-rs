@@ -1,24 +1,28 @@
-name: VoiceBank 02 Protect and 50ms audio tests
+name: VoiceBank 02 audio pipeline tests
 on:
   workflow_dispatch:
   push:
     paths:
       - '.github/workflows/voicebank-stage02-quality.yml'
+      - 'crates/vc-core/src/model_rvc/pipeline.rs'
 permissions:
   contents: read
 env:
   VC_RS_ENABLE_NATIVE_TENSORRT: "0"
   CARGO_TERM_COLOR: never
 jobs:
-  vst3:
+  test:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Test VST3 including real smoothing with mock inference
-        run: cargo test -p vc-vst3 --no-default-features --features tensorrt --locked -- --nocapture
-  core:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Test RVC core Protect and crossfade
-        run: cargo test -p vc-core --no-default-features --features tensorrt --locked --lib -- --nocapture
+      - name: Test DSP, retrieval, pitch, converted ONNX metadata and streaming
+        shell: pwsh
+        run: |
+          cargo test -p vc-core --no-default-features --features tensorrt --locked --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test existing VST3 functions
+        shell: pwsh
+        run: |
+          cargo test -p vc-vst3 --no-default-features --features tensorrt --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

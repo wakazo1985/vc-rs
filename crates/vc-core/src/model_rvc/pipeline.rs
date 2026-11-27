@@ -250,6 +250,7 @@ pub struct RvcPipeline {
     original_features: FeatureTensor,
     quality_report: String,
     quality_enabled: bool,
+    prevent_hard_clip: bool,
     input_reference_scratch: Vec<f32>,
     rms_mix_scratch: dsp::RmsMixScratch,
     pitchf_untrimmed_scratch: Vec<f32>,
@@ -687,6 +688,7 @@ impl RvcPipeline {
             original_features: FeatureTensor::default(),
             quality_report: String::new(),
             quality_enabled: false,
+            prevent_hard_clip: false,
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -1201,6 +1203,7 @@ impl RvcPipeline {
             original_features: FeatureTensor::default(),
             quality_report: String::new(),
             quality_enabled: false,
+            prevent_hard_clip: false,
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -1232,6 +1235,8 @@ impl RvcPipeline {
         Ok(())
     }
     pub fn set_quality_diagnostics(&mut self, enabled: bool) { self.quality_enabled = enabled; }
+    /// VoiceBank opt-in: preserve the shape of over-range model and RMS-mixed audio.
+    pub fn set_peak_protection(&mut self, enabled: bool) { self.prevent_hard_clip = enabled; }
     pub fn quality_report(&self) -> &str { &self.quality_report }
     pub fn set_pitch_shift(&mut self, pitch_shift: f32) {
         self.pitch_shift = pitch_shift;
@@ -1448,6 +1453,7 @@ impl VoiceModel for RvcPipeline {
 
         // Features
         let embedder_start = Instant::now();
+        let input_quality = self.quality_enabled.then(|| signal_quality(audio));
         #[cfg(feature = "ort")]
         if let Some(shared_waveform) = self.shared_waveform.as_mut() {
             // Shared CUDA input is charged to embedder_time because the public
@@ -1466,6 +1472,8 @@ impl VoiceModel for RvcPipeline {
             &self.stream_state.audio_16k_buffer,
             &mut self.feature_tensor,
         )?;
+        ensure!(self.feature_tensor.data.iter().all(|v| v.is_finite()), "ContentVec returned nonfinite features");
+        let feature_quality = self.quality_enabled.then(|| signal_quality(&self.feature_tensor.data));
         let preserve_features = self.retrieval.is_some() && (self.protect < 0.5 || self.quality_enabled);
         if preserve_features {
             self.original_features.data.clone_from(&self.feature_tensor.data);
@@ -1575,6 +1583,7 @@ impl VoiceModel for RvcPipeline {
             &mut self.pitchf_postprocessed_scratch,
         );
         let pitchf = self.pitchf_postprocessed_scratch.as_slice();
+        ensure!(pitchf.iter().all(|v| v.is_finite() && *v >= 0.0), "RMVPE/F0 processing returned invalid pitch");
         let feature_change = if preserve_features && self.quality_enabled {
             let sum = self.feature_tensor.data.iter().zip(&self.original_features.data)
                 .map(|(a,b)| { let d = *a-*b; (d*d) as f64 }).sum::<f64>();
@@ -1585,11 +1594,12 @@ impl VoiceModel for RvcPipeline {
             super::feature::protect_unvoiced(&mut self.feature_tensor.data, &self.original_features.data, pitchf, channels, self.protect)?;
         }
         if self.quality_enabled {
+            let protected_feature_quality = signal_quality(&self.feature_tensor.data);
             fn f0_summary(xs: &[f32]) -> (usize,f32,f32,f32) {
                 let (n,sum,min,max) = xs.iter().copied().filter(|x| x.is_finite() && *x >= 1.0).fold((0usize,0.0f32,f32::INFINITY,0.0f32), |(n,s,l,h),x|(n+1,s+x,l.min(x),h.max(x)));
                 if n == 0 { (0,0.0,0.0,0.0) } else { (n,min,sum/n as f32,max) }
             }
-            self.quality_report = format!("f0_raw={:?} f0_shifted={:?} pitch_st={} feature_frames={} feature_change_rms={:.6} index_rate={} protect={}", f0_summary(&self.pitchf_scratch),f0_summary(pitchf),self.pitch_shift,feature_len,feature_change,self.retrieval_rate,self.protect);
+            self.quality_report = format!("input={input_quality:?} contentvec={feature_quality:?} features_after_protect={protected_feature_quality:?} f0_raw={:?} f0_shifted={:?} pitch_st={} feature_frames={} feature_change_rms={:.6} index_rate={} protect={}", f0_summary(&self.pitchf_scratch),f0_summary(pitchf),self.pitch_shift,feature_len,feature_change,self.retrieval_rate,self.protect);
         }
         debug!(
             "pitch update: audio_16k_samples={}, rmvpe_input_samples={}, rmvpe_window_start_samples={}, pitchf_raw_len={}, pitchf_buffer_len={}, feature_len={}",
@@ -1693,6 +1703,7 @@ impl VoiceModel for RvcPipeline {
             self.stream_state.time_state.advance_phase(pitchf);
         }
         let raw_output_samples = out_audio.len();
+        ensure!(out_audio.iter().all(|v| v.is_finite()), "RVC synthesis returned nonfinite audio");
         if self.quality_enabled {
             let peak = out_audio.iter().fold(0.0_f32, |a,x|a.max(x.abs()));
             let clipped = out_audio.iter().filter(|x|x.abs()>1.0).count();
@@ -1713,7 +1724,11 @@ impl VoiceModel for RvcPipeline {
         } else {
             1.0
         };
-        dsp::clamp_scale_in_place(out_audio, output_envelope);
+        let envelope_gain = if self.prevent_hard_clip {
+            peak_safe_gain(out_audio, output_envelope)
+        } else { output_envelope };
+        dsp::clamp_scale_in_place(out_audio, envelope_gain);
+        let before_rms_mix = self.quality_enabled.then(|| signal_quality(out_audio));
         if self.rms_mix_rate < 1.0 {
             // Captured before apply_rms_mix mutates `out_audio`, but only used
             // in the debug! below; skip the extra RMS pass when debug is off.
@@ -1750,13 +1765,18 @@ impl VoiceModel for RvcPipeline {
                 dsp::rms(out_audio)
             );
         }
-        let (output_rms, applied_output_gain) = apply_output_gain(
-            out_audio,
-            self.output_gain,
-            self.auto_output_gain,
-            self.target_output_rms,
-            self.max_output_gain,
-        );
+        ensure!(out_audio.iter().all(|v| v.is_finite()), "RMS mixing returned nonfinite audio");
+        let after_rms_mix = self.quality_enabled.then(|| signal_quality(out_audio));
+        let (output_rms, applied_output_gain) = if self.prevent_hard_clip {
+            apply_peak_safe_output_gain(out_audio, self.output_gain, self.auto_output_gain, self.target_output_rms, self.max_output_gain)
+        } else {
+            apply_output_gain(out_audio, self.output_gain, self.auto_output_gain, self.target_output_rms, self.max_output_gain)
+        };
+        if self.quality_enabled {
+            use std::fmt::Write as _;
+            let final_quality = signal_quality(out_audio);
+            let _ = write!(self.quality_report, " before_rms_mix={before_rms_mix:?} after_rms_mix={after_rms_mix:?} before_join={final_quality:?} envelope_gain={envelope_gain:.6} applied_gain={applied_output_gain:.6} peak_protection={}", self.prevent_hard_clip);
+        }
 
         Ok(ModelOutput {
             sample_rate: self.rvc_sample_rate,
@@ -1858,6 +1878,38 @@ fn provider_drives_nvtrtx(provider: Provider) -> bool {
     false
 }
 
+/// Peak, RMS, over-range count, and invalid count. Compute before clipping
+/// so diagnostics can distinguish synthesis from loudness compensation.
+fn signal_quality(audio: &[f32]) -> (f32, f32, usize, usize) {
+    let mut peak = 0.0_f32;
+    let mut sum = 0.0_f64;
+    let mut over = 0;
+    let mut invalid = 0;
+    for &v in audio {
+        if !v.is_finite() { invalid += 1; continue; }
+        peak = peak.max(v.abs());
+        sum += (v as f64) * (v as f64);
+        if v.abs() > 1.0 { over += 1; }
+    }
+    (peak, (sum / audio.len().max(1) as f64).sqrt() as f32, over, invalid)
+}
+fn peak_safe_gain(audio: &[f32], requested: f32) -> f32 {
+    let peak = audio.iter().fold(0.0_f32, |a,v| a.max(v.abs()));
+    let requested = requested.max(0.0);
+    if peak > 0.0 { requested.min(0.999 / peak) } else { requested }
+}
+fn apply_peak_safe_output_gain(audio: &mut [f32], manual: f32, auto: bool, target: f32, max_gain: f32) -> (f32, f32) {
+    let mut gain = manual.max(0.0);
+    if auto {
+        let rms = dsp::rms(audio);
+        if rms > 1e-8 {
+            gain *= (target.max(0.0) / rms).clamp(1.0, max_gain.max(1.0));
+        }
+    }
+    gain = peak_safe_gain(audio, gain);
+    (dsp::apply_gain_and_rms(audio, gain), gain)
+}
+
 fn apply_output_gain(
     audio: &mut [f32],
     manual_gain: f32,
@@ -1882,6 +1934,24 @@ fn apply_output_gain(
 #[cfg(test)]
 mod output_gain_tests {
     use super::*;
+
+    #[test]
+    fn peak_protection_preserves_waveform_instead_of_flattening_peaks() {
+        for auto in [false, true] {
+            let mut a = [0.5, -1.0, 4.0, -8.0];
+            let (_, gain) = apply_peak_safe_output_gain(&mut a, 1.0, auto, 0.03, 512.0);
+            assert!((gain - 0.999 / 8.0).abs() < 1e-7);
+            assert!(a.iter().all(|v| v.abs() < 1.0));
+            assert!((a[2] / a[3] + 0.5).abs() < 1e-6);
+            assert!((a[0] / a[1] + 0.5).abs() < 1e-6);
+        }
+        let mut normal = [0.1, -0.2];
+        let (_, g) = apply_peak_safe_output_gain(&mut normal, 1.0, false, 0.03, 512.0);
+        assert_eq!(g, 1.0);
+        assert_eq!(normal, [0.1, -0.2]);
+        assert_eq!(signal_quality(&[0.5, -2.0, f32::NAN]).2, 1);
+        assert_eq!(signal_quality(&[0.5, -2.0, f32::NAN]).3, 1);
+    }
 
     #[test]
     fn rms_mix_peaks_are_clipped_at_and_around_unity_output_gain() {
