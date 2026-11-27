@@ -1,0 +1,100 @@
+name: VoiceBank native TensorRT build and GPU probe
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-tensorrt-probe.yml'
+permissions:
+  contents: read
+env:
+  VC_RS_ENABLE_NATIVE_TENSORRT: "1"
+  CARGO_TERM_COLOR: never
+jobs:
+  native-probe:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire official NVIDIA SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/11.2.1/zip/TensorRT-Enterprise-11.2.1.2-Windows-amd64-cuda-13.3-Release-external.zip'
+          $zip = Join-Path $env:RUNNER_TEMP 'tensorrt.zip'
+          curl.exe --fail --location --retry 2 --output $zip $url
+          if ($LASTEXITCODE -ne 0) { throw 'Official TensorRT SDK download failed; NVIDIA authentication may be required.' }
+          New-Item -ItemType Directory -Force external/nvidia | Out-Null
+          7z x $zip "-o$PWD\external\nvidia" -y
+          if ($LASTEXITCODE -ne 0) { throw 'TensorRT SDK archive extraction failed.' }
+          . scripts/tensorrt-sdk.ps1
+          $sdk = Resolve-TensorRtSdk -RepoRoot $PWD.Path
+          if (-not $sdk) { throw 'TensorRT SDK headers, import libraries or runtime DLLs missing.' }
+          "TENSORRT_ROOT=$($sdk.Root)" >> $env:GITHUB_ENV
+      - name: Install CUDA 13.3 toolkit components
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
+          curl.exe --fail --location --retry 2 --output $installer 'https://developer.download.nvidia.com/compute/cuda/13.3.1/local_installers/cuda_13.3.1_windows.exe'
+          if ($LASTEXITCODE -ne 0) { throw 'CUDA Toolkit download failed.' }
+          $p = Start-Process -FilePath $installer -ArgumentList '-s','cudart_13.3','nvcc_13.3','crt_13.3','cccl_13.3' -Wait -PassThru
+          if ($p.ExitCode -notin @(0,3010)) { throw "CUDA installer exit $($p.ExitCode)" }
+          $root = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3'
+          if (-not (Test-Path "$root\include\cuda_runtime_api.h") -or -not (Test-Path "$root\lib\x64\cudart.lib")) { throw 'CUDA headers or import libraries missing.' }
+          foreach ($file in @('include\cuda_runtime_api.h','include\crt\host_defines.h','lib\x64\cudart.lib')) {
+            if (!(Test-Path (Join-Path $root $file))) { throw "CUDA component missing: $file" }
+            Write-Host "SDK_FILE_OK $file"
+          }
+          "CUDA_PATH=$root" >> $env:GITHUB_ENV
+      - name: Build native core and RVC smoke tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          . scripts/activate.ps1
+          cargo test -p vc-core --no-default-features --features tensorrt --locked --lib --no-run
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $list = cargo test -p vc-core --no-default-features --features tensorrt --locked --lib -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $list | Write-Host
+          if (!($list -match 'native_tensorrt_legacy_streaming_smoke')) { throw 'Native TensorRT was not compiled; refusing stub build' }
+          Write-Host 'NATIVE_TENSORRT_COMPILED'
+      - name: Compile engine builder
+        shell: pwsh
+        run: |
+          . scripts/activate.ps1
+          cargo build --release --manifest-path tools/tensorrt_builder/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test RVC inference on available NVIDIA GPU
+        shell: pwsh
+        run: |
+          . scripts/activate.ps1
+          $smi=Get-Command nvidia-smi -ErrorAction SilentlyContinue
+          $gpu=$null
+          if ($smi) { $gpu=& $smi.Source --query-gpu=name,compute_cap --format=csv,noheader }
+          if (!$smi -or $LASTEXITCODE -ne 0 -or !$gpu) {
+            'GPU_INFERENCE_NOT_TESTED: no NVIDIA GPU in this runner' | Tee-Object -FilePath gpu-result.txt
+            Add-Content $env:GITHUB_STEP_SUMMARY 'GPU inference NOT TESTED: no NVIDIA GPU. Compile success is not runtime validation.'
+            return
+          }
+          $gpu | Write-Host
+          $env:VC_RS_TENSORRT_BUILDER_HELPER=(Resolve-Path 'tools/tensorrt_builder/target/release/vc-tensorrt-builder.exe').Path
+          cargo test -p vc-core --no-default-features --features tensorrt --locked --lib native_tensorrt_legacy_streaming_smoke -- --ignored --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p vc-core --no-default-features --features tensorrt --locked --lib applio_native_tensorrt_streaming -- --ignored --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          'GPU_INFERENCE_TESTS_PASSED' | Tee-Object -FilePath gpu-result.txt
+          Add-Content $env:GITHUB_STEP_SUMMARY 'Native RVC GPU smoke tests passed.'
+      - name: Build integrated VST3 using native TensorRT
+        shell: pwsh
+        run: |
+          . scripts/activate.ps1
+          cargo xtask bundle vc-vst3 --release --no-default-features --features tensorrt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Test-Path 'target/bundled/vc-vst3.vst3/Contents/x86_64-win/vc-vst3.vst3')) { throw 'VST3 binary missing' }
+          Write-Host 'VST3_NATIVE_BUILD_OK'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: TensorRT-probe-result
+          path: gpu-result.txt
+          if-no-files-found: ignore
