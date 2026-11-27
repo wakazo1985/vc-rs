@@ -203,8 +203,8 @@ pub(super) struct NativeRvcEngine {
 }
 
 // Native TensorRT handles own CUDA streams, execution contexts, and fixed device
-// buffers. They move with the model worker but are never shared; inference takes
-// &mut self so concurrent enqueue on one context is not exposed.
+// buffers. Common stateless sessions may share an Arc<Mutex<_>>; inference
+// takes &mut self and synchronizes before returning. RVC state remains private.
 unsafe impl Send for NativeContentVecEngine {}
 unsafe impl Send for NativeRmvpeEngine {}
 unsafe impl Send for NativeRvcEngine {}

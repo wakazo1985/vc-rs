@@ -1,4 +1,6 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::cell::RefCell;
+use std::sync::{Arc, Mutex, Weak};
 #[cfg(feature = "ort")]
 use std::time::Instant;
 
@@ -24,6 +26,39 @@ use super::native_tensorrt::{NativeContentVecEngine, NativeRmvpeEngine, NativeRv
 use super::onnx_meta::{read_model_io, RvcIoNames};
 use super::tensorrt::*;
 
+// Only common, stateless models are pooled. Each caller owns its waveform,
+// output features and rolling F0; the shared CUDA context is locked across
+// staging, enqueue and synchronization. Weak entries never keep VRAM alive.
+#[derive(Clone, PartialEq, Eq)]
+struct CommonKey {
+    path: PathBuf,
+    profile: TensorRtSessionProfile,
+    output: String,
+    channels: i64,
+}
+struct CommonPool<T>(Vec<(CommonKey,Weak<Mutex<T>>)>);
+impl<T> CommonPool<T> {
+    fn get(&mut self,key:CommonKey,load:impl FnOnce()->Result<T>) -> Result<Arc<Mutex<T>>> {
+        self.0.retain(|(_,v)|v.strong_count()>0);
+        if let Some(v)=self.0.iter().find(|(k,_)|*k==key).and_then(|(_,v)|v.upgrade()) {
+            info!("NATIVE_COMMON_REUSE role={} shape={}",key.profile.role.label(),key.profile.profile_shapes);
+            return Ok(v);
+        }
+        let v=Arc::new(Mutex::new(load()?));
+        self.0.push((key,Arc::downgrade(&v)));
+        Ok(v)
+    }
+}
+thread_local! {
+    static CONTENT_POOL: RefCell<CommonPool<NativeContentVecEngine>> = const { RefCell::new(CommonPool(Vec::new())) };
+    static RMVPE_POOL: RefCell<CommonPool<NativeRmvpeEngine>> = const { RefCell::new(CommonPool(Vec::new())) };
+}
+fn common_key(path:&Path,profile:&TensorRtSessionProfile,output:&str,channels:i64)->Result<CommonKey> {
+    // Require a fingerprint rather than accidentally sharing a replaced model.
+    profile.model_cache_key()?;
+    Ok(CommonKey{path:path.canonicalize()?,profile:profile.clone(),output:output.into(),channels})
+}
+
 /// Copies an embedder output (`shape` + `data`) into a reused `FeatureTensor`,
 /// clearing it first. Lets the extract paths fill a caller-owned buffer instead
 /// of allocating a fresh tensor each chunk.
@@ -44,7 +79,7 @@ pub(super) struct HubertEmbedderSession {
     pub(super) tensor_rt_run_mode: TensorRtRunMode,
     #[cfg(feature = "ort")]
     pub(super) tensor_rt_binding: Option<HubertTensorRtBinding>,
-    native: Option<NativeContentVecEngine>,
+    native: Option<Arc<Mutex<NativeContentVecEngine>>>,
     pub(super) input_name: String,
     pub(super) output_name: String,
 }
@@ -68,13 +103,10 @@ impl HubertEmbedderSession {
             let profile = tensor_rt_profile.as_ref().ok_or_else(|| {
                 anyhow!("native TensorRT ContentVec requires a fixed-shape profile")
             })?;
-            Some(NativeContentVecEngine::load(
-                path,
-                profile,
-                input_name.as_str(),
-                output_name.as_str(),
-                expected_channels,
-            )?)
+            let key=common_key(path,profile,&output_name,expected_channels)?;
+            Some(CONTENT_POOL.with(|pool|pool.borrow_mut().get(key,||NativeContentVecEngine::load(
+                path, profile, input_name.as_str(), output_name.as_str(), expected_channels
+            )))?)
         } else {
             None
         };
@@ -123,7 +155,7 @@ impl HubertEmbedderSession {
     /// embedder is backed by one. `None` for ORT-backed sessions. The engine
     /// self-reports its fixed output length, so this needs no warmup inference.
     pub(super) fn native_contentvec_output_frames(&self) -> Option<Result<usize>> {
-        self.native.as_ref().map(|native| native.output_frames())
+        self.native.as_ref().map(|native| native.lock().map_err(|_|anyhow!("ContentVec engine lock poisoned"))?.output_frames())
     }
 
     #[cfg(feature = "ort")]
@@ -220,7 +252,7 @@ impl HubertEmbedderSession {
         if let Some(native) = self.native.as_mut() {
             // The native TensorRT FFI still returns an owned tensor; copy it into
             // the reused buffer so the contract matches the ORT paths.
-            let ft = native.extract(audio_16k)?;
+            let ft = native.lock().map_err(|_|anyhow!("ContentVec engine lock poisoned"))?.extract(audio_16k)?;
             fill_feature_tensor(out, &ft.shape, &ft.data);
             return Ok(());
         }
@@ -375,7 +407,7 @@ pub(super) struct RmvpePitchSession {
     pub(super) tensor_rt_run_mode: TensorRtRunMode,
     #[cfg(feature = "ort")]
     pub(super) tensor_rt_binding: Option<RmvpeTensorRtBinding>,
-    native: Option<NativeRmvpeEngine>,
+    native: Option<Arc<Mutex<NativeRmvpeEngine>>>,
     // Reused buffer for the pitch-shift-scaled F0 output, so `extract` does not
     // allocate a fresh Vec every chunk. Returned as a borrowed slice.
     pitchf_scratch: Vec<f32>,
@@ -396,7 +428,8 @@ impl RmvpePitchSession {
             let profile = tensor_rt_profile
                 .as_ref()
                 .ok_or_else(|| anyhow!("native TensorRT RMVPE requires a fixed-shape profile"))?;
-            Some(NativeRmvpeEngine::load(path, profile)?)
+            let key=common_key(path,profile,"pitchf",1)?;
+            Some(RMVPE_POOL.with(|pool|pool.borrow_mut().get(key,||NativeRmvpeEngine::load(path,profile)))?)
         } else {
             None
         };
@@ -445,7 +478,7 @@ impl RmvpePitchSession {
             &waveform_shape,
         )?;
         if let Some(native) = self.native.as_ref() {
-            return Ok(native.warmup_output_shape());
+            return Ok(native.lock().map_err(|_|anyhow!("RMVPE engine lock poisoned"))?.warmup_output_shape());
         }
         #[cfg(feature = "ort")]
         {
@@ -562,7 +595,7 @@ impl RmvpePitchSession {
         if let Some(native) = self.native.as_mut() {
             // The native TensorRT FFI still returns an owned Vec; copy it into the
             // reused scratch so the borrowed-slice contract holds across backends.
-            let raw = native.extract(audio_16k, pitch_shift, threshold)?;
+            let raw = native.lock().map_err(|_|anyhow!("RMVPE engine lock poisoned"))?.extract(audio_16k, pitch_shift, threshold)?;
             self.pitchf_scratch.clear();
             self.pitchf_scratch.extend_from_slice(&raw);
             return Ok(self.pitchf_scratch.as_slice());
@@ -2542,5 +2575,23 @@ mod windows_ml_auto_tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("catalog unavailable"));
+    }
+}
+
+#[cfg(test)]
+mod common_pool_tests {
+    use super::*;
+    #[test]
+    fn common_pool_reuses_only_exact_profiles_and_releases_last_owner() {
+        let key=CommonKey{path:"model.onnx".into(),profile:TensorRtSessionProfile::new(ModelRole::ContentVec,vec![TensorRtInputShape{name:"waveform".into(),dims:vec![1,2400]}]).with_model_cache_key("a"),output:"feats".into(),channels:768};
+        let mut p=CommonPool(Vec::new());
+        let a=p.get(key.clone(),||Ok(7u32)).unwrap();
+        let b=p.get(key.clone(),||anyhow::bail!("duplicate load")).unwrap();
+        assert!(Arc::ptr_eq(&a,&b));
+        let mut different=key.clone();different.profile.gpu_device_id=1;
+        let c=p.get(different,||Ok(9)).unwrap();
+        assert!(!Arc::ptr_eq(&a,&c));
+        drop(a);drop(b);
+        assert_eq!(*p.get(key,||Ok(11)).unwrap().lock().unwrap(),11);
     }
 }

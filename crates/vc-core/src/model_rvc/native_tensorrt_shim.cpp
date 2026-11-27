@@ -95,6 +95,7 @@ struct DeviceBuffer {
 };
 
 struct NativeEngine {
+    int32_t gpu_device_id{0};
     std::unique_ptr<nvinfer1::IRuntime, TrtDeleter<nvinfer1::IRuntime>> runtime;
     std::unique_ptr<nvinfer1::ICudaEngine, TrtDeleter<nvinfer1::ICudaEngine>> engine;
     std::unique_ptr<nvinfer1::IExecutionContext, TrtDeleter<nvinfer1::IExecutionContext>> context;
@@ -108,6 +109,8 @@ struct NativeEngine {
     bool graph_capture_attempted{false};
 
     ~NativeEngine() {
+        // A loader can hand a prepared engine to the inference worker.
+        cudaSetDevice(gpu_device_id);
         if (graph_exec != nullptr) {
             cudaGraphExecDestroy(graph_exec);
         }
@@ -503,6 +506,7 @@ extern "C" NativeEngine* vc_rs_trt_engine_create(
     }
 
     std::unique_ptr<NativeEngine> native(new NativeEngine());
+    native->gpu_device_id = gpu_device_id;
     native->input_dims = profile;
     native->output_name = output_name;
     Logger& logger = trt_logger();
@@ -642,6 +646,7 @@ extern "C" int vc_rs_trt_contentvec_infer(
         msg.append("null argument passed to TensorRT ContentVec infer\n");
         return 2;
     }
+    if (!cuda_ok(cudaSetDevice(native->gpu_device_id), msg, "cudaSetDevice inference")) { return 1; }
     begin_inference(*native);
     if (!copy_to_device(*native, input_name, audio, audio_len * sizeof(float), msg)) {
         return 1;
@@ -667,6 +672,7 @@ extern "C" int vc_rs_trt_rmvpe_infer(
         msg.append("null argument passed to TensorRT RMVPE infer\n");
         return 2;
     }
+    if (!cuda_ok(cudaSetDevice(native->gpu_device_id), msg, "cudaSetDevice inference")) { return 1; }
     begin_inference(*native);
     if (!copy_to_device(*native, "waveform", waveform, waveform_len * sizeof(float), msg)) {
         return 1;
@@ -730,6 +736,7 @@ extern "C" int vc_rs_trt_rvc_infer(
         msg.append("null input-name passed to TensorRT RVC infer\n");
         return 2;
     }
+    if (!cuda_ok(cudaSetDevice(native->gpu_device_id), msg, "cudaSetDevice inference")) { return 1; }
     begin_inference(*native);
     // A latent-noise input must arrive as a matched (name, data) pair: a name
     // without data (or vice versa) means the caller and engine disagree on
@@ -820,6 +827,7 @@ extern "C" int vc_rs_trt_gtcrn_infer(
         msg.append("null argument passed to TensorRT GTCRN infer\n");
         return 2;
     }
+    if (!cuda_ok(cudaSetDevice(native->gpu_device_id), msg, "cudaSetDevice inference")) { return 1; }
     begin_inference(*native);
     // The cache tensors are both inputs and outputs at the Rust boundary. The
     // input side is staged before enqueue; after synchronization the same caller
