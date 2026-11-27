@@ -725,7 +725,28 @@ impl WorkerCtx {
         self.loading.store(false, Ordering::Release);
         self.state.notify_offline();
 
+        let mut managed_checked = self.autoload;
         while self.running.load(Ordering::SeqCst) {
+            if !managed_checked && !cfg!(test) && self.params.audio_seen.load(Ordering::Acquire) && !self.state.offline.load(Ordering::Acquire) {
+                managed_checked = true;
+                if let Some(root) = crate::diagnostics::local_dir() {
+                    let mut settings = self.params.settings.read().unwrap().clone();
+                    if root.join("models").is_dir() {
+                        self.loading.store(true, Ordering::Release);
+                        self.set_status("Discovering local voice models");
+                        crate::managed_models::discover(&root, &mut settings, &self.running, &self.params.diagnostics);
+                        if self.running.load(Ordering::Acquire) {
+                            *self.params.settings.write().unwrap() = settings.clone();
+                            self.params.request_save();
+                            if settings.has_models() { self.reload.store(true, Ordering::Release); }
+                            else { self.loading.store(false, Ordering::Release); self.set_idle_status(); }
+                        }
+                    } else if settings.has_models() && settings.model.is_file() && settings.embedder.is_file() && settings.f0_model.is_file() {
+                        self.loading.store(true, Ordering::Release);
+                        self.reload.store(true, Ordering::Release);
+                    }
+                }
+            }
             if last_profile_flush.elapsed() >= Duration::from_millis(500) {
                 self.params.flush_profile();
                 last_profile_flush = std::time::Instant::now();

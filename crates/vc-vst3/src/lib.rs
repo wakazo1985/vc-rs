@@ -20,6 +20,7 @@ mod voice_bank;
 mod echo;
 mod hotkeys;
 mod diagnostics;
+mod managed_models;
 #[cfg(windows)]
 mod http_control;
 
@@ -269,6 +270,7 @@ impl Plugin for VcRvcPlugin {
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        if !cfg!(test) { self.params.audio_seen.store(true, Ordering::Release); }
         let original = self.params.selected_voice() == 0;
         if original != self.was_original {
             if let Some(runtime) = self.runtime.as_mut() { runtime.reset(); }
@@ -311,6 +313,7 @@ impl Plugin for VcRvcPlugin {
     fn deactivate(&mut self) {
         #[cfg(windows)]
         { self.http_control = None; self.hotkeys = None; }
+        self.params.audio_seen.store(false, Ordering::Release);
         self.params.echo_hotkey.store(false, Ordering::Release);
         self.applied_settings = self
             .runtime

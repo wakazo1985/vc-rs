@@ -1,0 +1,84 @@
+name: VoiceBank stage 12 integrated package
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-stage12.yml'
+      - 'crates/vc-vst3/src/managed_models.rs'
+      - 'crates/vc-vst3/src/control.html'
+permissions:
+  contents: read
+env:
+  VC_RS_ENABLE_NATIVE_TENSORRT: "0"
+  CARGO_TERM_COLOR: never
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test integrated plugin
+        shell: pwsh
+        run: |
+          cargo test -p vc-vst3 --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p vc-convert --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build VST3, converter, benchmark
+        shell: pwsh
+        run: |
+          cargo xtask bundle vc-vst3 --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -File crates/vc-vst3/package-windowsml.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build -p vc-convert --example voicebank_convert --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build -p vc-cli --no-default-features --features windowsml --release --bin vc-rs --example voicebank_wav_metrics --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -File crates/vc-cli/package-windowsml.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Assemble complete package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $stage='release/RVCVoiceBank'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target/bundled/vc-vst3.vst3 $stage/ -Recurse
+          $bundle=Join-Path $stage 'vc-vst3.vst3'
+          Copy-Item crates/vc-vst3/src/control.html $bundle/
+          Copy-Item crates/vc-vst3/src/control.html $stage/
+          foreach ($slot in @('toddler','girl','male','robot','common')) {
+            $folder=Join-Path $bundle "models/$slot"
+            New-Item -ItemType Directory -Force $folder | Out-Null
+            if ($slot -eq 'common') {'Place ContentVec and RMVPE ONNX here.' | Set-Content "$folder/README.txt"}
+            else {'Place exactly one PTH and its INDEX here. INDEX is retained but not used in this build.' | Set-Content "$folder/README.txt"}
+          }
+          $tools=Join-Path $bundle 'tools'
+          New-Item -ItemType Directory -Force $tools | Out-Null
+          Copy-Item target/release/examples/voicebank_convert.exe $tools/
+          Copy-Item crates/vc-convert/LICENSE-*.txt $tools/
+          Copy-Item crates/vc-convert/THIRD_PARTY.md $tools/
+          Copy-Item LICENSE $stage/
+          Copy-Item docs/voicebank-final-ja.md "$stage/README-ja.md"
+          $bench=Join-Path $stage 'benchmark'
+          New-Item -ItemType Directory -Force $bench | Out-Null
+          Copy-Item target/release/vc-rs.exe $bench/
+          Copy-Item target/release/examples/voicebank_wav_metrics.exe $bench/
+          Copy-Item target/release/Microsoft.WindowsAppRuntime.Bootstrap.dll $bench/
+          Copy-Item target/release/licenses $bench/ -Recurse
+          Copy-Item scripts/voicebank-benchmark.ps1 $bench/
+          Copy-Item scripts/START_VOICEBANK_BENCHMARK.cmd $bench/
+          git archive --format=zip -o "$stage/source.zip" HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path $stage -DestinationPath release/RVCVoiceBank-WindowsML.zip
+          Get-FileHash release/RVCVoiceBank-WindowsML.zip -Algorithm SHA256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RVCVoiceBank-WindowsML
+          path: release/RVCVoiceBank-WindowsML.zip
+          if-no-files-found: error

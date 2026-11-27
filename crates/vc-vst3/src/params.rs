@@ -79,6 +79,7 @@ pub struct VcRvcParams {
     pub echo_hotkey: AtomicBool,
     pub diagnostics: Arc<crate::diagnostics::Diagnostics>,
     pub save_requested: AtomicBool,
+    pub audio_seen: AtomicBool,
     selected_voice: Arc<AtomicI32>,
     #[id = "pitch"]
     pub pitch_shift: FloatParam,
@@ -138,6 +139,7 @@ impl Default for VcRvcParams {
             echo_hotkey: AtomicBool::new(false),
             diagnostics: Arc::new(crate::diagnostics::Diagnostics::default()),
             save_requested: AtomicBool::new(false),
+            audio_seen: AtomicBool::new(false),
             echo_held: AtomicBool::new(false),
             pitch_shift: FloatParam::new(
                 "Pitch",
