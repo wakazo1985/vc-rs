@@ -286,14 +286,10 @@ impl Plugin for VcRvcPlugin {
             // resample, infer, or apply RVC gain to the original voice.
             0
         } else if let Some(runtime) = self.runtime.as_mut() {
-            if runtime.realtime() && self.params.active_voice.load(Ordering::Acquire)!=requested {
-                // Do not play queued audio of the previous voice while the worker
-                // acknowledges the new selection.
-                runtime.wake();
-                for channel in buffer.as_slice(){channel.fill(0.0);}
-            }else{
-                runtime.process_block(buffer.as_slice());
-            }
+            // Keep consuming and enqueueing audio during a loaded-to-loaded
+            // switch. The worker owns the chunk boundary; flushing here loses
+            // microphone input and forces a gap on every selection.
+            runtime.process_block(buffer.as_slice());
             runtime.current_latency()
         } else {
             for channel in buffer.as_slice() { channel.fill(0.0); }

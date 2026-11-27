@@ -1,0 +1,21 @@
+name: VoiceBank 04 switch latency tests
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-stage04-latency.yml'
+permissions:
+  contents: read
+env:
+  VC_RS_ENABLE_NATIVE_TENSORRT: "0"
+  CARGO_TERM_COLOR: never
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        run: |
+          cargo test -p vc-vst3 --no-default-features --features tensorrt --locked -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

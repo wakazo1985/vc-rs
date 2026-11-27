@@ -697,6 +697,19 @@ struct WorkerCtx {
     initial_conversion: Option<Box<dyn WorkerConversion>>,
 }
 
+/// Five-ms bounded seam smoothing. A decaying endpoint correction avoids
+/// replaying old speech or fading the whole new chunk to silence.
+fn soften_voice_transition(audio: &mut [f32], from: f32, rate: u32) {
+    let n = audio.len().min((rate as usize / 200).max(1));
+    if n == 0 { return; }
+    let correction = from - audio[0];
+    for (i, sample) in audio[..n].iter_mut().enumerate() {
+        let t = if n == 1 { 1.0 } else { i as f32 / (n-1) as f32 };
+        let weight = 0.5 * (1.0 + (std::f32::consts::PI*t).cos());
+        *sample = (*sample + correction*weight).clamp(-1.0,1.0);
+    }
+}
+
 impl WorkerCtx {
     fn spawn(self) -> JoinHandle<()> {
         thread::Builder::new()
@@ -728,6 +741,10 @@ impl WorkerCtx {
         let mut chunk_out = Vec::<f32>::with_capacity(chunk_samples * 2);
         let mut queued_output = Vec::<QueuedSample>::with_capacity(chunk_samples * 2);
         let mut zero_input = vec![0.0; chunk_samples];
+        let mut previous_input = Vec::<f32>::with_capacity(chunk_samples);
+        let mut previous_output_end: Option<f32> = None;
+        let mut pending_switch: Option<(i32, Instant)> = None;
+        let mut transition_from: Option<f32> = None;
 
         // Do not load models during host startup, plugin scan, or project
         // restore. Some DAWs instantiate and tear down plugins on UI/control
@@ -847,6 +864,7 @@ impl WorkerCtx {
                     }
                 }
                 input_acc.clear();
+                previous_input.clear(); previous_output_end = None; pending_switch = None; transition_from = None;
                 self.drain_input();
                 // Loading made a fresh model timeline. A host reset issued
                 // during the load is covered by that same fresh initialization.
@@ -872,13 +890,44 @@ impl WorkerCtx {
                     match current.select_voice(requested_voice) {
                         Ok(changed) => {
                             if changed {
-                                if let Some(hop) = current.profile_hop() {
-                chunk_samples = hop;
-                zero_input.resize(hop, 0.0);
-                self.state.input_hop.store(hop, Ordering::Release);
-                self.latency.store(u32::try_from(hop.saturating_add(current.content_delay())).unwrap_or(u32::MAX), Ordering::Relaxed);
-            }
-                                self.state.generation.fetch_add(1, Ordering::AcqRel);
+                                let started = Instant::now();
+                                let old_hop = chunk_samples;
+                                let new_hop = current.profile_hop().unwrap_or(old_hop);
+                                let continuous = !self.state.offline.load(Ordering::Acquire)
+                                    && current.profile_hop().is_some()
+                                    && new_hop == old_hop
+                                    && self.state.generation.load(Ordering::Acquire) == generation;
+                                chunk_samples = new_hop;
+                                zero_input.resize(new_hop, 0.0);
+                                self.state.input_hop.store(new_hop, Ordering::Release);
+                                if continuous {
+                                    // Clear the target's stale history, NOT the shared
+                                    // microphone/output FIFO. Prime only from real recent
+                                    // input, never reuse a previous character's model state.
+                                    let prepared = current.reset().and_then(|()| {
+                                        if previous_input.len() == new_hop {
+                                            current.apply_live(&self.live_params());
+                                            current.prime(&previous_input, self.sample_rate)?;
+                                        }
+                                        Ok(())
+                                    });
+                                    if let Err(err) = prepared {
+                                        generation = self.fail_conversion("voice switch preparation failed", err);
+                                        converter = None;
+                                        input_acc.clear();
+                                        previous_input.clear(); previous_output_end = None;
+                                        pending_switch = None; transition_from = None;
+                                        continue;
+                                    }
+                                    transition_from = previous_output_end;
+                                    pending_switch = Some((selected, started));
+                                    self.params.diagnostics.event("VOICE_SWITCH_PREPARED", &format!("slot={selected} hop={new_hop} prime_ms={:.2} retained_input={}", started.elapsed().as_secs_f64()*1000.0,input_acc.len()));
+                                } else {
+                                    // Host reset, offline render, or different hop:
+                                    // preserve the existing strict generation boundary.
+                                    self.state.generation.fetch_add(1, Ordering::AcqRel);
+                                }
+                                self.latency.store(u32::try_from(new_hop.saturating_add(current.content_delay())).unwrap_or(u32::MAX), Ordering::Relaxed);
                                 self.set_status(format!("Voice: {}", LABELS[requested_voice]));
                             }
                             self.params.active_voice.store(selected, Ordering::Release);
@@ -897,6 +946,7 @@ impl WorkerCtx {
             let requested_generation = self.state.generation.load(Ordering::Acquire);
             if requested_generation != generation {
                 input_acc.clear();
+                previous_input.clear(); previous_output_end = None; pending_switch = None; transition_from = None;
                 if let Some(current) = converter.as_mut() {
                     if let Err(err) = current.reset() {
                         generation = self.fail_conversion("stream reset failed", err);
@@ -973,6 +1023,12 @@ impl WorkerCtx {
                     continue;
                 }
             };
+            if let Some(from) = transition_from.take() {
+                soften_voice_transition(&mut chunk_out, from, self.sample_rate);
+            }
+            previous_input.clear();
+            previous_input.extend_from_slice(chunk);
+            previous_output_end = chunk_out.last().copied();
             self.params.diagnostics.record_chunk(&stats);
             let detailed = self.params.settings.try_read().map(|s|s.detailed_diagnostics).unwrap_or(false);
             if detailed || last_chunk_log.elapsed() >= Duration::from_secs(5) {
@@ -1023,6 +1079,11 @@ impl WorkerCtx {
             }
             if !self.state.offline.load(Ordering::Acquire) {
                 self.params.diagnostics.output_dropped.fetch_add(queued_output.len().saturating_sub(pushed) as u64, Ordering::Relaxed);
+            }
+            if pushed > 0 {
+                if let Some((slot, started)) = pending_switch.take() {
+                    self.params.diagnostics.event("VOICE_SWITCH_OUTPUT", &format!("slot={slot} first_enqueue_ms={:.2} queued_samples={pushed} {}",started.elapsed().as_secs_f64()*1000.0,self.params.diagnostics.counters()));
+                }
             }
         }
         self.params.flush_profile();
@@ -1812,6 +1873,82 @@ mod tests {
             index += 1;
         }
         output
+    }
+
+    // The bank test uses real queues/worker and a deterministic model mock.
+    // No GPU, scheduling deadline or perceived audio quality claim is made.
+    struct SwitchMock {
+        hop: usize,
+        value: f32,
+        seen: Arc<Mutex<Vec<f32>>>,
+        primes: Arc<AtomicUsize>,
+    }
+    impl WorkerConversion for SwitchMock {
+        fn profile_hop(&self) -> Option<usize> { Some(self.hop) }
+        fn apply_live(&mut self, _: &LiveParams) {}
+        fn reset(&mut self) -> anyhow::Result<()> { Ok(()) }
+        fn prime(&mut self, input: &[f32], _: u32) -> anyhow::Result<()> {
+            assert_eq!(input.len(), self.hop);
+            assert!(input.iter().all(|v| *v == 0.2));
+            self.primes.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
+        fn process(&mut self, input: &[f32], _: u32, out: &mut Vec<f32>) -> anyhow::Result<ChunkStats> {
+            assert_eq!(input.len(), self.hop);
+            self.seen.lock().unwrap().extend_from_slice(input);
+            out.clear(); out.resize(self.hop,self.value);
+            Ok(ChunkStats::default())
+        }
+        fn content_delay(&self) -> usize { 0 }
+    }
+
+    #[test]
+    fn same_hop_switch_retains_queued_output_and_partial_input() {
+        let params = configured_params(0,0,"sola");
+        params.settings.write().unwrap().chunk_ms=50;
+        let hop=800;
+        let seen=Arc::new(Mutex::new(Vec::new()));
+        let primes=Arc::new(AtomicUsize::new(0));
+        let slots: [Option<Box<dyn WorkerConversion>>;4]=std::array::from_fn(|i| {
+            Some(Box::new(SwitchMock{hop,value:0.2+i as f32*0.1,seen:seen.clone(),primes:primes.clone()}) as Box<dyn WorkerConversion>)
+        });
+        let bank=VoiceBank::new(slots,0).unwrap();
+        let mut runtime=PluginRuntime::start_inner(
+            params.clone(),Arc::new(AtomicBool::new(false)),Arc::new(AtomicBool::new(false)),Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(PluginStatus::new("test"))),&Arc::new(ReloadWaker::default()),RATE,hop,ProcessMode::Realtime,None,Some(Box::new(bank)));
+        wait_for(||runtime.state.has_converter.load(Ordering::Acquire) && runtime.state.ready_generation.load(Ordering::Acquire)==1);
+        runtime.process_block(&mut [&mut vec![0.2;hop]]);
+        wait_for(||runtime.output_consumer.slots()>=hop);
+        let mut half=vec![0.4;hop/2];
+        runtime.process_block(&mut [&mut half]);
+        assert!(half.iter().all(|v| *v==0.2));
+        params.set_selected_voice(2); runtime.wake();
+        wait_for(||params.active_voice.load(Ordering::Acquire)==2);
+        assert_eq!(runtime.state.generation.load(Ordering::Acquire),1);
+        assert_eq!(primes.load(Ordering::Acquire),1);
+        let mut second=vec![0.5;hop/2];
+        runtime.process_block(&mut [&mut second]);
+        assert!(second.iter().all(|v| *v==0.2));
+        wait_for(||runtime.output_consumer.slots()>=hop);
+        let data=seen.lock().unwrap();
+        assert_eq!(&data[..hop],&vec![0.2;hop]);
+        assert_eq!(&data[hop..hop+hop/2],&vec![0.4;hop/2]);
+        assert_eq!(&data[hop+hop/2..hop*2],&vec![0.5;hop/2]);
+        drop(data);
+        let mut next=vec![0.6;hop];
+        runtime.process_block(&mut [&mut next]);
+        assert!((next[0]-0.2).abs()<1e-6);
+        assert!((next[hop-1]-0.3).abs()<1e-6);
+        assert!(next.iter().all(|v| *v>=0.19));
+    }
+
+    #[test]
+    fn transition_is_five_ms_bounded_and_does_not_insert_silence() {
+        let mut a=vec![0.3;2400];
+        soften_voice_transition(&mut a,0.2,48000);
+        assert!((a[0]-0.2).abs()<1e-6);
+        assert_eq!(a[239],0.3);
+        assert!(a[240..].iter().all(|v| *v==0.3));
     }
 
     #[test]
