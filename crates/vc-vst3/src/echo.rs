@@ -23,24 +23,25 @@ impl HoldEcho {
             self.clear();
             return;
         }
-        let count = channels.len().min(2);
-        let Some(first) = channels.first() else {
+        let Some((first, rest)) = channels.split_first_mut() else {
             return;
         };
-        let n = first.len();
-        for i in 0..n {
+        let mut second = rest.first_mut();
+        for (i, left) in first.iter_mut().enumerate() {
             let previous = if self.valid == self.delay.len() {
                 self.delay[self.position]
             } else {
                 [0.0; 2]
             };
-            for ch in 0..count {
-                let dry = channels[ch][i];
-                self.delay[self.position][ch] = 0.65 * dry + 0.35 * previous[ch];
-                channels[ch][i] = 0.78 * dry + 0.22 * previous[ch];
-            }
-            for ch in count..2 {
-                self.delay[self.position][ch] = 0.0;
+            let dry = *left;
+            self.delay[self.position][0] = 0.65 * dry + 0.35 * previous[0];
+            *left = 0.78 * dry + 0.22 * previous[0];
+            if let Some(right) = second.as_mut() {
+                let dry = right[i];
+                self.delay[self.position][1] = 0.65 * dry + 0.35 * previous[1];
+                right[i] = 0.78 * dry + 0.22 * previous[1];
+            } else {
+                self.delay[self.position][1] = 0.0;
             }
             self.position = (self.position + 1) % self.delay.len();
             self.valid = (self.valid + 1).min(self.delay.len());

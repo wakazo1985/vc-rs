@@ -127,12 +127,13 @@ impl VcRvcPlugin {
     fn seed_settings(&mut self, discover: impl FnOnce() -> PluginConfig) {
         if !self.config_seed_checked {
             self.config_seed_checked = true;
-            if self.runtime.is_none() && self.applied_settings.is_none() {
-                if self.params.settings.seed_if_pristine(discover) {
-                    let selected = self.params.settings.read().unwrap().startup_voice;
-                    self.params.set_selected_voice(selected);
-                    self.params.save_requested.store(false, Ordering::Release);
-                }
+            if self.runtime.is_none()
+                && self.applied_settings.is_none()
+                && self.params.settings.seed_if_pristine(discover)
+            {
+                let selected = self.params.settings.read().unwrap().startup_voice;
+                self.params.set_selected_voice(selected);
+                self.params.save_requested.store(false, Ordering::Release);
             }
         }
     }

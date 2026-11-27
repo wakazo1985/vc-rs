@@ -109,13 +109,14 @@ impl Default for VoiceProfile {
 }
 impl VoiceProfile {
     pub fn initial(slot: usize) -> Self {
-        let mut p = Self::default();
-        p.pitch_shift = [14.0, 12.0, 0.0, 0.0][slot];
-        p.index_rate = [0.4, 0.4, 0.5, 0.7][slot];
-        p.protect = [0.25, 0.25, 0.33, 0.33][slot];
-        // Provisional: favor the generated envelope over aggressive input RMS matching.
-        p.rms_mix_rate = [0.75, 0.75, 0.8, 1.0][slot];
-        p
+        Self {
+            pitch_shift: [14.0, 12.0, 0.0, 0.0][slot],
+            index_rate: [0.4, 0.4, 0.5, 0.7][slot],
+            protect: [0.25, 0.25, 0.33, 0.33][slot],
+            // Provisional: favor the generated envelope over aggressive input RMS matching.
+            rms_mix_rate: [0.75, 0.75, 0.8, 1.0][slot],
+            ..Self::default()
+        }
     }
     /// Migrate only a completely untouched stage 01/02 profile.
     pub fn upgrade_untouched(&mut self, slot: usize) -> bool {

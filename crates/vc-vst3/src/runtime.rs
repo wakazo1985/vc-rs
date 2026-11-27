@@ -339,9 +339,8 @@ pub struct PluginRuntime {
     /// Initial plugin latency in host samples, reported at `initialize`.
     pub latency_samples: u32,
     /// Current latency, updated after model/output initialization or reload. The audio
-    /// thread re-reports it to the host (see [`PluginRuntime::poll_latency_update`]).
+    /// thread re-reports it to the host using `current_latency`.
     latency: Arc<AtomicU32>,
-    last_reported_latency: u32,
     loading: Arc<AtomicBool>,
     state: Arc<RuntimeState>,
     sample_rate: u32,
@@ -503,7 +502,6 @@ impl PluginRuntime {
             mono_out: vec![0.0; max_block],
             latency_samples,
             latency,
-            last_reported_latency: latency_samples,
             loading,
             state,
             sample_rate,
@@ -540,6 +538,7 @@ impl PluginRuntime {
     pub(crate) fn realtime(&self) -> bool {
         !self.state.offline.load(Ordering::Acquire)
     }
+    #[cfg(test)]
     pub(crate) fn wake(&self) {
         self.worker_thread.unpark();
     }
@@ -570,18 +569,6 @@ impl PluginRuntime {
         }
         self.offline_generation = 0;
         self.worker_thread.unpark();
-    }
-
-    /// Returns a new latency value if the worker changed it (chunk_ms edit) since
-    /// the last call, so the audio thread can re-report it to the host.
-    pub fn poll_latency_update(&mut self) -> Option<u32> {
-        let current = self.latency.load(Ordering::Relaxed);
-        if current != self.last_reported_latency {
-            self.last_reported_latency = current;
-            Some(current)
-        } else {
-            None
-        }
     }
 
     /// Audio-thread entry point. Downmixes input to mono, queues it, and fills
@@ -1704,25 +1691,6 @@ impl ModelLoader {
             .unwrap_or_else(|e| e.into_inner()) = text.clone();
         if let Ok(mut status) = self.status.lock() {
             *status = PluginStatus::new(text);
-        }
-    }
-
-    fn set_error(&self, summary: impl Into<String>, detail: impl Into<String>) {
-        let summary = summary.into();
-        let detail = detail.into();
-        self.params
-            .diagnostics
-            .event("ERROR", &format!("{summary}: {detail}"));
-        *self
-            .params
-            .model_message
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = format!("{summary}: {detail}");
-        if let Ok(mut status) = self.status.lock() {
-            *status = PluginStatus {
-                summary,
-                detail: Some(detail),
-            };
         }
     }
 
