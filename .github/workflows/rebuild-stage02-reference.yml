@@ -1,0 +1,184 @@
+name: Stage 02 official PyTorch reference audio
+on:
+  push:
+    branches: [rebuild-stage01-audit]
+    paths: ['.github/workflows/rebuild-stage02-reference.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [applio, rvc]
+    env:
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      TORCH_FORCE_WEIGHTS_ONLY_LOAD: '1'
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CPU PyTorch and official inference dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install 'numpy<2.3' 'scipy<1.17' 'transformers<5' librosa soundfile faiss-cpu soxr onnxruntime onnx einops torchcrepe torchfcpe stftpitchshift requests tqdm praat-parselmouth ffmpeg-python python-dotenv psutil pyyaml tensorboard
+          python -m pip freeze
+      - name: Fetch official inference source
+        run: |
+          if [ "${{ matrix.engine }}" = applio ]; then
+            git clone --depth 1 https://github.com/IAHispano/Applio.git engine
+          else
+            git clone --depth 1 https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git engine
+          fi
+          git -C engine rev-parse HEAD | tee source-commit.txt
+      - name: Verify public checkpoints and generate common input
+        env:
+          ENGINE: ${{ matrix.engine }}
+        run: |
+          mkdir -p reference-output private-models
+          python - <<'PY'
+          import hashlib, pathlib, urllib.request, zipfile, json, os, shutil
+          import librosa, soundfile as sf
+          p=pathlib.Path("private-models").resolve()
+          sources={
+              "toddler":[("maxwellyoung(FantasticMax).zip","https://huggingface.co/VofVoices/maxwell-young-fantastic-max-RVC-v2/resolve/main/maxwellyoung%28FantasticMax%29.zip","01805b226446741e8b077d102255bd55c7b85caa976f1fc7030033880649708d")],
+              "girl":[("rvc_amitaro_runrun_1.0.zip","https://amitaro.net/download/others/rvc_amitaro_runrun_1.0.zip","bcb6487dbf26648d2ffa78ff39cc8c88b53d1e754b27e55423b77379475d0ebe")],
+              "D":[("D.pth","https://huggingface.co/ttttdiva/rvc_okiba/resolve/main/models/D/D.pth","bc0191b5447a8a1e884198b9465db54fb4da91b07f25a684d43f39688a6c8343"),("D.index","https://huggingface.co/ttttdiva/rvc_okiba/resolve/main/models/D/D.index","a7912aa4f47471a3d133425416dcb157541f5b68473644589be7f5207ba12cbd")],
+              "robot":[("speakandspell.zip","https://huggingface.co/analogspiderweb/analogspiderweb_RVC/resolve/17a331f0ecdc9cbb52b0b7d599b36300a38fc413/speakandspell.zip","76c53a8951c555deccfd2e2f6b190fb4b68fb7aa31f42982c5ab20c228be0e1d")]}
+          def download(url,path,expected=None):
+              path.parent.mkdir(parents=True,exist_ok=True)
+              h=hashlib.sha256()
+              with urllib.request.urlopen(urllib.request.Request(url,headers={"User-Agent":"RVC-reference-audit/1.0"}),timeout=90) as r, path.open("wb") as f:
+                  while b:=r.read(1024*1024):
+                      h.update(b);f.write(b)
+              actual=h.hexdigest()
+              if expected and actual!=expected: raise RuntimeError("SHA256 mismatch "+str(path))
+              print("PUBLIC_FILE",path.name,path.stat().st_size,actual,flush=True)
+              return actual
+          voices=("toddler","girl") if os.environ["ENGINE"]=="applio" else ("D","robot")
+          manifest={}
+          for v in voices:
+              d=p/v; d.mkdir()
+              for name,url,expected in sources[v]:
+                  target=d/name; download(url,target,expected)
+                  if target.suffix==".zip":
+                      with zipfile.ZipFile(target) as z:
+                          for member in z.infolist():
+                              ext=pathlib.PurePosixPath(member.filename).suffix.lower()
+                              if ext in (".pth",".index") and not member.is_dir():
+                                  # Preserve original member bytes and filenames; no extraction of executable files.
+                                  dst=d/pathlib.PurePosixPath(member.filename).name
+                                  if dst.exists(): raise RuntimeError("duplicate archive member")
+                                  with z.open(member) as src,dst.open("wb") as out: shutil.copyfileobj(src,out)
+                      target.unlink()
+              pt=list(d.glob("*.pth")); idx=list(d.glob("*.index"))
+              idx=[x for x in idx if not x.name.startswith("trained_")]
+              if len(pt)!=1 or len(idx)!=1: raise RuntimeError(str((v,pt,idx)))
+              manifest[v]={"pth":str(pt[0]),"index":str(idx[0]),"pth_sha256":hashlib.file_digest(pt[0].open("rb"),"sha256").hexdigest(),"index_sha256":hashlib.file_digest(idx[0].open("rb"),"sha256").hexdigest(),"public_archive_sha256":[x[2] for x in sources[v]]}
+          (p/"manifest.json").write_text(json.dumps(manifest,indent=2))
+          y,sr=librosa.load(librosa.ex("libri2"),sr=16000,mono=True,duration=10)
+          sf.write("reference-output/00_input_LibriSpeech.wav",y,sr,subtype="PCM_16")
+          print("INPUT",len(y),sr)
+          e=pathlib.Path("engine")
+          if os.environ["ENGINE"]=="applio":
+              base="https://huggingface.co/IAHispano/Applio/resolve/main/Resources/"
+              for name in ("pytorch_model.bin","config.json"):
+                  download(base+"embedders/contentvec/"+name,e/"rvc/models/embedders/contentvec"/name)
+              download("https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt",e/"rvc/models/predictors/rmvpe.pt")
+          else:
+              base="https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/"
+              for name in ("pytorch_model.bin","config.json","preprocessor_config.json"):
+                  download(base+"hubert_base/"+name,e/"assets/hubert_base"/name)
+              download(base+"rmvpe.pt",e/"assets/rmvpe/rmvpe.pt")
+          PY
+      - name: Run official file inference and validate WAV
+        env:
+          ENGINE: ${{ matrix.engine }}
+        run: |
+          cd engine
+          python - <<'PY'
+          import os, pathlib, json, time, random, traceback, sys, hashlib
+          import numpy as np, soundfile as sf, torch, faiss
+          root=pathlib.Path("..").resolve()
+          manifest=json.loads((root/"private-models/manifest.json").read_text())
+          out=root/"reference-output"
+          source=root/"source-commit.txt"
+          input_path=out/"00_input_LibriSpeech.wav"
+          results=[]
+          # Log missing/unexpected keys on actual official network load; do not modify any weights.
+          original_load=torch.nn.Module.load_state_dict
+          def audited_load(self,*args,**kwargs):
+              ret=original_load(self,*args,**kwargs)
+              if self.__class__.__name__.startswith("Synthesizer"):
+                  print("STATE_DICT",self.__class__.__name__,"missing",ret.missing_keys,"unexpected",ret.unexpected_keys,flush=True)
+                  if ret.missing_keys or ret.unexpected_keys: raise RuntimeError("checkpoint incompatibility")
+              return ret
+          torch.nn.Module.load_state_dict=audited_load
+          if os.environ["ENGINE"]=="applio":
+              from rvc.infer.infer import VoiceConverter
+              vc=VoiceConverter()
+          else:
+              from types import SimpleNamespace
+              os.environ["rmvpe_root"]=str(pathlib.Path("assets/rmvpe").resolve())
+              os.environ["index_root"]=str(root/"private-models")
+              from infer.vc.modules import VC
+              vc=VC(SimpleNamespace(device="cpu",is_half=False,x_pad=1,x_query=6,x_center=38,x_max=41))
+          for name,m in manifest.items():
+              result={"voice":name,"engine":os.environ["ENGINE"],"commit":source.read_text().strip(),**{k:v for k,v in m.items() if k.endswith("sha256")}}
+              try:
+                  ix=faiss.read_index(m["index"])
+                  print("INDEX_LOAD",name,ix.d,ix.ntotal,ix.is_trained,flush=True)
+                  assert ix.d==768 and ix.ntotal>0 and ix.is_trained
+                  del ix
+                  # Candidate pitch for male input, not author-certified optimum.
+                  pitch={"toddler":12,"girl":12,"D":15,"robot":0}[name]
+                  # Applio API defaults; RVC reference settings from official API.
+                  applio=os.environ["ENGINE"]=="applio"
+                  index_rate=0.75 if name!="D" else 1.0
+                  protect=0.5 if applio else 0.33
+                  rms=1.0 if applio else 0.25
+                  result.update(pitch=pitch,index_rate=index_rate,protect=protect,rms_mix=rms,f0="rmvpe",sid=0,device="cpu",precision="float32")
+                  random.seed(42);np.random.seed(42);torch.manual_seed(42)
+                  dest=out/(name+"_official_reference.wav")
+                  start=time.monotonic()
+                  if applio:
+                      vc.convert_audio(audio_input_path=str(input_path),audio_output_path=str(dest),model_path=m["pth"],index_path=m["index"],pitch=pitch,f0_method="rmvpe",index_rate=index_rate,volume_envelope=rms,protect=protect,embedder_model="contentvec",f0_autotune=False,proposed_pitch=False,sid=0,inference_engine="torch")
+                  else:
+                      os.environ["weight_root"]=str(pathlib.Path(m["pth"]).parent)
+                      vc.get_vc(pathlib.Path(m["pth"]).name)
+                      msg,pair=vc.vc_single(0,str(input_path),pitch,"rmvpe",m["index"],index_rate,0,rms,protect)
+                      print("RVC_STATUS",msg,flush=True)
+                      if not pair or pair[0] is None or pair[1] is None: raise RuntimeError(msg)
+                      sr,audio=pair
+                      sf.write(dest,audio,sr,subtype="PCM_16")
+                  a,sr=sf.read(dest)
+                  assert len(a)>0 and np.isfinite(a).all()
+                  rms_out=float(np.sqrt(np.mean(a*a)))
+                  assert rms_out>1e-5
+                  result.update(status="generated",sample_rate=sr,seconds=len(a)/sr,peak=float(np.abs(a).max()),rms=rms_out,clipped_samples=int(np.sum(np.abs(a)>=0.999)),wall_seconds=time.monotonic()-start,output_sha256=hashlib.file_digest(dest.open("rb"),"sha256").hexdigest())
+              except Exception as e:
+                  traceback.print_exc();result.update(status="failed",error=str(e))
+              results.append(result)
+              print("REFERENCE_RESULT",json.dumps(result),flush=True)
+              (out/"results.json").write_text(json.dumps(results,indent=2))
+          (out/"source-commit.txt").write_text(source.read_text())
+          (out/"NOTICE.txt").write_text("Public distribution files verified against reference SHA-256, not user's originals. Input: LibriSpeech narration (librosa libri2). Voices: Fantastic Max (VofVoices), Amitaro Runrun (あみたろ), D (ttttdiva), Speak and Spell (analogspiderweb). No model redistribution. CPU offline baseline, not a latency or perceptual quality certification.")
+          if any(x["status"]!="generated" for x in results): sys.exit(1)
+          PY
+      - name: Upload only generated WAVs and verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage02-${{ matrix.engine }}-reference
+          path: |
+            reference-output/*.wav
+            reference-output/*.json
+            reference-output/*.txt
+          if-no-files-found: warn
+          retention-days: 7
