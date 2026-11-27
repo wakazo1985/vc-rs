@@ -33,7 +33,11 @@ mod ffi {
             message_len: usize,
         ) -> *mut c_void;
         pub(super) fn vc_rs_trt_engine_destroy(native: *mut c_void);
-        pub(super) fn vc_rs_trt_memory_info(device: i32, free: *mut usize, total: *mut usize) -> c_int;
+        pub(super) fn vc_rs_trt_memory_info(
+            device: i32,
+            free: *mut usize,
+            total: *mut usize,
+        ) -> c_int;
         pub(super) fn vc_rs_trt_engine_output_len(native: *const c_void) -> usize;
         pub(super) fn vc_rs_trt_contentvec_infer(
             native: *mut c_void,
@@ -672,17 +676,23 @@ fn native_cache_root() -> Result<PathBuf> {
 }
 
 /// Device-wide memory snapshot, not this plugin's exclusive allocation.
-pub fn native_gpu_memory(device: u32) -> Result<(usize,usize)> {
+pub fn native_gpu_memory(device: u32) -> Result<(usize, usize)> {
     #[cfg(native_tensorrt)]
     {
-        let mut free=0usize; let mut total=0usize;
-        let id=i32::try_from(device)?;
-        let status=unsafe{ffi::vc_rs_trt_memory_info(id,&mut free,&mut total)};
-        if status!=0 { bail!("CUDA memory query failed ({status})"); }
-        Ok((free,total))
+        let mut free = 0usize;
+        let mut total = 0usize;
+        let id = i32::try_from(device)?;
+        let status = unsafe { ffi::vc_rs_trt_memory_info(id, &mut free, &mut total) };
+        if status != 0 {
+            bail!("CUDA memory query failed ({status})");
+        }
+        Ok((free, total))
     }
     #[cfg(not(native_tensorrt))]
-    { let _=device; bail!("native TensorRT unavailable") }
+    {
+        let _ = device;
+        bail!("native TensorRT unavailable")
+    }
 }
 pub(super) fn native_engine_is_cached(profile: &TensorRtSessionProfile) -> bool {
     native_engine_path(profile)
@@ -698,8 +708,13 @@ fn ensure_native_engine(
 ) -> Result<PathBuf> {
     let engine_path = native_engine_path(profile)?;
     let device_root = tensor_rt_cache_root()?.join(format!("device-{}", profile.gpu_device_id));
-    let cached=engine_path.metadata().is_ok_and(|m|m.len()>0);
-    info!("NATIVE_PLAN_CACHE role={} hit={} path={}",profile.role.label(),cached,engine_path.display());
+    let cached = engine_path.metadata().is_ok_and(|m| m.len() > 0);
+    info!(
+        "NATIVE_PLAN_CACHE role={} hit={} path={}",
+        profile.role.label(),
+        cached,
+        engine_path.display()
+    );
     ensure_native_engine_with_builder(&engine_path, &device_root, |engine_path| {
         build_engine(
             model_path,
@@ -1898,12 +1913,19 @@ mod cache_version_tests {
 
     #[test]
     fn warm_cache_does_not_call_builder_again() {
-        let root=scratch_dir("native-restart-cache");
-        let device=root.join("device-0");
-        let path=root.join("profile/native.engine");
-        ensure_native_engine_with_builder(&path,&device,|p|{std::fs::write(p,b"plan")?;Ok(())}).unwrap();
-        ensure_native_engine_with_builder(&path,&device,|_|anyhow::bail!("must reuse existing plan")).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(),b"plan");
+        let root = scratch_dir("native-restart-cache");
+        let device = root.join("device-0");
+        let path = root.join("profile/native.engine");
+        ensure_native_engine_with_builder(&path, &device, |p| {
+            std::fs::write(p, b"plan")?;
+            Ok(())
+        })
+        .unwrap();
+        ensure_native_engine_with_builder(&path, &device, |_| {
+            anyhow::bail!("must reuse existing plan")
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"plan");
         std::fs::remove_dir_all(root).unwrap();
     }
 

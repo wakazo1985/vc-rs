@@ -363,13 +363,13 @@ pub struct WavArgs {
     /// Enable separate accepted RMVPE and converted F0 bounds (VoiceBank mode).
     #[arg(long)]
     pub voice_f0_limits: bool,
-    #[arg(long,default_value_t=50.0)]
+    #[arg(long, default_value_t = 50.0)]
     pub input_f0_min_hz: f32,
-    #[arg(long,default_value_t=1100.0)]
+    #[arg(long, default_value_t = 1100.0)]
     pub input_f0_max_hz: f32,
-    #[arg(long,default_value_t=50.0)]
+    #[arg(long, default_value_t = 50.0)]
     pub output_f0_min_hz: f32,
-    #[arg(long,default_value_t=1100.0)]
+    #[arg(long, default_value_t = 1100.0)]
     pub output_f0_max_hz: f32,
     #[arg(long)]
     pub embedder: PathBuf,
@@ -644,8 +644,16 @@ impl WavArgs {
         )
         .and_then(|()| validate_wav_live_conversion_options(self))?;
         if self.voice_f0_limits {
-            vc_core::model_rvc::F0PostprocessConfig::with_input_range(self.input_f0_min_hz,self.input_f0_max_hz).map_err(|e| e.to_string())?;
-            vc_core::model_rvc::F0PostprocessConfig::with_input_range(self.output_f0_min_hz,self.output_f0_max_hz).map_err(|e| e.to_string())?;
+            vc_core::model_rvc::F0PostprocessConfig::with_input_range(
+                self.input_f0_min_hz,
+                self.input_f0_max_hz,
+            )
+            .map_err(|e| e.to_string())?;
+            vc_core::model_rvc::F0PostprocessConfig::with_input_range(
+                self.output_f0_min_hz,
+                self.output_f0_max_hz,
+            )
+            .map_err(|e| e.to_string())?;
         }
         if !self.protect.is_finite() || !(0.0..=0.5).contains(&self.protect) {
             return Err("Protect must be in 0..=0.5".into());
@@ -1451,16 +1459,44 @@ mod tests {
 
     #[test]
     fn wav_voicebank_quality_flags_validate() {
-        let mut flags = vec!["vc-rs","wav","--model","m.onnx","--embedder","e.onnx","--f0-model","f.onnx","--input","a.wav","--output","b.wav","--chunk-ms","50","--index","m.index","--index-rate","0.4","--protect","0.25","--formant-shift","-2","--peak-protection"];
-        let Command::Wav(args) = Cli::try_parse_from(&flags).unwrap().command else { panic!("wav expected"); };
-        assert_eq!(args.index_rate,0.4);
-        assert_eq!(args.protect,0.25);
-        assert_eq!(args.formant_shift,-2.0);
+        let mut flags = vec![
+            "vc-rs",
+            "wav",
+            "--model",
+            "m.onnx",
+            "--embedder",
+            "e.onnx",
+            "--f0-model",
+            "f.onnx",
+            "--input",
+            "a.wav",
+            "--output",
+            "b.wav",
+            "--chunk-ms",
+            "50",
+            "--index",
+            "m.index",
+            "--index-rate",
+            "0.4",
+            "--protect",
+            "0.25",
+            "--formant-shift",
+            "-2",
+            "--peak-protection",
+        ];
+        let Command::Wav(args) = Cli::try_parse_from(&flags).unwrap().command else {
+            panic!("wav expected");
+        };
+        assert_eq!(args.index_rate, 0.4);
+        assert_eq!(args.protect, 0.25);
+        assert_eq!(args.formant_shift, -2.0);
         assert!(args.peak_protection);
         args.validate_conversion_options().unwrap();
-        let i=flags.iter().position(|x|*x=="0.25").unwrap();
-        flags[i]="0.6";
-        let Command::Wav(args) = Cli::try_parse_from(&flags).unwrap().command else { panic!("wav expected"); };
+        let i = flags.iter().position(|x| *x == "0.25").unwrap();
+        flags[i] = "0.6";
+        let Command::Wav(args) = Cli::try_parse_from(&flags).unwrap().command else {
+            panic!("wav expected");
+        };
         assert!(args.validate_conversion_options().is_err());
     }
 

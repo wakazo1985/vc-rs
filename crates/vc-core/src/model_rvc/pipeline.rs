@@ -1229,39 +1229,71 @@ impl RvcPipeline {
     /// Optional FAISS L2 Flat/IVFFlat retrieval. Load on the inference worker,
     /// before processing. No Python or dynamically loaded FAISS library.
     pub fn set_retrieval_index(&mut self, path: &Path, rate: f32) -> Result<()> {
-        ensure!(rate.is_finite() && (0.0..=1.0).contains(&rate), "invalid index rate");
-        if rate == 0.0 { self.retrieval = None; self.retrieval_rate = 0.0; return Ok(()); }
+        ensure!(
+            rate.is_finite() && (0.0..=1.0).contains(&rate),
+            "invalid index rate"
+        );
+        if rate == 0.0 {
+            self.retrieval = None;
+            self.retrieval_rate = 0.0;
+            return Ok(());
+        }
         let index = super::retrieval::RetrievalIndex::load(path)?;
-        ensure!(i64::try_from(index.dimension())? == i64::from(self.rvc.expected_feat_channels), "INDEX dimension differs from RVC model");
+        ensure!(
+            i64::try_from(index.dimension())? == i64::from(self.rvc.expected_feat_channels),
+            "INDEX dimension differs from RVC model"
+        );
         self.retrieval = Some(index);
         self.retrieval_rate = rate;
         Ok(())
     }
 
     pub fn set_protect(&mut self, protect: f32) -> Result<()> {
-        ensure!(protect.is_finite() && (0.0..=0.5).contains(&protect), "Invalid Protect");
+        ensure!(
+            protect.is_finite() && (0.0..=0.5).contains(&protect),
+            "Invalid Protect"
+        );
         self.protect = protect;
         Ok(())
     }
-    pub fn set_quality_diagnostics(&mut self, enabled: bool) { self.quality_enabled = enabled; }
+    pub fn set_quality_diagnostics(&mut self, enabled: bool) {
+        self.quality_enabled = enabled;
+    }
     /// VoiceBank opt-in: preserve the shape of over-range model and RMS-mixed audio.
-    pub fn set_peak_protection(&mut self, enabled: bool) { self.prevent_hard_clip = enabled; }
+    pub fn set_peak_protection(&mut self, enabled: bool) {
+        self.prevent_hard_clip = enabled;
+    }
     pub fn set_formant_shift(&mut self, shift: f32) -> Result<()> {
-        ensure!(shift.is_finite() && (-12.0..=12.0).contains(&shift), "Invalid formant shift");
-        self.formant = if shift == 0.0 { None } else { Some(super::formant::Formant::new(self.rvc_sample_rate, shift)?) };
+        ensure!(
+            shift.is_finite() && (-12.0..=12.0).contains(&shift),
+            "Invalid formant shift"
+        );
+        self.formant = if shift == 0.0 {
+            None
+        } else {
+            Some(super::formant::Formant::new(self.rvc_sample_rate, shift)?)
+        };
         self.formant_shift = shift;
         Ok(())
     }
     /// Independent raw-F0 acceptance and post-transposition output limits.
     /// The original RVC 50..1100 Hz coarse quantization remains unchanged.
-    pub fn set_f0_ranges(&mut self, input_min: f32, input_max: f32, output_min: f32, output_max: f32) -> Result<()> {
+    pub fn set_f0_ranges(
+        &mut self,
+        input_min: f32,
+        input_max: f32,
+        output_min: f32,
+        output_max: f32,
+    ) -> Result<()> {
         let cfg = F0PostprocessConfig::with_input_range(input_min, input_max)?;
         F0PostprocessConfig::with_input_range(output_min, output_max)?;
         self.f0_postprocess.set_config(cfg);
         self.output_f0_range = Some((output_min, output_max));
         Ok(())
     }
-    pub fn quality_report(&self) -> &str { &self.quality_report }
+    pub fn quality_report(&self) -> &str {
+        &self.quality_report
+    }
     pub fn set_pitch_shift(&mut self, pitch_shift: f32) {
         self.pitch_shift = pitch_shift;
     }
@@ -1496,16 +1528,31 @@ impl VoiceModel for RvcPipeline {
             &self.stream_state.audio_16k_buffer,
             &mut self.feature_tensor,
         )?;
-        ensure!(self.feature_tensor.data.iter().all(|v| v.is_finite()), "ContentVec returned nonfinite features");
-        let feature_quality = self.quality_enabled.then(|| signal_quality(&self.feature_tensor.data));
-        let preserve_features = self.retrieval.is_some() && (self.protect < 0.5 || self.quality_enabled);
+        ensure!(
+            self.feature_tensor.data.iter().all(|v| v.is_finite()),
+            "ContentVec returned nonfinite features"
+        );
+        let feature_quality = self
+            .quality_enabled
+            .then(|| signal_quality(&self.feature_tensor.data));
+        let preserve_features =
+            self.retrieval.is_some() && (self.protect < 0.5 || self.quality_enabled);
         if preserve_features {
-            self.original_features.data.clone_from(&self.feature_tensor.data);
-            self.original_features.shape.clone_from(&self.feature_tensor.shape);
+            self.original_features
+                .data
+                .clone_from(&self.feature_tensor.data);
+            self.original_features
+                .shape
+                .clone_from(&self.feature_tensor.shape);
         }
         if let Some(index) = self.retrieval.as_ref() {
             let shape = &self.feature_tensor.shape;
-            ensure!(shape.len() == 3 && shape[0] == 1 && usize::try_from(shape[2])? == index.dimension(), "INDEX feature dimension mismatch");
+            ensure!(
+                shape.len() == 3
+                    && shape[0] == 1
+                    && usize::try_from(shape[2])? == index.dimension(),
+                "INDEX feature dimension mismatch"
+            );
             index.blend(&mut self.feature_tensor.data, self.retrieval_rate)?;
         }
         let raw_feature_len = self
@@ -1548,9 +1595,13 @@ impl VoiceModel for RvcPipeline {
         if preserve_features {
             self.original_features.repeat_frames(2)?;
             if silence_front_frames > 0 && silence_front_frames < feature_len_before_trim {
-                self.original_features.trim_front_frames(silence_front_frames)?;
+                self.original_features
+                    .trim_front_frames(silence_front_frames)?;
             }
-            ensure!(self.original_features.shape == self.feature_tensor.shape, "Protect feature grid mismatch");
+            ensure!(
+                self.original_features.shape == self.feature_tensor.shape,
+                "Protect feature grid mismatch"
+            );
         }
         let embedder_time = embedder_start.elapsed();
         let feature_len = self
@@ -1606,25 +1657,55 @@ impl VoiceModel for RvcPipeline {
             self.pitch_shift,
             &mut self.pitchf_postprocessed_scratch,
         );
-        if let Some((min,max)) = self.output_f0_range {
-            clamp_voiced_output_f0(&mut self.pitchf_postprocessed_scratch,min,max);
+        if let Some((min, max)) = self.output_f0_range {
+            clamp_voiced_output_f0(&mut self.pitchf_postprocessed_scratch, min, max);
         }
         let pitchf = self.pitchf_postprocessed_scratch.as_slice();
-        ensure!(pitchf.iter().all(|v| v.is_finite() && *v >= 0.0), "RMVPE/F0 processing returned invalid pitch");
+        ensure!(
+            pitchf.iter().all(|v| v.is_finite() && *v >= 0.0),
+            "RMVPE/F0 processing returned invalid pitch"
+        );
         let feature_change = if preserve_features && self.quality_enabled {
-            let sum = self.feature_tensor.data.iter().zip(&self.original_features.data)
-                .map(|(a,b)| { let d = *a-*b; (d*d) as f64 }).sum::<f64>();
+            let sum = self
+                .feature_tensor
+                .data
+                .iter()
+                .zip(&self.original_features.data)
+                .map(|(a, b)| {
+                    let d = *a - *b;
+                    (d * d) as f64
+                })
+                .sum::<f64>();
             (sum / self.feature_tensor.data.len().max(1) as f64).sqrt()
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         if preserve_features && self.protect < 0.5 {
             let channels = usize::try_from(self.feature_tensor.shape[2])?;
-            super::feature::protect_unvoiced(&mut self.feature_tensor.data, &self.original_features.data, pitchf, channels, self.protect)?;
+            super::feature::protect_unvoiced(
+                &mut self.feature_tensor.data,
+                &self.original_features.data,
+                pitchf,
+                channels,
+                self.protect,
+            )?;
         }
         if self.quality_enabled {
             let protected_feature_quality = signal_quality(&self.feature_tensor.data);
-            fn f0_summary(xs: &[f32]) -> (usize,f32,f32,f32) {
-                let (n,sum,min,max) = xs.iter().copied().filter(|x| x.is_finite() && *x >= 1.0).fold((0usize,0.0f32,f32::INFINITY,0.0f32), |(n,s,l,h),x|(n+1,s+x,l.min(x),h.max(x)));
-                if n == 0 { (0,0.0,0.0,0.0) } else { (n,min,sum/n as f32,max) }
+            fn f0_summary(xs: &[f32]) -> (usize, f32, f32, f32) {
+                let (n, sum, min, max) = xs
+                    .iter()
+                    .copied()
+                    .filter(|x| x.is_finite() && *x >= 1.0)
+                    .fold(
+                        (0usize, 0.0f32, f32::INFINITY, 0.0f32),
+                        |(n, s, l, h), x| (n + 1, s + x, l.min(x), h.max(x)),
+                    );
+                if n == 0 {
+                    (0, 0.0, 0.0, 0.0)
+                } else {
+                    (n, min, sum / n as f32, max)
+                }
             }
             self.quality_report = format!("input={input_quality:?} contentvec={feature_quality:?} features_after_protect={protected_feature_quality:?} f0_raw={:?} f0_shifted={:?} pitch_st={} feature_frames={} feature_change_rms={:.6} index_rate={} protect={}", f0_summary(&self.pitchf_scratch),f0_summary(pitchf),self.pitch_shift,feature_len,feature_change,self.retrieval_rate,self.protect);
         }
@@ -1730,13 +1811,19 @@ impl VoiceModel for RvcPipeline {
             self.stream_state.time_state.advance_phase(pitchf);
         }
         let raw_output_samples = out_audio.len();
-        ensure!(out_audio.iter().all(|v| v.is_finite()), "RVC synthesis returned nonfinite audio");
+        ensure!(
+            out_audio.iter().all(|v| v.is_finite()),
+            "RVC synthesis returned nonfinite audio"
+        );
         if self.quality_enabled {
-            let peak = out_audio.iter().fold(0.0_f32, |a,x|a.max(x.abs()));
-            let clipped = out_audio.iter().filter(|x|x.abs()>1.0).count();
-            let nonfinite = out_audio.iter().filter(|x|!x.is_finite()).count();
+            let peak = out_audio.iter().fold(0.0_f32, |a, x| a.max(x.abs()));
+            let clipped = out_audio.iter().filter(|x| x.abs() > 1.0).count();
+            let nonfinite = out_audio.iter().filter(|x| !x.is_finite()).count();
             use std::fmt::Write as _;
-            let _ = write!(self.quality_report, " rvc_raw_peak={peak:.6} rvc_raw_overrange={clipped} rvc_nonfinite={nonfinite}");
+            let _ = write!(
+                self.quality_report,
+                " rvc_raw_peak={peak:.6} rvc_raw_overrange={clipped} rvc_nonfinite={nonfinite}"
+            );
         }
         ensure!(
             raw_output_samples >= stream_input.out_size,
@@ -1748,10 +1835,17 @@ impl VoiceModel for RvcPipeline {
         pitchf_tail_for_output_into(pitchf, out_audio.len(), self.rvc_sample_rate, out_pitchf);
         // The candidate includes join overlap, and formant correction does not
         // change its length, pitch frame grid, or TensorRT engine shape.
-        if let Some(formant) = self.formant.as_mut() { formant.process(out_audio)?; }
+        if let Some(formant) = self.formant.as_mut() {
+            formant.process(out_audio)?;
+        }
         if self.quality_enabled {
             use std::fmt::Write as _;
-            let _ = write!(self.quality_report, " formant_st={} after_formant={:?}", self.formant_shift, signal_quality(out_audio));
+            let _ = write!(
+                self.quality_report,
+                " formant_st={} after_formant={:?}",
+                self.formant_shift,
+                signal_quality(out_audio)
+            );
         }
         let output_envelope = if self.volume_envelope {
             stream_input.volume.sqrt().clamp(0.0, 1.0)
@@ -1760,11 +1854,15 @@ impl VoiceModel for RvcPipeline {
         };
         let envelope_gain = if self.prevent_hard_clip {
             peak_safe_gain(out_audio, output_envelope)
-        } else { output_envelope };
+        } else {
+            output_envelope
+        };
         if self.prevent_hard_clip {
             // clamp_scale_in_place clips BEFORE scaling; that would defeat peak protection.
             dsp::apply_gain_and_rms(out_audio, envelope_gain);
-        } else { dsp::clamp_scale_in_place(out_audio, envelope_gain); }
+        } else {
+            dsp::clamp_scale_in_place(out_audio, envelope_gain);
+        }
         let before_rms_mix = self.quality_enabled.then(|| signal_quality(out_audio));
         if self.rms_mix_rate < 1.0 {
             // Captured before apply_rms_mix mutates `out_audio`, but only used
@@ -1802,12 +1900,27 @@ impl VoiceModel for RvcPipeline {
                 dsp::rms(out_audio)
             );
         }
-        ensure!(out_audio.iter().all(|v| v.is_finite()), "RMS mixing returned nonfinite audio");
+        ensure!(
+            out_audio.iter().all(|v| v.is_finite()),
+            "RMS mixing returned nonfinite audio"
+        );
         let after_rms_mix = self.quality_enabled.then(|| signal_quality(out_audio));
         let (output_rms, applied_output_gain) = if self.prevent_hard_clip {
-            apply_peak_safe_output_gain(out_audio, self.output_gain, self.auto_output_gain, self.target_output_rms, self.max_output_gain)
+            apply_peak_safe_output_gain(
+                out_audio,
+                self.output_gain,
+                self.auto_output_gain,
+                self.target_output_rms,
+                self.max_output_gain,
+            )
         } else {
-            apply_output_gain(out_audio, self.output_gain, self.auto_output_gain, self.target_output_rms, self.max_output_gain)
+            apply_output_gain(
+                out_audio,
+                self.output_gain,
+                self.auto_output_gain,
+                self.target_output_rms,
+                self.max_output_gain,
+            )
         };
         if self.quality_enabled {
             use std::fmt::Write as _;
@@ -1840,7 +1953,9 @@ impl VoiceModel for RvcPipeline {
 // Preserve unvoiced frames; do not turn a clipped high note into silence.
 fn clamp_voiced_output_f0(pitch: &mut [f32], min: f32, max: f32) {
     for f in pitch {
-        if f.is_finite() && *f > 0.0 { *f = f.clamp(min,max); }
+        if f.is_finite() && *f > 0.0 {
+            *f = f.clamp(min, max);
+        }
     }
 }
 
@@ -1930,19 +2045,39 @@ fn signal_quality(audio: &[f32]) -> (f32, f32, usize, usize) {
     let mut over = 0;
     let mut invalid = 0;
     for &v in audio {
-        if !v.is_finite() { invalid += 1; continue; }
+        if !v.is_finite() {
+            invalid += 1;
+            continue;
+        }
         peak = peak.max(v.abs());
         sum += (v as f64) * (v as f64);
-        if v.abs() > 1.0 { over += 1; }
+        if v.abs() > 1.0 {
+            over += 1;
+        }
     }
-    (peak, (sum / audio.len().max(1) as f64).sqrt() as f32, over, invalid)
+    (
+        peak,
+        (sum / audio.len().max(1) as f64).sqrt() as f32,
+        over,
+        invalid,
+    )
 }
 fn peak_safe_gain(audio: &[f32], requested: f32) -> f32 {
-    let peak = audio.iter().fold(0.0_f32, |a,v| a.max(v.abs()));
+    let peak = audio.iter().fold(0.0_f32, |a, v| a.max(v.abs()));
     let requested = requested.max(0.0);
-    if peak > 0.0 { requested.min(0.999 / peak) } else { requested }
+    if peak > 0.0 {
+        requested.min(0.999 / peak)
+    } else {
+        requested
+    }
 }
-fn apply_peak_safe_output_gain(audio: &mut [f32], manual: f32, auto: bool, target: f32, max_gain: f32) -> (f32, f32) {
+fn apply_peak_safe_output_gain(
+    audio: &mut [f32],
+    manual: f32,
+    auto: bool,
+    target: f32,
+    max_gain: f32,
+) -> (f32, f32) {
     let mut gain = manual.max(0.0);
     if auto {
         let rms = dsp::rms(audio);
@@ -1981,14 +2116,14 @@ mod output_gain_tests {
 
     #[test]
     fn output_f0_limits_preserve_unvoiced_and_rvc_quantization() {
-        let mut f = [0.0,40.0,100.0,220.0,700.0,1300.0];
-        clamp_voiced_output_f0(&mut f,80.0,600.0);
-        assert_eq!(f,[0.0,80.0,100.0,220.0,600.0,600.0]);
-        let mut coarse=Vec::new();
-        coarse_pitch_into(&f,&mut coarse);
-        assert_eq!(coarse[0],1);
-        assert_eq!(coarse[4],coarse[5]);
-        assert!(coarse.windows(2).all(|p|p[0]<=p[1]));
+        let mut f = [0.0, 40.0, 100.0, 220.0, 700.0, 1300.0];
+        clamp_voiced_output_f0(&mut f, 80.0, 600.0);
+        assert_eq!(f, [0.0, 80.0, 100.0, 220.0, 600.0, 600.0]);
+        let mut coarse = Vec::new();
+        coarse_pitch_into(&f, &mut coarse);
+        assert_eq!(coarse[0], 1);
+        assert_eq!(coarse[4], coarse[5]);
+        assert!(coarse.windows(2).all(|p| p[0] <= p[1]));
     }
 
     #[test]

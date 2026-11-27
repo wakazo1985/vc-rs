@@ -2,7 +2,10 @@
 use anyhow::{Context, Result};
 use hound::{SampleFormat, WavReader};
 use serde_json::{json, Value};
-use std::{io::{Read, Seek}, path::Path};
+use std::{
+    io::{Read, Seek},
+    path::Path,
+};
 
 fn measure<R: Read + Seek>(mut reader: WavReader<R>) -> Result<Value> {
     let spec = reader.spec();
@@ -20,23 +23,41 @@ fn measure<R: Read + Seek>(mut reader: WavReader<R>) -> Result<Value> {
     let mut add = |value: f64| {
         let ch = count as usize % channels;
         count += 1;
-        if !value.is_finite() { previous[ch] = None; return; }
+        if !value.is_finite() {
+            previous[ch] = None;
+            return;
+        }
         finite += 1;
         let magnitude = value.abs();
         peak = peak.max(magnitude);
         sum_sq += value * value;
         sum += value;
-        if magnitude <= 1e-6 { zero += 1; }
-        if magnitude >= 0.999 { clipped += 1; }
-        if let Some(before) = previous[ch] { max_step = max_step.max((value-before).abs()); }
+        if magnitude <= 1e-6 {
+            zero += 1;
+        }
+        if magnitude >= 0.999 {
+            clipped += 1;
+        }
+        if let Some(before) = previous[ch] {
+            max_step = max_step.max((value - before).abs());
+        }
         previous[ch] = Some(value);
     };
     match spec.sample_format {
-        SampleFormat::Float => for value in reader.samples::<f32>() { add(f64::from(value?)); },
+        SampleFormat::Float => {
+            for value in reader.samples::<f32>() {
+                add(f64::from(value?));
+            }
+        }
         SampleFormat::Int => {
-            anyhow::ensure!((1..=32).contains(&spec.bits_per_sample), "Invalid PCM bit depth");
+            anyhow::ensure!(
+                (1..=32).contains(&spec.bits_per_sample),
+                "Invalid PCM bit depth"
+            );
             let scale = (1u64 << (spec.bits_per_sample - 1)) as f64;
-            for value in reader.samples::<i32>() { add(f64::from(value?) / scale); }
+            for value in reader.samples::<i32>() {
+                add(f64::from(value?) / scale);
+            }
         }
     }
     anyhow::ensure!(count > 0, "Empty WAV");
@@ -53,7 +74,9 @@ fn measure<R: Read + Seek>(mut reader: WavReader<R>) -> Result<Value> {
     }))
 }
 fn main() -> Result<()> {
-    let path = std::env::args_os().nth(1).context("usage: voicebank_wav_metrics file.wav")?;
+    let path = std::env::args_os()
+        .nth(1)
+        .context("usage: voicebank_wav_metrics file.wav")?;
     let reader = WavReader::open(Path::new(&path))?;
     println!("{}", serde_json::to_string_pretty(&measure(reader)?)?);
     Ok(())
@@ -64,17 +87,25 @@ mod tests {
     #[test]
     fn known_stereo_signal_does_not_compare_between_channels() {
         let mut data = std::io::Cursor::new(Vec::new());
-        let spec = hound::WavSpec { channels:2, sample_rate:48000,bits_per_sample:16,sample_format:SampleFormat::Int };
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48000,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
         {
-            let mut w = hound::WavWriter::new(&mut data,spec).unwrap();
-            for _ in 0..32 { w.write_sample(16384i16).unwrap(); w.write_sample(-16384i16).unwrap(); }
+            let mut w = hound::WavWriter::new(&mut data, spec).unwrap();
+            for _ in 0..32 {
+                w.write_sample(16384i16).unwrap();
+                w.write_sample(-16384i16).unwrap();
+            }
             w.finalize().unwrap();
         }
         data.set_position(0);
         let report = measure(WavReader::new(data).unwrap()).unwrap();
-        assert_eq!(report["rms"],0.5);
-        assert_eq!(report["peak"],0.5);
-        assert_eq!(report["max_adjacent_sample_step"],0.0);
-        assert_eq!(report["nonfinite_samples"],0);
+        assert_eq!(report["rms"], 0.5);
+        assert_eq!(report["peak"], 0.5);
+        assert_eq!(report["max_adjacent_sample_step"], 0.0);
+        assert_eq!(report["nonfinite_samples"], 0);
     }
 }
