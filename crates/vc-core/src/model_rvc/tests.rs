@@ -1256,35 +1256,52 @@ mod vc_convert_ort {
     #[ignore = "requires standalone ONNX Runtime DirectML DLLs"]
     fn standalone_directml_tiny_rvc_probe() {
         use ort::ep;
+        let backend=std::env::var("VOICEBANK_PROBE_BACKEND").expect("VOICEBANK_PROBE_BACKEND");
+        eprintln!("PROBE_BEGIN backend={backend}");
+        let graph=vc_convert_tiny(vc_convert::ExportMode::Streaming);
+        if let Some(out)=std::env::var_os("VOICEBANK_PROBE_GRAPH") {
+            std::fs::write(out,&graph).expect("save converted test graph");
+        }
+        eprintln!("PROBE_GRAPH_OK bytes={}",graph.len());
+        if backend=="export" { return; }
         let path=std::path::PathBuf::from(std::env::var_os("VOICEBANK_PROBE_ORT").expect("VOICEBANK_PROBE_ORT"));
         assert!(path.is_absolute() && path.is_file());
-        let dml=path.with_file_name("DirectML.dll");
-        assert!(dml.is_file(), "missing {}",dml.display());
-        // Explicitly load DirectML from the same directory, not Windows App SDK.
-        use std::os::windows::ffi::OsStrExt;
-        #[link(name="kernel32")]
-        extern "system" { fn LoadLibraryExW(name:*const u16,file:*mut std::ffi::c_void,flags:u32)->*mut std::ffi::c_void; }
-        let wide:Vec<u16>=dml.as_os_str().encode_wide().chain(Some(0)).collect();
-        assert!(!unsafe{LoadLibraryExW(wide.as_ptr(),std::ptr::null_mut(),0x100|0x800)}.is_null(),"DirectML.dll: {}",std::io::Error::last_os_error());
-        ort::init_from(&path).expect("load standalone ORT").commit();
-        let graph=vc_convert_tiny(vc_convert::ExportMode::Streaming);
-        let backend=std::env::var("VOICEBANK_PROBE_BACKEND").expect("VOICEBANK_PROBE_BACKEND");
-        let mut builder=Session::builder().unwrap().with_intra_threads(1).unwrap();
+        if backend=="directml" {
+            let dml=path.with_file_name("DirectML.dll");
+            assert!(dml.is_file(), "missing {}",dml.display());
+            use std::os::windows::ffi::OsStrExt;
+            #[link(name="kernel32")]
+            extern "system" { fn LoadLibraryExW(name:*const u16,file:*mut std::ffi::c_void,flags:u32)->*mut std::ffi::c_void; }
+            let wide:Vec<u16>=dml.as_os_str().encode_wide().chain(Some(0)).collect();
+            assert!(!unsafe{LoadLibraryExW(wide.as_ptr(),std::ptr::null_mut(),0x100|0x800)}.is_null(),"DirectML.dll: {}",std::io::Error::last_os_error());
+            eprintln!("PROBE_DML_DLL_OK");
+        }
+        eprintln!("PROBE_ORT_INIT_BEGIN {}",path.display());
+        let env=ort::init_from(&path).expect("load standalone ORT");
+        eprintln!("PROBE_ORT_INIT_OK");
+        env.commit();
+        eprintln!("PROBE_ORT_COMMIT_OK");
+        let builder=Session::builder().expect("create session options");
+        eprintln!("PROBE_BUILDER_OK");
+        let mut builder=builder.with_intra_threads(1).unwrap();
         if backend=="directml" {
             builder=builder.with_memory_pattern(false).unwrap().with_parallel_execution(false).unwrap()
                 .with_execution_providers([ep::DirectML::default().build().error_on_failure()]).expect("DirectML EP registration");
+            eprintln!("PROBE_DML_EP_OK");
         } else { assert_eq!(backend,"cpu"); }
         let load=std::time::Instant::now();
+        eprintln!("PROBE_SESSION_BEGIN");
         let mut session=builder.commit_from_memory(&graph).expect("load converted streaming RVC graph");
-        println!("PROBE_SESSION_OK backend={backend} load_ms={:.2}",load.elapsed().as_secs_f64()*1000.0);
+        eprintln!("PROBE_SESSION_OK backend={backend} load_ms={:.2}",load.elapsed().as_secs_f64()*1000.0);
         for i in 0..3 {
             let start=std::time::Instant::now();
+            eprintln!("PROBE_RUN_BEGIN iteration={i}");
             let (audio,phase)=run(&mut session,8,0.0);
             assert_eq!(audio.len(),3200);
             assert!(audio.iter().chain(&phase).all(|x|x.is_finite()));
             let peak=audio.iter().map(|x|x.abs()).fold(0.0f32,f32::max);
             assert!(peak>0.0,"RVC output is entirely zero");
-            println!("PROBE_INFERENCE_OK backend={backend} iteration={i} samples={} peak={peak:.8} ms={:.2}",audio.len(),start.elapsed().as_secs_f64()*1000.0);
+            eprintln!("PROBE_INFERENCE_OK backend={backend} iteration={i} samples={} peak={peak:.8} ms={:.2}",audio.len(),start.elapsed().as_secs_f64()*1000.0);
         }
     }
 

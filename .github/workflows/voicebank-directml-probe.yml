@@ -44,9 +44,18 @@ jobs:
             Copy-Item $dll.FullName "$native/DirectML.dll"
           }
           "VOICEBANK_PROBE_ORT=$native\onnxruntime.dll" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          $cpu=Join-Path $root 'cpu'
+          New-Item -ItemType Directory -Force $cpu | Out-Null
+          Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.4/microsoft.ml.onnxruntime.1.24.4.nupkg' -OutFile "$root/cpu.zip"
+          Expand-Archive "$root/cpu.zip" -DestinationPath $cpu
+          $cpuDll=Join-Path $cpu 'runtimes/win-x64/native/onnxruntime.dll'
+          if (!(Test-Path $cpuDll)) { throw 'Missing standalone CPU runtime' }
+          "VOICEBANK_CPU_ORT=$cpuDll" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "VOICEBANK_PROBE_GRAPH=$root/tiny-rvc.onnx" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           Get-ChildItem $native -File | Select-Object Name,Length
           Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion
       - name: Compile actual vc-core test
+        id: compile
         shell: pwsh
         run: |
           cargo test -p vc-core --no-default-features --features windowsml --locked --lib --no-run
@@ -55,9 +64,11 @@ jobs:
         shell: pwsh
         run: |
           $env:VOICEBANK_PROBE_BACKEND='cpu'
+          $env:VOICEBANK_PROBE_ORT=$env:VOICEBANK_CPU_ORT
           cargo test -p vc-core --no-default-features --features windowsml --locked --lib standalone_directml_tiny_rvc_probe -- --ignored --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Standalone DirectML inference
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         shell: pwsh
         run: |
           $env:VOICEBANK_PROBE_BACKEND='directml'
