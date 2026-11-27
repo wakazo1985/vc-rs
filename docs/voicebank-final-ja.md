@@ -6,3 +6,5 @@
 5. Windows App SDK Runtime 2.1以上が必要。実際のモデルとWave Linkは利用者環境で確認すること。benchmarkフォルダは任意の測定ツール。
 
 INDEX実装の参考: https://github.com/facebookresearch/faiss/blob/v1.8.0/faiss/impl/index_write.cpp および https://github.com/RVC-Project/Retrieval-based-Voice-Conversion/blob/develop/rvc/modules/vc/pipeline.py 。Pythonや外部FAISS DLLは不要。実際のモデルの形式・音質・処理時間は未確認。
+
+配布ZIPは1回解凍するだけです。ソースコードはsourceフォルダに展開済みです。HTMLをローカルファイルから開いた場合、接続リンクから設定画面に移動できます。HTTP APIは同一オリジンのブラウザまたはローカルのネイティブHTTPクライアントから操作可能です。拒否時はHTTP_REJECTログを参照してください。

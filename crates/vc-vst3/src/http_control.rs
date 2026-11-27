@@ -70,6 +70,20 @@ fn reply(stream: &mut TcpStream, status: &str, mime: &str, body: &str) -> io::Re
     write!(stream,"HTTP/1.1 {status}\r\nContent-Type: {mime}; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'\r\n\r\n{body}",body.len())?;
     stream.flush()
 }
+fn allowed_request(method: &str, path: &str, host: Option<&str>, origin: Option<&str>, site: Option<&str>) -> bool {
+    let expected_origin = match host {
+        Some(HOST) => ORIGIN,
+        Some("localhost:18765") => "http://localhost:18765",
+        _ => return false,
+    };
+    // Opening the read-only HTML page from a local file or another site is
+    // harmless. Its subsequent API requests must still be same-origin.
+    if method == "GET" && matches!(path, "/" | "/control.html") {
+        return true;
+    }
+    origin.is_none_or(|value| value == expected_origin)
+        && site.is_none_or(|value| value == "same-origin" || value == "none")
+}
 fn handle(stream: &mut TcpStream, params: &VcRvcParams, waker: &ReloadWaker) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
     stream.set_write_timeout(Some(Duration::from_millis(200)))?;
@@ -105,9 +119,10 @@ fn handle(stream: &mut TcpStream, params: &VcRvcParams, waker: &ReloadWaker) -> 
             }
         }
     }
-    // Reject DNS rebinding, cross-origin forms and browser cross-site requests.
-    if host != Some(HOST) || origin.is_some_and(|s|s!=ORIGIN) || site.is_some_and(|s|s!="same-origin" && s!="none") {
-        return reply(stream,"403 Forbidden","text/plain","Local same-origin requests only");
+    // Restrict API calls to loopback same-origin or native local HTTP clients.
+    if !allowed_request(&method, &path, host, origin, site) {
+        params.diagnostics.event("HTTP_REJECT", &format!("method={method} path={path} host={host:?} origin={origin:?} site={site:?}"));
+        return reply(stream,"403 Forbidden","text/plain","API request rejected: use the control page at http://127.0.0.1:18765/control.html or a local native HTTP client.");
     }
     if len>MAX || head_end+len>MAX { return reply(stream,"413 Payload Too Large","text/plain","Request too large"); }
     while data.len()<head_end+len {
@@ -151,6 +166,18 @@ fn handle(stream: &mut TcpStream, params: &VcRvcParams, waker: &ReloadWaker) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn local_html_navigation_and_api_origin_rules() {
+        for site in [Some("cross-site"), Some("none"), Some("same-origin"), None] {
+            assert!(allowed_request("GET", "/control.html", Some(HOST), None, site));
+        }
+        assert!(allowed_request("GET", "/", Some("localhost:18765"), None, Some("cross-site")));
+        assert!(allowed_request("POST", "/api/voice/girl", Some("localhost:18765"), Some("http://localhost:18765"), Some("same-origin")));
+        assert!(allowed_request("POST", "/api/voice/girl", Some(HOST), None, None));
+        assert!(!allowed_request("POST", "/api/voice/girl", Some(HOST), Some("null"), Some("cross-site")));
+        assert!(!allowed_request("POST", "/api/voice/girl", Some(HOST), Some("https://example.com"), None));
+        assert!(!allowed_request("GET", "/api/state", Some(HOST), None, Some("cross-site")));
+        assert!(!allowed_request("GET", "/control.html", Some("example.com:18765"), None, None));
+    }
     #[test] fn all_voice_routes() {
         for (i,name) in ["original","toddler","girl","male","robot"].iter().enumerate() {
             assert_eq!(voice(&format!("/api/voice/{name}")),Some(i as i32));

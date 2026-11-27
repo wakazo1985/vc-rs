@@ -6,6 +6,7 @@ on:
       - '.github/workflows/voicebank-stage12.yml'
       - 'crates/vc-vst3/src/managed_models.rs'
       - 'crates/vc-vst3/src/control.html'
+      - 'crates/vc-vst3/src/http_control.rs'
       - 'crates/vc-core/src/model_rvc/retrieval.rs'
       - 'crates/vc-vst3/src/config.rs'
 permissions:
@@ -77,12 +78,17 @@ jobs:
           Copy-Item target/release/licenses $bench/ -Recurse
           Copy-Item scripts/voicebank-benchmark.ps1 $bench/
           Copy-Item scripts/START_VOICEBANK_BENCHMARK.cmd $bench/
-          git archive --format=zip -o "$stage/source.zip" HEAD
+          # Keep source unpacked and let Actions produce the one downloadable ZIP.
+          git archive --format=zip -o release/source-temporary.zip HEAD
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Compress-Archive -Path $stage -DestinationPath release/RVCVoiceBank-WindowsML.zip
-          Get-FileHash release/RVCVoiceBank-WindowsML.zip -Algorithm SHA256
+          Expand-Archive -LiteralPath release/source-temporary.zip -DestinationPath "$stage/source"
+          Remove-Item -LiteralPath release/source-temporary.zip
+          if (Get-ChildItem -LiteralPath $stage -Recurse -File -Filter '*.zip') { throw 'Unexpected nested ZIP in distribution' }
+          if (-not (Test-Path "$bundle/Contents/x86_64-win/vc-vst3.vst3")) { throw 'Missing VST3 module' }
+          Get-ChildItem -LiteralPath $stage -Force | Select-Object Name
       - uses: actions/upload-artifact@v4
         with:
           name: RVCVoiceBank-WindowsML
-          path: release/RVCVoiceBank-WindowsML.zip
+          path: release/RVCVoiceBank/
+          include-hidden-files: true
           if-no-files-found: error
