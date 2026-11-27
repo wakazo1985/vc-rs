@@ -726,7 +726,7 @@ impl WorkerCtx {
             state: Arc::clone(&self.state),
             params: self.params.clone(),
         };
-        let mut last_voice_request = self.params.selected_voice().saturating_sub(1) as usize;
+        let mut last_voice_request = usize::MAX;
         let initial_settings = self.initial_settings.clone();
         let mut last_profile_flush = std::time::Instant::now();
         let mut last_chunk_log = std::time::Instant::now();
@@ -1067,6 +1067,13 @@ impl WorkerCtx {
                 // Replaces the fixed 2 ms poll: a reload submitted while the host
                 // is idle starts immediately, and there is no idle spin when the
                 // host stops calling process().
+                // A selection can arrive while reading the input ring. Process
+                // it before sleeping even if the host has stopped sending audio.
+                if self.params.selected_voice() != selected
+                    || self.reload.load(Ordering::Acquire)
+                    || self.state.generation.load(Ordering::Acquire) != generation {
+                    continue;
+                }
                 thread::park_timeout(Duration::from_millis(100));
                 continue;
             }
@@ -2087,14 +2094,15 @@ mod tests {
         let mut runtime=PluginRuntime::start_inner(
             params.clone(),Arc::new(AtomicBool::new(false)),Arc::new(AtomicBool::new(false)),Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(PluginStatus::new("test"))),&Arc::new(ReloadWaker::default()),RATE,hop,ProcessMode::Realtime,None,Some(Box::new(bank)));
-        wait_for(||runtime.state.has_converter.load(Ordering::Acquire) && runtime.state.ready_generation.load(Ordering::Acquire)==1);
+        wait_for(||runtime.converter_ready() && runtime.state.ready_generation.load(Ordering::Acquire)==1 && params.active_voice.load(Ordering::Acquire)==1);
         runtime.process_block(&mut [&mut vec![0.2;hop]]);
         wait_for(||runtime.output_consumer.slots()>=hop);
         let mut half=vec![0.4;hop/2];
         runtime.process_block(&mut [&mut half]);
         assert!(half.iter().all(|v| *v==0.2));
         params.set_selected_voice(2); runtime.wake();
-        wait_for(||params.active_voice.load(Ordering::Acquire)==2);
+        wait_for(||params.active_voice.load(Ordering::Acquire)==2 || !runtime.running.load(Ordering::Acquire));
+        assert_eq!(params.active_voice.load(Ordering::Acquire),2,"worker stopped before acknowledging switch");
         assert_eq!(runtime.state.generation.load(Ordering::Acquire),1);
         assert_eq!(primes.load(Ordering::Acquire),1);
         let mut second=vec![0.5;hop/2];
@@ -2117,7 +2125,7 @@ mod tests {
     fn startup_prioritizes_requested_slot_and_never_loads_a_slot_twice() {
         for selected in 0..=4 {
             let order=bank_load_order(selected);
-            assert_eq!(order[0],selected.saturating_sub(1) as usize);
+            assert_eq!(order[0], [0,0,1,2,3][selected as usize]);
             let mut sorted=order;sorted.sort_unstable();
             assert_eq!(sorted,[0,1,2,3]);
         }
