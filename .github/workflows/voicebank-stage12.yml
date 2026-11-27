@@ -55,7 +55,6 @@ jobs:
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item target/bundled/vc-vst3.vst3 $stage/ -Recurse
           $bundle=Join-Path $stage 'vc-vst3.vst3'
-          Copy-Item crates/vc-vst3/src/control.html $bundle/
           Copy-Item crates/vc-vst3/src/control.html $stage/
           foreach ($slot in @('toddler','girl','male','robot','common')) {
             $folder=Join-Path $bundle "models/$slot"
@@ -81,8 +80,9 @@ jobs:
           # Keep source unpacked and let Actions produce the one downloadable ZIP.
           git archive --format=zip -o release/source-temporary.zip HEAD
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Expand-Archive -LiteralPath release/source-temporary.zip -DestinationPath "$stage/source"
+          Expand-Archive -LiteralPath release/source-temporary.zip -DestinationPath release/source
           Remove-Item -LiteralPath release/source-temporary.zip
+          if (@(Get-ChildItem -LiteralPath $stage -Recurse -File -Filter 'control.html').Count -ne 1) { throw 'Expected exactly one control.html' }
           if (Get-ChildItem -LiteralPath $stage -Recurse -File -Filter '*.zip') { throw 'Unexpected nested ZIP in distribution' }
           if (-not (Test-Path "$bundle/Contents/x86_64-win/vc-vst3.vst3")) { throw 'Missing VST3 module' }
           Get-ChildItem -LiteralPath $stage -Force | Select-Object Name
@@ -90,5 +90,11 @@ jobs:
         with:
           name: RVCVoiceBank-WindowsML
           path: release/RVCVoiceBank/
+          include-hidden-files: true
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RVCVoiceBank-source
+          path: release/source/
           include-hidden-files: true
           if-no-files-found: error
