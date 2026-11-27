@@ -1,0 +1,56 @@
+name: VoiceBank standalone DirectML inference probe
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-directml-probe.yml'
+permissions:
+  contents: read
+env:
+  VC_RS_ENABLE_NATIVE_TENSORRT: "0"
+  CARGO_TERM_COLOR: never
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get official standalone runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:RUNNER_TEMP 'voicebank-ort-probe'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          $zip=Join-Path $root 'runtime.zip'
+          Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/1.24.4/microsoft.ml.onnxruntime.directml.1.24.4.nupkg' -OutFile $zip
+          Expand-Archive -LiteralPath $zip -DestinationPath $root
+          $native=Join-Path $root 'runtimes/win-x64/native'
+          if (!(Test-Path "$native/onnxruntime.dll")) { throw 'Missing onnxruntime.dll' }
+          if (!(Test-Path "$native/DirectML.dll")) {
+            $dml=Join-Path $root 'dml.zip'
+            Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/1.15.4/microsoft.ai.directml.1.15.4.nupkg' -OutFile $dml
+            Expand-Archive $dml -DestinationPath "$root/dml"
+            $dll=Get-ChildItem "$root/dml" -Recurse -File -Filter DirectML.dll | Where-Object {$_.FullName -match '[\\/](x64|win-x64)[\\/]'} | Select-Object -First 1
+            if (!$dll) { throw 'Missing x64 DirectML.dll' }
+            Copy-Item $dll.FullName "$native/DirectML.dll"
+          }
+          "VOICEBANK_PROBE_ORT=$native\onnxruntime.dll" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Get-ChildItem $native -File | Select-Object Name,Length
+          Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion
+      - name: Compile actual vc-core test
+        shell: pwsh
+        run: |
+          cargo test -p vc-core --no-default-features --features windowsml --locked --lib --no-run
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Standalone CPU inference control
+        shell: pwsh
+        run: |
+          $env:VOICEBANK_PROBE_BACKEND='cpu'
+          cargo test -p vc-core --no-default-features --features windowsml --locked --lib standalone_directml_tiny_rvc_probe -- --ignored --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Standalone DirectML inference
+        shell: pwsh
+        run: |
+          $env:VOICEBANK_PROBE_BACKEND='directml'
+          cargo test -p vc-core --no-default-features --features windowsml --locked --lib standalone_directml_tiny_rvc_probe -- --ignored --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -1248,6 +1248,46 @@ mod vc_convert_ort {
         check_openvino(crate::Provider::WindowsMlOpenVinoNpu);
     }
 
+    // Isolated probe: exercises the actual converted RVC graph, not a mock.
+    // Intentionally does NOT call windows_ml::ensure_initialized().
+    // Run only in a fresh test process with the official standalone ORT DLL.
+    #[cfg(all(windows, feature = "windowsml"))]
+    #[test]
+    #[ignore = "requires standalone ONNX Runtime DirectML DLLs"]
+    fn standalone_directml_tiny_rvc_probe() {
+        use ort::ep;
+        let path=std::path::PathBuf::from(std::env::var_os("VOICEBANK_PROBE_ORT").expect("VOICEBANK_PROBE_ORT"));
+        assert!(path.is_absolute() && path.is_file());
+        let dml=path.with_file_name("DirectML.dll");
+        assert!(dml.is_file(), "missing {}",dml.display());
+        // Explicitly load DirectML from the same directory, not Windows App SDK.
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name="kernel32")]
+        extern "system" { fn LoadLibraryExW(name:*const u16,file:*mut std::ffi::c_void,flags:u32)->*mut std::ffi::c_void; }
+        let wide:Vec<u16>=dml.as_os_str().encode_wide().chain(Some(0)).collect();
+        assert!(!unsafe{LoadLibraryExW(wide.as_ptr(),std::ptr::null_mut(),0x100|0x800)}.is_null(),"DirectML.dll: {}",std::io::Error::last_os_error());
+        ort::init_from(&path).expect("load standalone ORT").commit();
+        let graph=vc_convert_tiny(vc_convert::ExportMode::Streaming);
+        let backend=std::env::var("VOICEBANK_PROBE_BACKEND").expect("VOICEBANK_PROBE_BACKEND");
+        let mut builder=Session::builder().unwrap().with_intra_threads(1).unwrap();
+        if backend=="directml" {
+            builder=builder.with_memory_pattern(false).unwrap().with_parallel_execution(false).unwrap()
+                .with_execution_providers([ep::DirectML::default().build().error_on_failure()]).expect("DirectML EP registration");
+        } else { assert_eq!(backend,"cpu"); }
+        let load=std::time::Instant::now();
+        let mut session=builder.commit_from_memory(&graph).expect("load converted streaming RVC graph");
+        println!("PROBE_SESSION_OK backend={backend} load_ms={:.2}",load.elapsed().as_secs_f64()*1000.0);
+        for i in 0..3 {
+            let start=std::time::Instant::now();
+            let (audio,phase)=run(&mut session,8,0.0);
+            assert_eq!(audio.len(),3200);
+            assert!(audio.iter().chain(&phase).all(|x|x.is_finite()));
+            let peak=audio.iter().map(|x|x.abs()).fold(0.0f32,f32::max);
+            assert!(peak>0.0,"RVC output is entirely zero");
+            println!("PROBE_INFERENCE_OK backend={backend} iteration={i} samples={} peak={peak:.8} ms={:.2}",audio.len(),start.elapsed().as_secs_f64()*1000.0);
+        }
+    }
+
     fn session() -> Session {
         // Under the windowsml feature ORT is load-dynamic; bind it to the
         // Windows App SDK runtime exactly like the real session path does.
