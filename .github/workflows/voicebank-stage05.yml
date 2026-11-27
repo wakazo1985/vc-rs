@@ -81,7 +81,7 @@ jobs:
             'Choose the original ZIP or PTH for each of the four requested voice slots.',
             'All conversion happens on your PC. No model is uploaded.',
             'Outputs: next to the selected ZIP or PTH, as toddler.onnx, girl.onnx, male.onnx or robot.onnx.',
-            'Results and detailed logs: %LOCALAPPDATA%\RVCVoiceBank',
+            'Results and detailed logs: logs\ inside the converter folder',
             'RVC v2 with F0 only; incompatible checkpoints are rejected.',
             'Index files are preserved in your source files and are not converted by this tool.',
             'This is not the VST3 plugin; it is the stage 05 conversion utility.'

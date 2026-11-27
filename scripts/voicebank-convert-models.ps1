@@ -2,7 +2,7 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $exe = Join-Path $PSScriptRoot 'voicebank_convert.exe'
-$root = Join-Path $env:LOCALAPPDATA 'RVCVoiceBank'
+$root = Join-Path $PSScriptRoot 'logs'
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 $log = Join-Path $root ('conversion-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
 $results = @()
