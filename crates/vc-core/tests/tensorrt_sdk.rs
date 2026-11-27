@@ -16,9 +16,12 @@ impl Fixture {
         loop {
             let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "vc-rs-sdk-{}-{stamp}-{sequence}", std::process::id()
+                "vc-rs-sdk-{}-{stamp}-{sequence}",
+                std::process::id()
             ));
             match fs::create_dir(&path) {
                 Ok(()) => return Self(path),

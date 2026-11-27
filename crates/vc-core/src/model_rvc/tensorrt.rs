@@ -1390,7 +1390,9 @@ pub fn with_engine_cache_root<T>(root: &Path, f: impl FnOnce() -> T) -> T {
     struct Restore(Option<PathBuf>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            LOCAL_ENGINE_CACHE.with(|cell| { cell.replace(self.0.take()); });
+            LOCAL_ENGINE_CACHE.with(|cell| {
+                cell.replace(self.0.take());
+            });
         }
     }
     let previous = LOCAL_ENGINE_CACHE.with(|cell| cell.replace(Some(root.to_path_buf())));

@@ -1101,20 +1101,24 @@ mod tests {
 
     #[test]
     fn fifty_ms_crossfade_geometry_at_actual_model_rates() {
-        for rate in [32_000,40_000,48_000] {
-            for kind in [SmoothingKind::Sola,SmoothingKind::Psola,SmoothingKind::PhaseVocoder] {
-                let mut config = smoother_config(kind,50);
-                config.model_sample_rate=rate;
-                config.crossfade_ms=40;
-                let mut smoother=model_domain_chunk_smoother(config);
-                let hop=rate as usize/20;
-                let fade=hop*3/4;
-                assert_eq!(smoother.crossfade_samples(),fade);
-                let len=hop+fade+rate as usize*22/1000;
+        for rate in [32_000, 40_000, 48_000] {
+            for kind in [
+                SmoothingKind::Sola,
+                SmoothingKind::Psola,
+                SmoothingKind::PhaseVocoder,
+            ] {
+                let mut config = smoother_config(kind, 50);
+                config.model_sample_rate = rate;
+                config.crossfade_ms = 40;
+                let mut smoother = model_domain_chunk_smoother(config);
+                let hop = rate as usize / 20;
+                let fade = hop * 3 / 4;
+                assert_eq!(smoother.crossfade_samples(), fade);
+                let len = hop + fade + rate as usize * 22 / 1000;
                 for _ in 0..5 {
-                    smoother.process(&vec![0.2;len],&[220.0;32]);
-                    assert_eq!(smoother.output().len(),hop);
-                    assert!(smoother.output().iter().all(|x|x.is_finite()));
+                    smoother.process(&vec![0.2; len], &[220.0; 32]);
+                    assert_eq!(smoother.output().len(), hop);
+                    assert!(smoother.output().iter().all(|x| x.is_finite()));
                 }
                 println!("50ms rate={rate} kind={kind:?} hop={hop} fade={fade}");
             }

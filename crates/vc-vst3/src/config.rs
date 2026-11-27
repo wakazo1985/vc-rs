@@ -122,7 +122,12 @@ impl VoiceProfile {
         let updated = Self::initial(slot);
         let mut old = updated.clone();
         old.rms_mix_rate = 0.0;
-        if *self == old { *self = updated; true } else { false }
+        if *self == old {
+            *self = updated;
+            true
+        } else {
+            false
+        }
     }
     pub fn live(&self) -> vc_core::model_rvc::LiveParams {
         vc_core::model_rvc::LiveParams {
@@ -135,17 +140,45 @@ impl VoiceProfile {
         }
     }
     pub(crate) fn validate_live(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(matches!(self.smoother.as_str(), "sola" | "psola" | "phase-vocoder"), "Invalid smoother");
-        vc_core::model_rvc::F0PostprocessConfig::with_input_range(self.input_f0_min_hz,self.input_f0_max_hz)?;
-        vc_core::model_rvc::F0PostprocessConfig::with_input_range(self.output_f0_min_hz,self.output_f0_max_hz)?;
-        anyhow::ensure!(self.pitch_shift.is_finite() && (-24.0..=24.0).contains(&self.pitch_shift), "Invalid voice pitch");
-        anyhow::ensure!((0..=255).contains(&self.speaker_id), "Invalid voice speaker");
+        anyhow::ensure!(
+            matches!(self.smoother.as_str(), "sola" | "psola" | "phase-vocoder"),
+            "Invalid smoother"
+        );
+        vc_core::model_rvc::F0PostprocessConfig::with_input_range(
+            self.input_f0_min_hz,
+            self.input_f0_max_hz,
+        )?;
+        vc_core::model_rvc::F0PostprocessConfig::with_input_range(
+            self.output_f0_min_hz,
+            self.output_f0_max_hz,
+        )?;
+        anyhow::ensure!(
+            self.pitch_shift.is_finite() && (-24.0..=24.0).contains(&self.pitch_shift),
+            "Invalid voice pitch"
+        );
+        anyhow::ensure!(
+            (0..=255).contains(&self.speaker_id),
+            "Invalid voice speaker"
+        );
         for gain in [self.input_gain_db, self.output_gain_db] {
-            anyhow::ensure!(gain.is_finite() && (-36.0..=36.0).contains(&gain), "Invalid voice gain");
+            anyhow::ensure!(
+                gain.is_finite() && (-36.0..=36.0).contains(&gain),
+                "Invalid voice gain"
+            );
         }
-        anyhow::ensure!(self.noise_gate_threshold_db.is_finite() && (-80.0..=0.0).contains(&self.noise_gate_threshold_db), "Invalid voice gate threshold");
-        anyhow::ensure!(self.protect.is_finite() && (0.0..=0.5).contains(&self.protect), "Invalid Protect");
-        anyhow::ensure!(self.formant_shift.is_finite() && (-12.0..=12.0).contains(&self.formant_shift), "Invalid formant shift");
+        anyhow::ensure!(
+            self.noise_gate_threshold_db.is_finite()
+                && (-80.0..=0.0).contains(&self.noise_gate_threshold_db),
+            "Invalid voice gate threshold"
+        );
+        anyhow::ensure!(
+            self.protect.is_finite() && (0.0..=0.5).contains(&self.protect),
+            "Invalid Protect"
+        );
+        anyhow::ensure!(
+            self.formant_shift.is_finite() && (-12.0..=12.0).contains(&self.formant_shift),
+            "Invalid formant shift"
+        );
         Ok(())
     }
 }
@@ -251,9 +284,13 @@ impl PluginConfig {
     /// runs in silent mode (the worker never loads a pipeline).
     pub fn has_models(&self) -> bool {
         if self.has_voice_bank() {
-            self.voice_slots.iter().any(|slot| !slot.model.as_os_str().is_empty()
-                && (!slot.embedder.as_os_str().is_empty() || !self.embedder.as_os_str().is_empty())
-                && (!slot.f0_model.as_os_str().is_empty() || !self.f0_model.as_os_str().is_empty()))
+            self.voice_slots.iter().any(|slot| {
+                !slot.model.as_os_str().is_empty()
+                    && (!slot.embedder.as_os_str().is_empty()
+                        || !self.embedder.as_os_str().is_empty())
+                    && (!slot.f0_model.as_os_str().is_empty()
+                        || !self.f0_model.as_os_str().is_empty())
+            })
         } else {
             !self.model.as_os_str().is_empty()
                 && !self.embedder.as_os_str().is_empty()
@@ -262,7 +299,9 @@ impl PluginConfig {
     }
 
     pub fn has_voice_bank(&self) -> bool {
-        self.voice_slots.iter().any(|slot| !slot.model.as_os_str().is_empty())
+        self.voice_slots
+            .iter()
+            .any(|slot| !slot.model.as_os_str().is_empty())
     }
 
     pub fn for_voice(&self, slot: usize) -> Self {
@@ -334,12 +373,19 @@ impl PluginConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!((0..=4).contains(&self.startup_voice), "Invalid startup voice");
+        anyhow::ensure!(
+            (0..=4).contains(&self.startup_voice),
+            "Invalid startup voice"
+        );
         self.hotkeys.validate().map_err(anyhow::Error::msg)?;
         if self.has_voice_bank() {
             for i in 0..4 {
-                self.voice_profiles[i].validate_live().map_err(|e| anyhow::anyhow!("Voice {}: {e}", i+1))?;
-                self.for_voice(i).validate().map_err(|e| anyhow::anyhow!("Voice {}: {e}", i+1))?;
+                self.voice_profiles[i]
+                    .validate_live()
+                    .map_err(|e| anyhow::anyhow!("Voice {}: {e}", i + 1))?;
+                self.for_voice(i)
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("Voice {}: {e}", i + 1))?;
             }
             return Ok(());
         }
@@ -374,7 +420,9 @@ impl PluginConfig {
         self.validate()?;
         if self.has_voice_bank() {
             // Validate every profile on the current host sample grid.
-            for i in 0..4 { self.for_voice(i).validated_chunk_samples(sample_rate)?; }
+            for i in 0..4 {
+                self.for_voice(i).validated_chunk_samples(sample_rate)?;
+            }
             let slot = (self.startup_voice.saturating_sub(1) as usize).min(3);
             return self.for_voice(slot).validated_chunk_samples(sample_rate);
         }
@@ -425,7 +473,9 @@ impl PluginConfig {
             }
         }
         if let Some(path) = crate::diagnostics::profile_path() {
-            if path.is_file() { return Some(path); }
+            if path.is_file() {
+                return Some(path);
+            }
         }
         if let Some(dir) = os_config_dir() {
             let path = dir.join("vc-rs").join("vst3.toml");
@@ -510,13 +560,17 @@ mod tests {
     fn stage03_defaults_migrate_only_untouched_profiles() {
         for i in 0..4 {
             let new = super::VoiceProfile::initial(i);
-            assert_eq!(new.chunk_ms,50);
-            assert_eq!(new.rms_mix_rate,[0.75,0.75,0.8,1.0][i]);
-            let mut old=new.clone(); old.rms_mix_rate=0.0;
-            let mut edited=old.clone(); edited.pitch_shift+=1.0;
-            let before=edited.clone();
-            assert!(old.upgrade_untouched(i)); assert_eq!(old,new);
-            assert!(!edited.upgrade_untouched(i)); assert_eq!(edited,before);
+            assert_eq!(new.chunk_ms, 50);
+            assert_eq!(new.rms_mix_rate, [0.75, 0.75, 0.8, 1.0][i]);
+            let mut old = new.clone();
+            old.rms_mix_rate = 0.0;
+            let mut edited = old.clone();
+            edited.pitch_shift += 1.0;
+            let before = edited.clone();
+            assert!(old.upgrade_untouched(i));
+            assert_eq!(old, new);
+            assert!(!edited.upgrade_untouched(i));
+            assert_eq!(edited, before);
         }
     }
     #[test]
@@ -556,10 +610,20 @@ mod tests {
     }
     use super::*;
 
-    #[cfg(all(feature = "tensorrt", not(any(feature = "cuda", feature = "windowsml"))))]
+    #[cfg(all(
+        feature = "tensorrt",
+        not(any(feature = "cuda", feature = "windowsml"))
+    ))]
     #[test]
     fn old_windowsml_profile_uses_native_tensorrt() {
-        for name in ["windowsml", "windowsml-directml", "windowsml-cpu", "cpu", "cuda", "tensorrt"] {
+        for name in [
+            "windowsml",
+            "windowsml-directml",
+            "windowsml-cpu",
+            "cpu",
+            "cuda",
+            "tensorrt",
+        ] {
             let config: PluginConfig = toml::from_str(&format!("provider = '{name}'")).unwrap();
             assert_eq!(config.provider(), Provider::TensorRt);
         }
@@ -578,37 +642,50 @@ mod tests {
     #[test]
     fn independent_profiles_are_migrated_and_persisted() {
         let mut c: PluginConfig = toml::from_str("index_rate = 0.9").unwrap();
-        for i in 0..4 { c.voice_slots[i].model = PathBuf::from(format!("voice-{i}.onnx")); }
-        assert_eq!(std::array::from_fn::<_,4,_>(|i| c.voice_profiles[i].pitch_shift), [14.0, 12.0, 0.0, 0.0]);
+        for i in 0..4 {
+            c.voice_slots[i].model = PathBuf::from(format!("voice-{i}.onnx"));
+        }
+        assert_eq!(
+            std::array::from_fn::<_, 4, _>(|i| c.voice_profiles[i].pitch_shift),
+            [14.0, 12.0, 0.0, 0.0]
+        );
         let before = c.voice_profiles.clone();
         c.voice_profiles[1].pitch_shift = 9.0;
         c.voice_profiles[1].chunk_ms = 100;
         c.voice_profiles[1].crossfade_ms = 20;
         c.voice_profiles[1].index_rate = 0.2;
         c.voice_profiles[1].output_gain_db = -6.0;
-        c.voice_profiles[1].input_f0_min_hz=70.0;
-        c.voice_profiles[1].input_f0_max_hz=450.0;
-        c.voice_profiles[1].output_f0_min_hz=100.0;
-        c.voice_profiles[1].output_f0_max_hz=800.0;
-        for i in [0,2,3] { assert_eq!(c.voice_profiles[i], before[i]); }
+        c.voice_profiles[1].input_f0_min_hz = 70.0;
+        c.voice_profiles[1].input_f0_max_hz = 450.0;
+        c.voice_profiles[1].output_f0_min_hz = 100.0;
+        c.voice_profiles[1].output_f0_max_hz = 800.0;
+        for i in [0, 2, 3] {
+            assert_eq!(c.voice_profiles[i], before[i]);
+        }
         let d: PluginConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
-        assert_eq!(c,d);
-        assert_eq!(d.for_voice(1).validated_chunk_samples(48_000).unwrap(),4800);
-        assert_eq!(d.for_voice(0).validated_chunk_samples(48_000).unwrap(),2400);
+        assert_eq!(c, d);
+        assert_eq!(
+            d.for_voice(1).validated_chunk_samples(48_000).unwrap(),
+            4800
+        );
+        assert_eq!(
+            d.for_voice(0).validated_chunk_samples(48_000).unwrap(),
+            2400
+        );
         for i in 0..4 {
             assert_eq!(VoiceProfile::initial(i).chunk_ms, 50);
         }
-        assert_eq!(d.for_voice(1).index_rate,0.2);
-        assert_eq!(d.voice_profiles[1].live().pitch_shift,9.0);
-        assert!((d.voice_profiles[1].live().output_gain-0.5011872).abs()<0.00001);
-        assert_eq!(d.for_voice(0).index_rate,0.4);
-        assert_eq!(d.voice_profiles[1].input_f0_min_hz,70.0);
-        assert_eq!(d.voice_profiles[0].input_f0_min_hz,50.0);
-        assert_eq!(d.voice_profiles[1].output_f0_max_hz,800.0);
+        assert_eq!(d.for_voice(1).index_rate, 0.2);
+        assert_eq!(d.voice_profiles[1].live().pitch_shift, 9.0);
+        assert!((d.voice_profiles[1].live().output_gain - 0.5011872).abs() < 0.00001);
+        assert_eq!(d.for_voice(0).index_rate, 0.4);
+        assert_eq!(d.voice_profiles[1].input_f0_min_hz, 70.0);
+        assert_eq!(d.voice_profiles[0].input_f0_min_hz, 50.0);
+        assert_eq!(d.voice_profiles[1].output_f0_max_hz, 800.0);
         assert!(c.validate().is_ok());
-        c.voice_profiles[1].output_f0_max_hz=90.0;
+        c.voice_profiles[1].output_f0_max_hz = 90.0;
         assert!(c.validate().is_err());
-        c.voice_profiles[1].output_f0_max_hz=800.0;
+        c.voice_profiles[1].output_f0_max_hz = 800.0;
         c.voice_profiles[1].chunk_ms = 19;
         assert!(c.validate().is_err());
     }
