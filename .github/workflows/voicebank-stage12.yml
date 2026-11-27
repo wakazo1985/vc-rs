@@ -9,6 +9,7 @@ on:
       - 'crates/vc-vst3/src/http_control.rs'
       - 'crates/vc-core/src/model_rvc/retrieval.rs'
       - 'crates/vc-vst3/src/config.rs'
+      - 'docs/voicebank-final-ja.md'
 permissions:
   contents: read
 env:
@@ -68,7 +69,8 @@ jobs:
           Copy-Item crates/vc-convert/LICENSE-*.txt $tools/
           Copy-Item crates/vc-convert/THIRD_PARTY.md $tools/
           Copy-Item LICENSE $stage/
-          Copy-Item docs/voicebank-final-ja.md "$stage/README-ja.md"
+          Get-Content -LiteralPath docs/voicebank-final-ja.md -Raw -Encoding UTF8 | Set-Content -LiteralPath "$stage/使い方.txt" -Encoding utf8BOM
+          if (-not (Test-Path -LiteralPath "$stage/使い方.txt" -PathType Leaf)) { throw "Missing Japanese user manual" }
           $bench=Join-Path $stage 'benchmark'
           New-Item -ItemType Directory -Force $bench | Out-Null
           Copy-Item target/release/vc-rs.exe $bench/
