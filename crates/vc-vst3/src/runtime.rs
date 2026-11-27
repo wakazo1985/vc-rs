@@ -95,6 +95,7 @@ trait WorkerConversion: Send {
     fn quality_report(&mut self) -> String { String::new() }
     fn available_mask(&self)->u32 { 0b11110 }
     fn active_slot(&self)->Option<usize>{None}
+    fn install_voice(&mut self, _slot:usize, _voice:Box<dyn WorkerConversion>)->anyhow::Result<()> { anyhow::bail!("Not a voice bank") }
     fn select_voice(&mut self, _requested: usize) -> anyhow::Result<bool> { Ok(false) }
     fn apply_live(&mut self, live: &LiveParams);
     fn reset(&mut self) -> anyhow::Result<()>;
@@ -114,6 +115,7 @@ impl WorkerConversion for VoiceBank<Box<dyn WorkerConversion>> {
     fn quality_report(&mut self) -> String { self.current_mut().quality_report() }
     fn available_mask(&self)->u32 { VoiceBank::available_mask(self) }
     fn active_slot(&self)->Option<usize>{Some(self.active())}
+    fn install_voice(&mut self, slot:usize, voice:Box<dyn WorkerConversion>)->anyhow::Result<()> { self.insert(slot,voice) }
     fn select_voice(&mut self, requested: usize) -> anyhow::Result<bool> { self.select(requested) }
     fn apply_live(&mut self, live: &LiveParams) { self.current_mut().apply_live(live); }
     fn reset(&mut self) -> anyhow::Result<()> { self.current_mut().reset() }
@@ -741,6 +743,7 @@ impl WorkerCtx {
         let mut chunk_out = Vec::<f32>::with_capacity(chunk_samples * 2);
         let mut queued_output = Vec::<QueuedSample>::with_capacity(chunk_samples * 2);
         let mut zero_input = vec![0.0; chunk_samples];
+        let mut bank_loading:Option<BankLoadTask>=None;
         let mut previous_input = Vec::<f32>::with_capacity(chunk_samples);
         let mut previous_output_end: Option<f32> = None;
         let mut pending_switch: Option<(i32, Instant)> = None;
@@ -758,7 +761,12 @@ impl WorkerCtx {
         if let Err(err) = initial_chunk {
             self.set_error(format!("invalid settings: {err}"), format!("{err:#}"));
         } else if self.autoload && converter.is_none() {
-            converter = self.load_conversion(&initial_settings, chunk_samples);
+            if initial_settings.has_voice_bank() && initial_settings.provider().is_tensorrt() && !self.state.offline.load(Ordering::Acquire) {
+                match BankLoadTask::start(self.model_loader(),initial_settings.clone(),self.params.selected_voice()) {
+                    Ok(task)=>bank_loading=Some(task),
+                    Err(err)=>self.set_error("Model loader could not start",err.to_string()),
+                }
+            }else{converter = self.load_conversion(&initial_settings, chunk_samples);}
         } else {
             if converter.is_none() {
                 self.set_idle_status();
@@ -781,7 +789,7 @@ impl WorkerCtx {
         self.state
             .ready_generation
             .store(generation, Ordering::Release);
-        self.loading.store(false, Ordering::Release);
+        self.loading.store(bank_loading.is_some(), Ordering::Release);
         self.state.notify_offline();
 
         let mut managed_checked = self.autoload;
@@ -847,10 +855,16 @@ impl WorkerCtx {
                     .store(self.latency_samples(chunk_samples), Ordering::Relaxed);
                 // Drop the old pipeline (releasing its CUDA context) before
                 // building the new one, so the two never coexist.
+                drop(bank_loading.take());
                 drop(converter.take());
                 self.state.generation.fetch_add(1, Ordering::AcqRel);
                 self.publish_conversion(&settings, None);
-                converter = self.load_conversion(&settings, chunk_samples);
+                if settings.has_voice_bank() && settings.provider().is_tensorrt() && !self.state.offline.load(Ordering::Acquire) {
+                    match BankLoadTask::start(self.model_loader(),settings.clone(),self.params.selected_voice()) {
+                        Ok(task)=>bank_loading=Some(task),
+                        Err(err)=>self.set_error("Model loader could not start",err.to_string()),
+                    }
+                }else{converter = self.load_conversion(&settings, chunk_samples);}
                 if let Some(current) = converter.as_mut() {
                     if let Some(hop) = current.profile_hop() {
                 chunk_samples = hop;
@@ -875,8 +889,65 @@ impl WorkerCtx {
                 self.state
                     .ready_generation
                     .store(generation, Ordering::Release);
-                self.loading.store(false, Ordering::SeqCst);
+                self.loading.store(bank_loading.is_some(), Ordering::SeqCst);
                 self.state.notify_offline();
+            }
+
+            // Publish each completed model independently; never touch the live
+            // converter from the loading thread. On a cache miss GPU builds may
+            // still contend with inference, measured by the existing counters.
+            let mut bank_done=false;
+            if let Some(task)=bank_loading.as_mut() {
+                loop {
+                    match task.rx.try_recv() {
+                        Ok(BankLoadMessage::Ready(i,voice))=>{
+                            if let Some(current)=converter.as_mut() {
+                                if let Err(e)=current.install_voice(i,voice) {
+                                    task.errors.push(format!("{}: {e:#}",LABELS[i]));
+                                    continue;
+                                }
+                                self.params.loaded_voice_mask.store(current.available_mask(),Ordering::Release);
+                            }else{
+                                let mut slots:[Option<Box<dyn WorkerConversion>>;4]=std::array::from_fn(|_|None);
+                                slots[i]=Some(voice);
+                                let bank=VoiceBank::new(slots,i).expect("just loaded one slot");
+                                converter=Some(Box::new(bank));
+                                let current=converter.as_mut().expect("bank");
+                                chunk_samples=current.profile_hop().unwrap_or(chunk_samples);
+                                zero_input.resize(chunk_samples,0.0);
+                                self.state.input_hop.store(chunk_samples,Ordering::Release);
+                                self.latency.store(u32::try_from(chunk_samples.saturating_add(current.content_delay())).unwrap_or(u32::MAX),Ordering::Relaxed);
+                                // Discard audio collected before any model was ready.
+                                input_acc.clear(); self.drain_input();
+                                previous_input.clear(); previous_output_end=None;
+                                pending_switch=None; transition_from=None;
+                                self.publish_conversion(&task.settings,converter.as_deref());
+                                self.loading.store(false,Ordering::Release);
+                                self.state.notify_offline();
+                                self.params.diagnostics.event("VOICE_FIRST_READY",&format!("slot={} elapsed_ms={:.2}",i+1,task.started.elapsed().as_secs_f64()*1000.0));
+                            }
+                            if self.params.selected_voice()==(i+1) as i32 {last_voice_request=usize::MAX;}
+                            self.params.diagnostics.event("VOICE_SLOT_READY",&format!("slot={} mask={:#06b}",i+1,self.params.loaded_voice_mask.load(Ordering::Acquire)));
+                        }
+                        Ok(BankLoadMessage::Failed(i,err))=>{
+                            self.params.diagnostics.event("VOICE_LOAD_ERROR",&format!("slot={} {err}",i+1));
+                            task.errors.push(err);
+                        }
+                        Ok(BankLoadMessage::Done)=>{bank_done=true;break;}
+                        Err(std::sync::mpsc::TryRecvError::Empty)=>break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected)=>{task.errors.push("Model loader disconnected".into());bank_done=true;break;}
+                    }
+                }
+            }
+            if bank_done {
+                if let Some(task)=bank_loading.take(){
+                    let count=converter.as_ref().map_or(0,|c|c.available_mask().count_ones());
+                    let summary=format!("VoiceBank: {count} of 4 loaded");
+                    if task.errors.is_empty(){self.set_status(summary)}else{self.set_error(summary,task.errors.join("\n"))}
+                    self.params.diagnostics.event("VOICE_BANK_LOAD_DONE",&format!("ready={count} elapsed_ms={:.2}",task.started.elapsed().as_secs_f64()*1000.0));
+                    if count==0 {self.dirty.store(true,Ordering::Release);}
+                }
+                self.loading.store(false,Ordering::Release); self.state.notify_offline();
             }
 
             let selected = self.params.selected_voice();
@@ -1112,65 +1183,25 @@ impl WorkerCtx {
         generation
     }
 
-    fn load_conversion(
-        &self,
-        settings: &PluginConfig,
-        chunk_samples: usize,
-    ) -> Option<Box<dyn WorkerConversion>> {
+    fn load_conversion(&self, settings:&PluginConfig, chunk_samples:usize)->Option<Box<dyn WorkerConversion>> {
         if settings.has_voice_bank() {
-            let mut slots: [Option<Box<dyn WorkerConversion>>; 4] = std::array::from_fn(|_| None);
-            let mut errors = Vec::new();
-            for (i, slot) in slots.iter_mut().enumerate() {
-                let config = settings.for_voice(i);
-                if config.model.as_os_str().is_empty() {
-                    errors.push(format!("{}: model not registered", LABELS[i]));
-                    continue;
-                }
-                if !config.has_models() {
-                    errors.push(format!("{}: embedder or F0 path missing", LABELS[i]));
-                    continue;
-                }
-                self.set_status(format!("Loading {}", LABELS[i]));
-                let hop = match config.validated_chunk_samples(self.sample_rate) {
-                    Ok(hop) => hop,
-                    Err(e) => { errors.push(format!("{}: {e}",LABELS[i])); continue; }
-                };
-                let profile = &settings.voice_profiles[i];
-                self.params.diagnostics.event("VOICE_PROFILE", &format!("slot={} pitch={} index_rate={} chunk_ms={} crossfade_ms={} f0_threshold={} extra_convert_ms={} input_gain_db={} output_gain_db={} protect={} formant_st={}", i+1, profile.pitch_shift,profile.index_rate,profile.chunk_ms,profile.crossfade_ms,profile.f0_threshold,profile.extra_convert_ms,profile.input_gain_db,profile.output_gain_db,profile.protect,profile.formant_shift));
-                match self.load_pipeline(&config, config.provider(), hop) {
-                    Ok(mut pipeline) => {
-                        if let Err(e) = pipeline.set_protect(profile.protect) {
-                            errors.push(format!("{}: {e}", LABELS[i]));
-                            continue;
-                        }
-                        if let Err(e) = pipeline.set_f0_ranges(profile.input_f0_min_hz,profile.input_f0_max_hz,profile.output_f0_min_hz,profile.output_f0_max_hz) {
-                            errors.push(format!("{}: {e}", LABELS[i]));
-                            continue;
-                        }
-                        self.params.diagnostics.event("VOICE_F0_RANGE",&format!("slot={} input_min_hz={} input_max_hz={} output_min_hz={} output_max_hz={}",i+1,profile.input_f0_min_hz,profile.input_f0_max_hz,profile.output_f0_min_hz,profile.output_f0_max_hz));
-                        if let Err(e) = pipeline.set_formant_shift(profile.formant_shift) {
-                            errors.push(format!("{}: {e}", LABELS[i]));
-                            continue;
-                        }
-                        pipeline.set_peak_protection(true);
-                        let inner = self.chunk_converter(pipeline, config.smoothing_kind(), hop, &config);
-                        *slot = Some(Box::new(ProfiledConversion { inner, live: profile.live(), hop }));
-                    }
-                    Err(err) => {
-                        nice_plug::nice_error!("vc-vst3: {} load failed: {err:#}", LABELS[i]);
-                        errors.push(format!("{}: {err:#}", LABELS[i]));
-                    }
+            let loader=self.model_loader();
+            let mut slots:[Option<Box<dyn WorkerConversion>>;4]=std::array::from_fn(|_|None);
+            let mut errors=Vec::new();
+            for i in bank_load_order(self.params.selected_voice()) {
+                match loader.load_voice_slot(settings,i) {
+                    Ok(v)=>slots[i]=Some(v),
+                    Err(e)=>errors.push(format!("{}: {e:#}",LABELS[i])),
                 }
             }
-            let requested = self.params.selected_voice().saturating_sub(1) as usize;
-            let Some(bank) = VoiceBank::new(slots, requested) else {
-                self.set_error("No voice bank model could load", errors.join("\n"));
-                self.dirty.store(true, Ordering::SeqCst);
+            let requested=self.params.selected_voice().saturating_sub(1) as usize;
+            let Some(bank)=VoiceBank::new(slots,requested) else {
+                self.set_error("No voice bank model could load",errors.join("\n"));
+                self.dirty.store(true,Ordering::SeqCst);
                 return None;
             };
-            let summary = format!("Voice: {} ({} of 4 loaded)", LABELS[bank.active()], 4 - errors.len());
-            if errors.is_empty() { self.set_status(summary); }
-            else { self.set_error(summary, errors.join("\n")); }
+            let summary=format!("Voice: {} ({} of 4 loaded)",LABELS[bank.active()],4-errors.len());
+            if errors.is_empty(){self.set_status(summary)}else{self.set_error(summary,errors.join("\n"))}
             return Some(Box::new(bank));
         }
         match self.load_current(settings, chunk_samples) {
@@ -1348,6 +1379,84 @@ impl WorkerCtx {
         }
     }
 
+    fn load_pipeline(&self, settings:&PluginConfig, provider:vc_core::Provider, chunk_samples:usize)->anyhow::Result<RvcPipeline> {
+        self.model_loader().load_pipeline(settings,provider,chunk_samples)
+    }
+    fn model_loader(&self)->ModelLoader {
+        ModelLoader{params:self.params.clone(),status:self.status.clone(),sample_rate:self.sample_rate}
+    }
+
+}
+
+
+// The loader owns no audio rings. All GPU construction is off the callback and
+// the inference worker; loaded converters are transferred exactly once.
+struct ModelLoader {
+    params:Arc<VcRvcParams>,
+    status:Arc<Mutex<PluginStatus>>,
+    sample_rate:u32,
+}
+impl ModelLoader {
+    fn set_status(&self, text: impl Into<String>) {
+        let text = text.into();
+        self.params.diagnostics.event("STATUS", &text);
+        *self.params.model_message.lock().unwrap_or_else(|e|e.into_inner())=text.clone();
+        if let Ok(mut status) = self.status.lock() {
+            *status = PluginStatus::new(text);
+        }
+    }
+
+    fn set_error(&self, summary: impl Into<String>, detail: impl Into<String>) {
+        let summary = summary.into();
+        let detail = detail.into();
+        self.params.diagnostics.event("ERROR", &format!("{summary}: {detail}"));
+        *self.params.model_message.lock().unwrap_or_else(|e|e.into_inner())=format!("{summary}: {detail}");
+        if let Ok(mut status) = self.status.lock() {
+            *status = PluginStatus {
+                summary,
+                detail: Some(detail),
+            };
+        }
+    }
+
+    fn report_load_progress(&self, progress: LoadProgress) {
+        self.set_status(match progress {
+            LoadProgress::Idle => "idle".to_string(),
+            LoadProgress::ValidatingConfig => "validating configuration".to_string(),
+            LoadProgress::PreparingProvider => "preparing execution provider".to_string(),
+            LoadProgress::DownloadingProvider => "downloading execution provider".to_string(),
+            LoadProgress::BuildingEngine { role } => {
+                format!("building {} TensorRT engine", role.label())
+            }
+            LoadProgress::LoadingModel { role } => format!("loading {} model", role.label()),
+            LoadProgress::OpeningAudioDevices => "opening audio devices".to_string(),
+            LoadProgress::Running => "running".to_string(),
+            LoadProgress::Failed => "failed".to_string(),
+        });
+    }
+
+
+    fn chunk_converter(
+        &self,
+        pipeline: RvcPipeline,
+        kind: SmoothingKind,
+        chunk_samples: usize,
+        settings: &PluginConfig,
+    ) -> ChunkConverter<RvcPipeline> {
+        ChunkConverter::new(
+            pipeline,
+            ChunkOutputConfig {
+                kind,
+                output_sample_rate: self.sample_rate,
+                output_chunk_samples: chunk_samples,
+                crossfade_ms: settings.crossfade_ms,
+                sola_search_ms: settings.sola_search_ms,
+                tail_discard_ms: settings.rvc_output_tail_discard_ms,
+            },
+        )
+    }
+
+
     fn load_pipeline(
         &self,
         settings: &PluginConfig,
@@ -1447,6 +1556,71 @@ impl WorkerCtx {
             }
         }
         Ok(pipeline)
+    }
+    fn load_voice_slot(&self, settings:&PluginConfig, i:usize)->anyhow::Result<Box<dyn WorkerConversion>> {
+        let started=Instant::now();
+        let config=settings.for_voice(i);
+        anyhow::ensure!(config.has_models(),"missing model, ContentVec or RMVPE");
+        self.set_status(format!("Loading {}",LABELS[i]));
+        let hop=config.validated_chunk_samples(self.sample_rate)?;
+        let profile=&settings.voice_profiles[i];
+        self.params.diagnostics.event("VOICE_PROFILE",&format!("slot={} pitch={} index_rate={} chunk_ms={} crossfade_ms={} f0_threshold={} extra_convert_ms={} input_gain_db={} output_gain_db={} protect={} formant_st={}",i+1,profile.pitch_shift,profile.index_rate,profile.chunk_ms,profile.crossfade_ms,profile.f0_threshold,profile.extra_convert_ms,profile.input_gain_db,profile.output_gain_db,profile.protect,profile.formant_shift));
+        let mut pipeline=self.load_pipeline(&config,config.provider(),hop)?;
+        pipeline.set_protect(profile.protect)?;
+        pipeline.set_f0_ranges(profile.input_f0_min_hz,profile.input_f0_max_hz,profile.output_f0_min_hz,profile.output_f0_max_hz)?;
+        self.params.diagnostics.event("VOICE_F0_RANGE",&format!("slot={} input_min_hz={} input_max_hz={} output_min_hz={} output_max_hz={}",i+1,profile.input_f0_min_hz,profile.input_f0_max_hz,profile.output_f0_min_hz,profile.output_f0_max_hz));
+        pipeline.set_formant_shift(profile.formant_shift)?;
+        pipeline.set_peak_protection(true);
+        let inner=self.chunk_converter(pipeline,config.smoothing_kind(),hop,&config);
+        self.params.diagnostics.event("VOICE_LOAD_DONE",&format!("slot={} load_ms={:.2}",i+1,started.elapsed().as_secs_f64()*1000.0));
+        Ok(Box::new(ProfiledConversion{inner,live:profile.live(),hop}))
+    }
+}
+fn bank_load_order(selected:i32)->[usize;4] {
+    let first=if (1..=4).contains(&selected) {(selected-1) as usize}else{0};
+    let mut order=[first,0,0,0];let mut pos=1;
+    for i in 0..4 {if i!=first {order[pos]=i;pos+=1;}}
+    order
+}
+enum BankLoadMessage {
+    Ready(usize,Box<dyn WorkerConversion>),
+    Failed(usize,String),
+    Done,
+}
+struct BankLoadTask {
+    rx:std::sync::mpsc::Receiver<BankLoadMessage>,
+    cancel:Arc<AtomicBool>,
+    handle:Option<JoinHandle<()>>,
+    settings:PluginConfig,
+    errors:Vec<String>,
+    started:Instant,
+}
+impl BankLoadTask {
+    fn start(loader:ModelLoader,settings:PluginConfig,selected:i32)->std::io::Result<Self> {
+        let (tx,rx)=std::sync::mpsc::channel();
+        let cancel=Arc::new(AtomicBool::new(false));
+        let cancelled=cancel.clone();
+        let snapshot=settings.clone();
+        let worker=thread::current();
+        let handle=thread::Builder::new().name("vc-vst3-model-loader".into()).spawn(move||{
+            for i in bank_load_order(selected) {
+                if cancelled.load(Ordering::Acquire){break;}
+                let msg=match loader.load_voice_slot(&snapshot,i) {
+                    Ok(v)=>BankLoadMessage::Ready(i,v),
+                    Err(e)=>BankLoadMessage::Failed(i,format!("{}: {e:#}",LABELS[i])),
+                };
+                if tx.send(msg).is_err(){return;}
+                worker.unpark();
+            }
+            let _=tx.send(BankLoadMessage::Done); worker.unpark();
+        })?;
+        Ok(Self{rx,cancel,handle:Some(handle),settings,errors:Vec::new(),started:Instant::now()})
+    }
+}
+impl Drop for BankLoadTask {
+    fn drop(&mut self) {
+        self.cancel.store(true,Ordering::Release);
+        if let Some(h)=self.handle.take(){let _=h.join();}
     }
 }
 
@@ -1947,6 +2121,15 @@ mod tests {
         assert!(next.iter().all(|v| *v>=0.19));
     }
 
+    #[test]
+    fn startup_prioritizes_requested_slot_and_never_loads_a_slot_twice() {
+        for selected in 0..=4 {
+            let order=bank_load_order(selected);
+            assert_eq!(order[0],selected.saturating_sub(1) as usize);
+            let mut sorted=order;sorted.sort_unstable();
+            assert_eq!(sorted,[0,1,2,3]);
+        }
+    }
     #[test]
     fn transition_is_five_ms_bounded_and_does_not_insert_silence() {
         let mut a=vec![0.3;2400];

@@ -15,6 +15,11 @@ impl<T> VoiceBank<T> {
         Some(Self { slots, active })
     }
     pub(crate) fn active(&self) -> usize { self.active }
+    pub(crate) fn insert(&mut self, slot: usize, value:T) -> anyhow::Result<()> {
+        let target=self.slots.get_mut(slot).ok_or_else(||anyhow::anyhow!("Invalid voice slot"))?;
+        anyhow::ensure!(target.is_none(),"Voice slot already loaded");
+        *target=Some(value); Ok(())
+    }
     pub(crate) fn available_mask(&self)->u32 { self.slots.iter().enumerate().fold(0,|mask,(i,slot)|if slot.is_some(){mask|(1u32<<(i+1))}else{mask}) }
     pub(crate) fn select(&mut self, slot: usize) -> anyhow::Result<bool> {
         if !self.slots.get(slot).is_some_and(Option::is_some) {
@@ -30,6 +35,17 @@ impl<T> VoiceBank<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn incrementally_loaded_slot_preserves_active_model() {
+        let mut b=VoiceBank::new([None,Some(2),None,None],1).unwrap();
+        assert_eq!(b.available_mask(),4);
+        b.insert(0,1).unwrap();
+        assert_eq!(b.available_mask(),6);
+        assert_eq!(*b.current(),2);
+        assert!(b.select(0).unwrap());
+        assert_eq!(*b.current(),1);
+        assert!(b.insert(0,99).is_err());
+    }
     #[test]
     fn all_four_slots_switch_without_reloading() {
         let mut b = VoiceBank::new([Some(1), Some(2), Some(3), Some(4)], 0).unwrap();

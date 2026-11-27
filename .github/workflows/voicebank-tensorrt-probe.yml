@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - '.github/workflows/voicebank-tensorrt-probe.yml'
+      - 'crates/vc-core/src/model_rvc/native_tensorrt_shim.cpp'
 permissions:
   contents: read
 env:
