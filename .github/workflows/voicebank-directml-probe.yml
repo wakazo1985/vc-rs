@@ -30,8 +30,17 @@ jobs:
             $dml=Join-Path $root 'dml.zip'
             Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/1.15.4/microsoft.ai.directml.1.15.4.nupkg' -OutFile $dml
             Expand-Archive $dml -DestinationPath "$root/dml"
-            $dll=Get-ChildItem "$root/dml" -Recurse -File -Filter DirectML.dll | Where-Object {$_.FullName -match '[\\/](x64|win-x64)[\\/]'} | Select-Object -First 1
+            $dll=Get-ChildItem "$root/dml" -Recurse -File -Filter DirectML.dll | Where-Object {
+              $reader=[IO.BinaryReader]::new([IO.File]::OpenRead($_.FullName))
+              try {
+                $reader.BaseStream.Position=0x3c
+                $offset=$reader.ReadInt32()
+                $reader.BaseStream.Position=$offset
+                ($reader.ReadUInt32() -eq 0x4550) -and ($reader.ReadUInt16() -eq 0x8664)
+              } finally { $reader.Dispose() }
+            } | Select-Object -First 1
             if (!$dll) { throw 'Missing x64 DirectML.dll' }
+            Write-Host "Selected x64 DLL: $($dll.FullName)"
             Copy-Item $dll.FullName "$native/DirectML.dll"
           }
           "VOICEBANK_PROBE_ORT=$native\onnxruntime.dll" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
