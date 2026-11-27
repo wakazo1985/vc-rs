@@ -6,6 +6,21 @@ pub(super) struct FeatureTensor {
     pub(super) shape: Vec<i64>,
 }
 
+/// RVC's unvoiced protection: preserve original ContentVec features when
+/// F0 is absent; voiced frames retain the full retrieval blend. Both tensors
+/// must already use the identical 10 ms feature grid.
+pub(super) fn protect_unvoiced(mixed: &mut [f32], original: &[f32], pitchf: &[f32], channels: usize, protect: f32) -> Result<()> {
+    anyhow::ensure!(channels > 0 && mixed.len() == original.len() && mixed.len() == pitchf.len().saturating_mul(channels), "Protect frame alignment mismatch");
+    anyhow::ensure!(protect.is_finite() && (0.0..=0.5).contains(&protect), "Invalid Protect");
+    if protect >= 0.5 { return Ok(()); }
+    for ((target, source), f0) in mixed.chunks_exact_mut(channels).zip(original.chunks_exact(channels)).zip(pitchf) {
+        if *f0 < 1.0 {
+            for (x, y) in target.iter_mut().zip(source) { *x = protect * *x + (1.0-protect) * *y; }
+        }
+    }
+    Ok(())
+}
+
 impl FeatureTensor {
     pub(super) fn repeat_frames(&mut self, factor: usize) -> Result<()> {
         if factor <= 1 {
@@ -64,6 +79,18 @@ impl FeatureTensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protect_preserves_voiced_and_restores_unvoiced_on_aligned_grid() {
+        let original = [1.0,2.0,3.0,4.0];
+        let mut mixed = [5.0,6.0,7.0,8.0];
+        protect_unvoiced(&mut mixed,&original,&[220.0,0.0],2,0.25).unwrap();
+        assert_eq!(mixed,[5.0,6.0,4.0,5.0]);
+        let mut disabled = [5.0,6.0,7.0,8.0];
+        protect_unvoiced(&mut disabled,&original,&[220.0,0.0],2,0.5).unwrap();
+        assert_eq!(disabled,[5.0,6.0,7.0,8.0]);
+        assert!(protect_unvoiced(&mut disabled,&original,&[0.0],2,0.25).is_err());
+    }
 
     #[test]
     fn repeat_frames_duplicates_each_frame_in_order() {

@@ -246,6 +246,10 @@ pub struct RvcPipeline {
     feature_tensor: FeatureTensor,
     retrieval: Option<super::retrieval::RetrievalIndex>,
     retrieval_rate: f32,
+    protect: f32,
+    original_features: FeatureTensor,
+    quality_report: String,
+    quality_enabled: bool,
     input_reference_scratch: Vec<f32>,
     rms_mix_scratch: dsp::RmsMixScratch,
     pitchf_untrimmed_scratch: Vec<f32>,
@@ -679,6 +683,10 @@ impl RvcPipeline {
             feature_tensor: FeatureTensor::default(),
             retrieval: None,
             retrieval_rate: 0.0,
+            protect: 0.5,
+            original_features: FeatureTensor::default(),
+            quality_report: String::new(),
+            quality_enabled: false,
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -1189,6 +1197,10 @@ impl RvcPipeline {
             feature_tensor: FeatureTensor::default(),
             retrieval: None,
             retrieval_rate: 0.0,
+            protect: 0.5,
+            original_features: FeatureTensor::default(),
+            quality_report: String::new(),
+            quality_enabled: false,
             input_reference_scratch: Vec::new(),
             rms_mix_scratch: dsp::RmsMixScratch::default(),
             pitchf_untrimmed_scratch: Vec::new(),
@@ -1214,6 +1226,13 @@ impl RvcPipeline {
         Ok(())
     }
 
+    pub fn set_protect(&mut self, protect: f32) -> Result<()> {
+        ensure!(protect.is_finite() && (0.0..=0.5).contains(&protect), "Invalid Protect");
+        self.protect = protect;
+        Ok(())
+    }
+    pub fn set_quality_diagnostics(&mut self, enabled: bool) { self.quality_enabled = enabled; }
+    pub fn quality_report(&self) -> &str { &self.quality_report }
     pub fn set_pitch_shift(&mut self, pitch_shift: f32) {
         self.pitch_shift = pitch_shift;
     }
@@ -1447,6 +1466,11 @@ impl VoiceModel for RvcPipeline {
             &self.stream_state.audio_16k_buffer,
             &mut self.feature_tensor,
         )?;
+        let preserve_features = self.retrieval.is_some() && (self.protect < 0.5 || self.quality_enabled);
+        if preserve_features {
+            self.original_features.data.clone_from(&self.feature_tensor.data);
+            self.original_features.shape.clone_from(&self.feature_tensor.shape);
+        }
         if let Some(index) = self.retrieval.as_ref() {
             let shape = &self.feature_tensor.shape;
             ensure!(shape.len() == 3 && shape[0] == 1 && usize::try_from(shape[2])? == index.dimension(), "INDEX feature dimension mismatch");
@@ -1488,6 +1512,13 @@ impl VoiceModel for RvcPipeline {
             }
         } else {
             self.feature_tensor.repeat_frames(2)?;
+        }
+        if preserve_features {
+            self.original_features.repeat_frames(2)?;
+            if silence_front_frames > 0 && silence_front_frames < feature_len_before_trim {
+                self.original_features.trim_front_frames(silence_front_frames)?;
+            }
+            ensure!(self.original_features.shape == self.feature_tensor.shape, "Protect feature grid mismatch");
         }
         let embedder_time = embedder_start.elapsed();
         let feature_len = self
@@ -1544,6 +1575,22 @@ impl VoiceModel for RvcPipeline {
             &mut self.pitchf_postprocessed_scratch,
         );
         let pitchf = self.pitchf_postprocessed_scratch.as_slice();
+        let feature_change = if preserve_features && self.quality_enabled {
+            let sum = self.feature_tensor.data.iter().zip(&self.original_features.data)
+                .map(|(a,b)| { let d = *a-*b; (d*d) as f64 }).sum::<f64>();
+            (sum / self.feature_tensor.data.len().max(1) as f64).sqrt()
+        } else { 0.0 };
+        if preserve_features && self.protect < 0.5 {
+            let channels = usize::try_from(self.feature_tensor.shape[2])?;
+            super::feature::protect_unvoiced(&mut self.feature_tensor.data, &self.original_features.data, pitchf, channels, self.protect)?;
+        }
+        if self.quality_enabled {
+            fn f0_summary(xs: &[f32]) -> (usize,f32,f32,f32) {
+                let (n,sum,min,max) = xs.iter().copied().filter(|x| x.is_finite() && *x >= 1.0).fold((0usize,0.0f32,f32::INFINITY,0.0f32), |(n,s,l,h),x|(n+1,s+x,l.min(x),h.max(x)));
+                if n == 0 { (0,0.0,0.0,0.0) } else { (n,min,sum/n as f32,max) }
+            }
+            self.quality_report = format!("f0_raw={:?} f0_shifted={:?} pitch_st={} feature_frames={} feature_change_rms={:.6} index_rate={} protect={}", f0_summary(&self.pitchf_scratch),f0_summary(pitchf),self.pitch_shift,feature_len,feature_change,self.retrieval_rate,self.protect);
+        }
         debug!(
             "pitch update: audio_16k_samples={}, rmvpe_input_samples={}, rmvpe_window_start_samples={}, pitchf_raw_len={}, pitchf_buffer_len={}, feature_len={}",
             self.stream_state.audio_16k_buffer.len(),
@@ -1646,6 +1693,13 @@ impl VoiceModel for RvcPipeline {
             self.stream_state.time_state.advance_phase(pitchf);
         }
         let raw_output_samples = out_audio.len();
+        if self.quality_enabled {
+            let peak = out_audio.iter().fold(0.0_f32, |a,x|a.max(x.abs()));
+            let clipped = out_audio.iter().filter(|x|x.abs()>1.0).count();
+            let nonfinite = out_audio.iter().filter(|x|!x.is_finite()).count();
+            use std::fmt::Write as _;
+            let _ = write!(self.quality_report, " rvc_raw_peak={peak:.6} rvc_raw_overrange={clipped} rvc_nonfinite={nonfinite}");
+        }
         ensure!(
             raw_output_samples >= stream_input.out_size,
             "RVC output is too short for chunk assembly: need {} samples, got {}",

@@ -91,6 +91,8 @@ impl Drop for WorkerExit {
 
 trait WorkerConversion: Send {
     fn profile_hop(&self) -> Option<usize> { None }
+    fn quality_diagnostics(&mut self, _enabled: bool) {}
+    fn quality_report(&mut self) -> String { String::new() }
     fn available_mask(&self)->u32 { 0b11110 }
     fn active_slot(&self)->Option<usize>{None}
     fn select_voice(&mut self, _requested: usize) -> anyhow::Result<bool> { Ok(false) }
@@ -108,6 +110,8 @@ trait WorkerConversion: Send {
 
 impl WorkerConversion for VoiceBank<Box<dyn WorkerConversion>> {
     fn profile_hop(&self) -> Option<usize> { self.current().profile_hop() }
+    fn quality_diagnostics(&mut self, enabled: bool) { self.current_mut().quality_diagnostics(enabled); }
+    fn quality_report(&mut self) -> String { self.current_mut().quality_report() }
     fn available_mask(&self)->u32 { VoiceBank::available_mask(self) }
     fn active_slot(&self)->Option<usize>{Some(self.active())}
     fn select_voice(&mut self, requested: usize) -> anyhow::Result<bool> { self.select(requested) }
@@ -131,6 +135,8 @@ struct ProfiledConversion {
 }
 impl WorkerConversion for ProfiledConversion {
     fn profile_hop(&self) -> Option<usize> { Some(self.hop) }
+    fn quality_diagnostics(&mut self, enabled: bool) { self.inner.model_mut().set_quality_diagnostics(enabled); }
+    fn quality_report(&mut self) -> String { let join = self.inner.last_join_diagnostics(); format!("{} join={join:?}",self.inner.model_mut().quality_report()) }
     fn apply_live(&mut self, _: &LiveParams) { self.inner.model_mut().apply_live(&self.live); }
     fn reset(&mut self) -> anyhow::Result<()> { WorkerConversion::reset(&mut self.inner) }
     fn prime(&mut self, input: &[f32], rate: u32) -> anyhow::Result<()> { WorkerConversion::prime(&mut self.inner,input,rate) }
@@ -955,7 +961,9 @@ impl WorkerCtx {
             // the same `LiveParams` the standalone worker does, so both drive the
             // single `apply_live` entry point rather than diverging set_* calls.
             current.apply_live(&self.live_params());
-
+            let detailed = self.params.settings.try_read().map(|s|s.detailed_diagnostics).unwrap_or(false);
+            let report_quality = detailed || last_chunk_log.elapsed() >= Duration::from_secs(5);
+            current.quality_diagnostics(report_quality);
             let stats = match current.process(chunk, self.sample_rate, &mut chunk_out) {
                 Ok(stats) => stats,
                 Err(err) => {
@@ -970,6 +978,10 @@ impl WorkerCtx {
             if detailed || last_chunk_log.elapsed() >= Duration::from_secs(5) {
                 let ms = |d: Duration| d.as_secs_f64() * 1000.0;
                 self.params.diagnostics.event("INFERENCE", &format!("voice={} silent={} inference_ms={:.2} embedder_ms={:.2} f0_ms={:.2} rvc_ms={:.2} smoothing_ms={:.2} model_output_samples={} content_delay_samples={:?} {}", self.params.selected_voice(), stats.silent, ms(stats.inference_time), ms(stats.embedder_time), ms(stats.pitch_time), ms(stats.rvc_time), ms(stats.smoothing_time), stats.model_output_samples, stats.content_delay_samples, self.params.diagnostics.counters()));
+                let peak = chunk_out.iter().fold(0.0_f32,|a,x|a.max(x.abs()));
+                let clipped = chunk_out.iter().filter(|x|x.abs()>=1.0).count();
+                let nonfinite = chunk_out.iter().filter(|x|!x.is_finite()).count();
+                self.params.diagnostics.event("QUALITY",&format!("voice={} hop={} output_peak={peak:.6} output_clipped={clipped} output_nonfinite={nonfinite} {}", self.params.selected_voice(),chunk_samples,current.quality_report()));
                 last_chunk_log = std::time::Instant::now();
             }
             // The shared converter now knows the model's native rate, actual
@@ -1063,9 +1075,13 @@ impl WorkerCtx {
                     Err(e) => { errors.push(format!("{}: {e}",LABELS[i])); continue; }
                 };
                 let profile = &settings.voice_profiles[i];
-                self.params.diagnostics.event("VOICE_PROFILE", &format!("slot={} pitch={} index_rate={} chunk_ms={} crossfade_ms={} f0_threshold={} extra_convert_ms={} input_gain_db={} output_gain_db={} protect_reserved={} formant_reserved={}", i+1, profile.pitch_shift,profile.index_rate,profile.chunk_ms,profile.crossfade_ms,profile.f0_threshold,profile.extra_convert_ms,profile.input_gain_db,profile.output_gain_db,profile.protect,profile.formant_shift));
+                self.params.diagnostics.event("VOICE_PROFILE", &format!("slot={} pitch={} index_rate={} chunk_ms={} crossfade_ms={} f0_threshold={} extra_convert_ms={} input_gain_db={} output_gain_db={} protect={} formant_reserved={}", i+1, profile.pitch_shift,profile.index_rate,profile.chunk_ms,profile.crossfade_ms,profile.f0_threshold,profile.extra_convert_ms,profile.input_gain_db,profile.output_gain_db,profile.protect,profile.formant_shift));
                 match self.load_pipeline(&config, config.provider(), hop) {
-                    Ok(pipeline) => {
+                    Ok(mut pipeline) => {
+                        if let Err(e) = pipeline.set_protect(profile.protect) {
+                            errors.push(format!("{}: {e}", LABELS[i]));
+                            continue;
+                        }
                         let inner = self.chunk_converter(pipeline, config.smoothing_kind(), hop, &config);
                         *slot = Some(Box::new(ProfiledConversion { inner, live: profile.live(), hop }));
                     }
@@ -1718,16 +1734,17 @@ mod tests {
                 + settings.sola_search_ms
                 + settings.rvc_output_tail_discard_ms) as usize
             / 1000;
+        let hop = settings.validated_chunk_samples(RATE).unwrap();
         let converter = TestConversion(ChunkConverter::new(
             TestVoice {
                 history: Vec::new(),
-                candidate_samples: HOP + extra,
+                candidate_samples: hop + extra,
                 control,
             },
             ChunkOutputConfig {
                 kind: settings.smoothing_kind(),
                 output_sample_rate: RATE,
-                output_chunk_samples: HOP,
+                output_chunk_samples: hop,
                 crossfade_ms: settings.crossfade_ms,
                 sola_search_ms: settings.sola_search_ms,
                 tail_discard_ms: settings.rvc_output_tail_discard_ms,
@@ -1790,6 +1807,25 @@ mod tests {
             index += 1;
         }
         output
+    }
+
+    #[test]
+    fn fifty_ms_mock_pipeline_preserves_waveform_and_length() {
+        let params = configured_params(40, 10, "phase-vocoder");
+        params.settings.write().unwrap().chunk_ms = 50;
+        let mut runtime = loaded_runtime(params, ProcessMode::Offline, 2048, TestControl::default());
+        let hop = 800;
+        assert_eq!(runtime.state.input_hop.load(Ordering::Acquire), hop);
+        let latency = runtime.current_latency() as usize;
+        // Actual smoothing clamps 40 ms to 37.5 ms for a 50 ms hop.
+        assert_eq!(latency, hop + 600 + 160);
+        let input: Vec<f32> = (0..hop*6+53).map(|i|0.2+0.1*(i as f32*0.017).cos()).collect();
+        let mut padded = input.clone();
+        padded.resize(input.len()+latency,0.0);
+        let output = render(&mut runtime,&padded,&[37,512,63,17]);
+        let error = output[latency..].iter().zip(&input).map(|(a,b)|(a-b).abs()).fold(0.0_f32,f32::max);
+        println!("50ms mock phase-vocoder hop={hop} latency_samples={latency} max_error={error}");
+        assert!(error<1e-5,"50ms waveform error={error}");
     }
 
     #[test]
