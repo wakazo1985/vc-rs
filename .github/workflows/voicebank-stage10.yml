@@ -23,7 +23,19 @@ jobs:
       - name: Core DSP and ONNX contract tests
         shell: pwsh
         run: |
-          cargo test -p vc-core --no-default-features --features ort --locked
+          cargo test -p vc-core --no-default-features --features ort --locked --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p vc-core --no-default-features --features ort --locked --tests -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  plugin-tests:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Plugin realtime, echo, settings and shortcut tests
         shell: pwsh

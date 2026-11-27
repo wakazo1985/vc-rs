@@ -12,10 +12,20 @@ use std::{
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        Self(std::env::temp_dir().join(
-            format!("vc-rs-sdk-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()),
-        ))
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        loop {
+            let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "vc-rs-sdk-{}-{stamp}-{sequence}", std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => panic!("cannot create isolated SDK fixture: {err}"),
+            }
+        }
     }
     fn install(&self, relative: &str, version: [u32; 4]) -> PathBuf {
         let root = self.0.join(relative);
