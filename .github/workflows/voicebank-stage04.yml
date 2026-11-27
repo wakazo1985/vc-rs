@@ -1,0 +1,86 @@
+name: VoiceBank stage 04 baseline VST3 packages
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-stage04.yml'
+permissions:
+  contents: read
+jobs:
+  windowsml:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust and packaging tool
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo install cargo-about --version 0.8.4 --locked --features cli
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package original Windows ML VST3
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -File crates/vc-vst3/package.ps1 -Variant windowsml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Get-ChildItem dist -Filter '*.zip' -File)) { throw 'Missing distribution ZIP' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage04-windowsml-baseline
+          path: dist/*.zip
+          if-no-files-found: error
+  tensorrt:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire official NVIDIA SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/11.2.1/zip/TensorRT-Enterprise-11.2.1.2-Windows-amd64-cuda-13.3-Release-external.zip'
+          $zip = Join-Path $env:RUNNER_TEMP 'tensorrt.zip'
+          curl.exe --fail --location --retry 2 --output $zip $url
+          if ($LASTEXITCODE -ne 0) { throw 'Official TensorRT SDK download failed; NVIDIA authentication may be required.' }
+          New-Item -ItemType Directory -Force external/nvidia | Out-Null
+          7z x $zip "-o$PWD\external\nvidia" -y
+          if ($LASTEXITCODE -ne 0) { throw 'TensorRT SDK archive extraction failed.' }
+          . scripts/tensorrt-sdk.ps1
+          $sdk = Resolve-TensorRtSdk -RepoRoot $PWD.Path
+          if (-not $sdk) { throw 'TensorRT SDK headers, import libraries or runtime DLLs missing.' }
+          "TENSORRT_ROOT=$($sdk.Root)" >> $env:GITHUB_ENV
+      - name: Install CUDA 13.3 toolkit components
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
+          curl.exe --fail --location --retry 2 --output $installer 'https://developer.download.nvidia.com/compute/cuda/13.3.1/local_installers/cuda_13.3.1_windows.exe'
+          if ($LASTEXITCODE -ne 0) { throw 'CUDA Toolkit download failed.' }
+          $p = Start-Process -FilePath $installer -ArgumentList '-s','cudart_13.3','nvcc_13.3' -Wait -PassThru
+          if ($p.ExitCode -notin @(0,3010)) { throw "CUDA installer exit $($p.ExitCode)" }
+          $root = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3'
+          if (-not (Test-Path "$root\include\cuda_runtime_api.h") -or -not (Test-Path "$root\lib\x64\cudart.lib")) { throw 'CUDA headers or import libraries missing.' }
+          "CUDA_PATH=$root" >> $env:GITHUB_ENV
+      - name: Install Rust and packaging tool
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo install cargo-about --version 0.8.4 --locked --features cli
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package original native TensorRT VST3
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:VC_RS_ENABLE_NATIVE_TENSORRT = '1'
+          . scripts/activate.ps1
+          pwsh -File crates/vc-vst3/package.ps1 -Variant tensorrt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Get-ChildItem dist -Filter '*.zip' -File)) { throw 'Missing distribution ZIP' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage04-tensorrt-baseline
+          path: dist/*.zip
+          if-no-files-found: error
