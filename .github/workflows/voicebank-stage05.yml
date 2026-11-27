@@ -1,0 +1,93 @@
+name: VoiceBank stage 05 offline model converter
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/voicebank-stage05.yml'
+      - 'crates/vc-convert/examples/voicebank_convert.rs'
+      - 'scripts/voicebank-convert-models.ps1'
+permissions:
+  contents: read
+jobs:
+  converter:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test offline conversion library
+        shell: pwsh
+        run: |
+          cargo test -p vc-convert --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile local Windows converter
+        shell: pwsh
+        run: |
+          cargo build -p vc-convert --example voicebank_convert --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test actual conversion executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path 'target/release/examples/voicebank_convert.exe').Path
+          $fixtures = 'crates/vc-convert/tests/fixtures'
+          New-Item -ItemType Directory -Force fixture-output | Out-Null
+          foreach ($name in @('tiny_v2_f0','tiny_applio_mrf','tiny_applio_refine')) {
+            $out = "fixture-output/$name.onnx"
+            & $exe "$fixtures/$name.pth" $out
+            if ($LASTEXITCODE -ne 0) { throw "Conversion failed: $name" }
+            $file = Get-Item $out
+            if ($file.Length -lt 10000) { throw "Invalid ONNX: $name" }
+            Get-FileHash $out -Algorithm SHA256
+          }
+          $PSNativeCommandUseErrorActionPreference = $false
+          foreach ($name in @('tiny_v1','tiny_v2_nof0')) {
+            $out = "fixture-output/$name.onnx"
+            & $exe "$fixtures/$name.pth" $out
+            if ($LASTEXITCODE -eq 0 -or (Test-Path $out)) { throw "Unsupported checkpoint was accepted: $name" }
+          }
+          Write-Host 'Supported and unsupported model fixture checks passed.'
+          exit 0
+      - name: Check PowerShell wizard syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'scripts/voicebank-convert-models.ps1').Path,[ref]$tokens,[ref]$errors)
+          if ($errors.Count) { $errors | Out-String | Write-Host; throw 'Invalid PowerShell syntax' }
+      - name: Package local conversion tool only
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force stage05 | Out-Null
+          Copy-Item target/release/examples/voicebank_convert.exe stage05/
+          Copy-Item scripts/voicebank-convert-models.ps1 stage05/
+          Copy-Item LICENSE stage05/
+          Copy-Item crates/vc-convert/LICENSE-*.txt stage05/
+          Copy-Item crates/vc-convert/THIRD_PARTY.md stage05/
+          @(
+            '@echo off',
+            'cd /d "%~dp0"',
+            'powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File "%~dp0voicebank-convert-models.ps1"',
+            'echo Exit code: %ERRORLEVEL%',
+            'pause'
+          ) | Set-Content stage05/START_CONVERSION.cmd -Encoding ascii
+          @(
+            'Run START_CONVERSION.cmd on Windows.',
+            'Choose the original ZIP or PTH for each of the four requested voice slots.',
+            'All conversion happens on your PC. No model is uploaded.',
+            'Outputs: %LOCALAPPDATA%\RVCVoiceBank\models',
+            'Results and detailed logs: %LOCALAPPDATA%\RVCVoiceBank',
+            'RVC v2 with F0 only; incompatible checkpoints are rejected.',
+            'Index files are preserved in your source files and are not converted by this tool.',
+            'This is not the VST3 plugin; it is the stage 05 conversion utility.'
+          ) | Set-Content stage05/README.txt -Encoding utf8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage05-local-model-converter
+          path: stage05/
+          if-no-files-found: error
