@@ -1,0 +1,59 @@
+name: Stage 01 public SHA-256 reference
+on:
+  push:
+    branches: [rebuild-stage01-audit]
+    paths: ['.github/workflows/rebuild-stage01-hashes.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Get public reference hashes only
+        run: |
+          python - <<'PY'
+          import hashlib, json, re, urllib.request
+          from urllib.parse import quote
+          def open_url(url):
+              return urllib.request.urlopen(urllib.request.Request(url,headers={"User-Agent":"stage01-hash-audit","Accept-Encoding":"identity"}),timeout=35)
+          items=[
+              ("maxwellyoung(FantasticMax).zip",160446052,"VofVoices/maxwell-young-fantastic-max-RVC-v2","main","maxwellyoung(FantasticMax).zip"),
+              ("speakandspell.zip",96253214,"analogspiderweb/analogspiderweb_RVC","17a331f0ecdc9cbb52b0b7d599b36300a38fc413","speakandspell.zip"),
+              ("D.pth",55232523,"ttttdiva/rvc_okiba","main","models/D/D.pth"),
+              ("D.index",454130739,"ttttdiva/rvc_okiba","main","models/D/D.index"),
+          ]
+          failures=0
+          for name,size,repo,rev,path in items:
+              try:
+                  folder=path.rpartition("/")[0]
+                  url="https://huggingface.co/api/models/"+repo+"/tree/"+rev+("/"+folder if folder else "")
+                  with open_url(url) as r: data=json.load(r)
+                  entry=next(e for e in data if e["path"]==path)
+                  sha=entry["lfs"]["oid"]
+                  if entry["size"]!=size or not re.fullmatch(r"[0-9a-f]{64}",sha): raise ValueError("size or hash mismatch")
+                  print("REFERENCE",json.dumps({"name":name,"bytes":size,"sha256":sha,"source":url,"method":"public LFS metadata"},ensure_ascii=False),flush=True)
+              except Exception as e:
+                  failures+=1;print("REFERENCE_FAILED",name,str(e),flush=True)
+          # The author does not publish a checksum. Stream the public ZIP to a
+          # digest without writing it to disk, loading a model, or uploading any data.
+          name="rvc_amitaro_runrun_1.0.zip"; size=365440882
+          url="https://amitaro.net/download/others/rvc_amitaro_runrun_1.0.zip"
+          try:
+              h=hashlib.sha256(); n=0
+              with open_url(url) as r:
+                  if r.headers.get("Content-Length") and int(r.headers["Content-Length"])!=size: raise ValueError("size mismatch")
+                  while True:
+                      b=r.read(1024*1024)
+                      if not b: break
+                      n+=len(b)
+                      if n>size: raise ValueError("size exceeds expected")
+                      h.update(b)
+              if n!=size: raise ValueError("incomplete public file")
+              print("REFERENCE",json.dumps({"name":name,"bytes":n,"sha256":h.hexdigest(),"source":url,"method":"streamed public ZIP SHA-256"},ensure_ascii=False),flush=True)
+          except Exception as e:
+              failures+=1;print("REFERENCE_FAILED",name,str(e),flush=True)
+          print("REFERENCE_FAILURES",failures)
+          if failures: raise SystemExit(1)
+          PY
