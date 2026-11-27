@@ -251,6 +251,7 @@ pub struct RvcPipeline {
     quality_report: String,
     quality_enabled: bool,
     prevent_hard_clip: bool,
+    suppress_silent_context: bool,
     formant: Option<super::formant::Formant>,
     formant_shift: f32,
     output_f0_range: Option<(f32, f32)>,
@@ -692,6 +693,7 @@ impl RvcPipeline {
             quality_report: String::new(),
             quality_enabled: false,
             prevent_hard_clip: false,
+            suppress_silent_context: false,
             formant: None,
             formant_shift: 0.0,
             output_f0_range: None,
@@ -1210,6 +1212,7 @@ impl RvcPipeline {
             quality_report: String::new(),
             quality_enabled: false,
             prevent_hard_clip: false,
+            suppress_silent_context: false,
             formant: None,
             formant_shift: 0.0,
             output_f0_range: None,
@@ -1262,6 +1265,10 @@ impl RvcPipeline {
     /// VoiceBank opt-in: preserve the shape of over-range model and RMS-mixed audio.
     pub fn set_peak_protection(&mut self, enabled: bool) {
         self.prevent_hard_clip = enabled;
+    }
+    /// Suppress generated noise only after the complete rolling input is quiet.
+    pub fn set_silent_context_suppression(&mut self, enabled: bool) {
+        self.suppress_silent_context = enabled;
     }
     pub fn set_formant_shift(&mut self, shift: f32) -> Result<()> {
         ensure!(
@@ -1506,6 +1513,9 @@ impl VoiceModel for RvcPipeline {
         let is_silent = self.silence_threshold > 0.0 && input_rms < self.silence_threshold;
         let output_silent = is_silent && self.stream_state.prev_silence;
         self.stream_state.prev_silence = is_silent;
+        let suppress_output = self.suppress_silent_context
+            && output_silent
+            && quiet_context(&self.stream_state.audio_16k_buffer, self.silence_threshold);
 
         // Features
         let embedder_start = Instant::now();
@@ -1905,6 +1915,12 @@ impl VoiceModel for RvcPipeline {
             "RMS mixing returned nonfinite audio"
         );
         let after_rms_mix = self.quality_enabled.then(|| signal_quality(out_audio));
+        // Keep model/phase advancement and overlap timing intact. A silent
+        // current hop alone is insufficient: the candidate includes earlier
+        // speech. Only mute after the complete input context is below threshold.
+        if suppress_output {
+            out_audio.fill(0.0);
+        }
         let (output_rms, applied_output_gain) = if self.prevent_hard_clip {
             apply_peak_safe_output_gain(
                 out_audio,
@@ -1925,7 +1941,7 @@ impl VoiceModel for RvcPipeline {
         if self.quality_enabled {
             use std::fmt::Write as _;
             let final_quality = signal_quality(out_audio);
-            let _ = write!(self.quality_report, " before_rms_mix={before_rms_mix:?} after_rms_mix={after_rms_mix:?} before_join={final_quality:?} envelope_gain={envelope_gain:.6} applied_gain={applied_output_gain:.6} peak_protection={}", self.prevent_hard_clip);
+            let _ = write!(self.quality_report, " before_rms_mix={before_rms_mix:?} after_rms_mix={after_rms_mix:?} before_join={final_quality:?} envelope_gain={envelope_gain:.6} applied_gain={applied_output_gain:.6} peak_protection={} silent_context_suppressed={suppress_output}", self.prevent_hard_clip);
         }
 
         Ok(ModelOutput {
@@ -1948,6 +1964,21 @@ impl VoiceModel for RvcPipeline {
             volume: stream_input.volume,
         })
     }
+}
+
+// Require every sample to be quiet; do not suppress a short consonant merely
+// because a long context has a low average RMS.
+fn quiet_context(audio: &[f32], threshold: f32) -> bool {
+    threshold > 0.0 && audio.iter().all(|x| x.is_finite() && x.abs() < threshold)
+}
+
+#[cfg(test)]
+#[test]
+fn silent_context_guard_preserves_short_speech_and_rejects_invalid_samples() {
+    assert!(quiet_context(&[0.0, 0.00001, -0.00001], 0.0001));
+    assert!(!quiet_context(&[0.0, 0.001, 0.0], 0.0001));
+    assert!(!quiet_context(&[f32::NAN], 0.0001));
+    assert!(!quiet_context(&[0.0], 0.0));
 }
 
 // Preserve unvoiced frames; do not turn a clipped high note into silence.

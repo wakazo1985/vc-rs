@@ -1326,13 +1326,7 @@ impl WorkerCtx {
             previous_input.extend_from_slice(chunk);
             previous_output_end = chunk_out.last().copied();
             self.params.diagnostics.record_chunk(&stats);
-            let detailed = self
-                .params
-                .settings
-                .try_read()
-                .map(|s| s.detailed_diagnostics)
-                .unwrap_or(false);
-            if detailed || last_chunk_log.elapsed() >= Duration::from_secs(5) {
+            if report_quality {
                 let ms = |d: Duration| d.as_secs_f64() * 1000.0;
                 self.params.diagnostics.event("INFERENCE", &format!("voice={} silent={} inference_ms={:.2} embedder_ms={:.2} f0_ms={:.2} rvc_ms={:.2} smoothing_ms={:.2} model_output_samples={} content_delay_samples={:?} {}", self.params.selected_voice(), stats.silent, ms(stats.inference_time), ms(stats.embedder_time), ms(stats.pitch_time), ms(stats.rvc_time), ms(stats.smoothing_time), stats.model_output_samples, stats.content_delay_samples, self.params.diagnostics.counters()));
                 let peak = chunk_out.iter().fold(0.0_f32, |a, x| a.max(x.abs()));
@@ -1903,6 +1897,7 @@ impl ModelLoader {
         );
         pipeline.set_formant_shift(profile.formant_shift)?;
         pipeline.set_peak_protection(true);
+        pipeline.set_silent_context_suppression(true);
         let inner = self.chunk_converter(pipeline, config.smoothing_kind(), hop, &config);
         self.params.diagnostics.event(
             "VOICE_LOAD_DONE",
