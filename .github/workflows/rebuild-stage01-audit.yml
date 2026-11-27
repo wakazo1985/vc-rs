@@ -15,7 +15,7 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
-          import io, json, struct, zipfile, urllib.request, re, pickletools, zlib
+          import io, json, struct, zipfile, urllib.request, re, pickletools, zlib, collections, math, pickle
           from urllib.parse import quote
           def get(url, start=None, end=None):
               headers = {"User-Agent":"RVC-stage01-metadata-audit/1.0","Accept-Encoding":"identity"}
@@ -42,31 +42,41 @@ jobs:
                   if len(data)!=n: raise ValueError("invalid range response")
                   self.pos+=n; self.transferred+=n
                   return data
+          class MetadataOnly(pickle.Unpickler):
+              def find_class(self,module,name):
+                  if (module,name)==("collections","OrderedDict"): return collections.OrderedDict
+                  if module=="torch" and name in ("HalfStorage","FloatStorage","DoubleStorage","LongStorage","IntStorage","BoolStorage","ByteStorage","BFloat16Storage","ShortStorage","CharStorage"): return name
+                  if module=="torch._utils" and name in ("_rebuild_tensor","_rebuild_tensor_v2","_rebuild_tensor_v3"):
+                      return lambda storage,offset,size,stride,*args: {"shape":list(size),"stride":list(stride),"storage":storage,"offset":offset}
+                  if module=="torch._utils" and name in ("_rebuild_parameter","_rebuild_parameter_with_state"): return lambda data,*args:data
+                  raise ValueError("Unrecognized pickle global "+module+"."+name)
+              def persistent_load(self,pid):
+                  if not isinstance(pid,tuple) or len(pid)<5 or pid[0]!="storage": raise ValueError("Unsupported persistent id")
+                  return {"dtype":pid[1],"storage_id":pid[2],"device":pid[3],"size":pid[4]}
           def pth_meta(f):
               head=f.read(30)
-              if head[:4]!=b"PK\x03\x04":
-                  print("PTH non-ZIP or legacy format; no unsafe unpickle")
-                  return
+              if head[:4]!=b"PK\x03\x04": raise ValueError("Non ZIP checkpoint")
               sig,ver,flag,comp,mt,md,crc,cs,us,nl,xl=struct.unpack("<4s5H3I2H",head)
               name=f.read(nl).decode("utf-8","replace"); f.read(xl)
-              if not name.endswith("data.pkl"):
-                  print("first checkpoint record",name,"metadata not decoded")
-                  return
+              if not name.endswith("data.pkl"): raise ValueError("Unexpected checkpoint record "+name)
               if comp==0: buf=f.read(min(cs or 1048576,1048576))
               elif comp==8: buf=zlib.decompressobj(-15).decompress(f.read(min(cs or 1048576,1048576)),1048576)
-              else: print("unsupported compression",comp); return
-              ops=[]
-              try:
-                  for op,arg,pos in pickletools.genops(buf):
-                      ops.append((op.name,arg))
-              except Exception as e: print("partial pickle inspection",str(e))
-              for i,(op,arg) in enumerate(ops):
-                  if isinstance(arg,str) and arg in ("config","version","f0","sr","info","embedder_name","model_name"):
-                      print("PTH field tokens",arg,repr(ops[i+1:i+35 if arg=="config" else i+5])[:1800])
+              else: raise ValueError("Unsupported compression")
+              # Only allow inert tensor descriptors, never instantiate torch modules or load storage.
+              data=MetadataOnly(io.BytesIO(buf)).load()
+              w=data.get("weight",{})
+              meta={k:v for k,v in data.items() if k!="weight"}
+              print("FULL_META",json.dumps(meta,ensure_ascii=False,default=str))
+              print("TENSOR_COUNT",len(w),"PARAM_COUNT",sum(math.prod(v["shape"]) for v in w.values() if isinstance(v,dict) and "shape" in v))
+              print("TENSOR_GROUPS",json.dumps(dict(collections.Counter(k.split(".")[0] for k in w))))
+              print("KEY_SHAPES",json.dumps({k:v for k,v in w.items() if k in ("emb_g.weight","enc_p.emb_phone.weight","enc_p.emb_pitch.weight","dec.conv_pre.weight","dec.conv_pre.weight_v","dec.conv_post.weight","dec.m_source.l_linear.weight") or re.search(r"^dec\\.ups\\.\\d+\\.(weight_v|weight|parametrizations.weight.original1)$",k)},default=str))
+              print("DECODER_KEYS",json.dumps([k for k in w if k.startswith("dec.")][:30]))
           def inspect_index(f):
-              head=f.read(24)
-              if len(head)>=16:
-                  print("INDEX raw header",head.hex(),"magic",repr(head[:4]),"d_candidate",struct.unpack_from("<i",head,4)[0],"ntotal_candidate",struct.unpack_from("<q",head,8)[0])
+              h=f.read(57)
+              magic,d,n,dummy1,dummy2,trained,metric=struct.unpack_from("<4siqqq?i",h)
+              if magic!=b"IwFl" or metric not in (0,1): raise ValueError("Unsupported header")
+              nlist,nprobe,quantizer=struct.unpack_from("<QQ4s",h,37)
+              print("INDEX_META",json.dumps({"type":"IndexIVFFlat","dimension":d,"vectors":n,"trained":trained,"metric":("inner_product","squared_L2")[metric],"nlist":nlist,"nprobe":nprobe,"quantizer_magic":quantizer.decode(),"bytes_per_vector":4*d+8}))
           sources=[
               ("toddler","https://huggingface.co/VofVoices/maxwell-young-fantastic-max-RVC-v2/resolve/main/"+quote("maxwellyoung(FantasticMax).zip"),160446052),
               ("girl","https://amitaro.net/download/others/rvc_amitaro_runrun_1.0.zip",365440882),
@@ -83,14 +93,14 @@ jobs:
                       for item in z.infolist():
                           ext=item.filename.lower().rsplit(".",1)[-1]
                           if ext in ("txt","md","json") and item.file_size<=65536:
-                              with z.open(item) as f: print("TEXT (bounded)",repr(f.read(65536).decode("utf-8","replace"))[:8000])
+                              with z.open(item) as f: print("README_PRESENT",item.filename,item.file_size)
                           elif ext=="pth":
                               with z.open(item) as f: pth_meta(f)
                           elif ext=="index":
                               with z.open(item) as f: inspect_index(f)
                   print("range bytes read",r.transferred)
               except Exception as e: print("FAILED",name,type(e).__name__,str(e))
-          for folder in ("D","man-D"):
+          for folder in ("D",):
               url="https://huggingface.co/api/models/ttttdiva/rvc_okiba/tree/main/models/"+folder
               print("\nMALE CANDIDATE",folder)
               try:
