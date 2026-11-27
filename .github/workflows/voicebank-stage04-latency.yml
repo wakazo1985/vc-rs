@@ -4,6 +4,8 @@ on:
   push:
     paths:
       - '.github/workflows/voicebank-stage04-latency.yml'
+      - 'crates/vc-vst3/src/runtime.rs'
+      - 'crates/vc-vst3/src/lib.rs'
 permissions:
   contents: read
 env:

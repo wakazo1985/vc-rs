@@ -9,7 +9,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle, Thread};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nice_plug::prelude::{util, ProcessMode};
 use rtrb::{Consumer, Producer, RingBuffer};
