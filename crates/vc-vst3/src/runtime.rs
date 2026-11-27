@@ -2060,6 +2060,7 @@ mod tests {
         value: f32,
         seen: Arc<Mutex<Vec<f32>>>,
         primes: Arc<AtomicUsize>,
+        first_output_gate: Option<Receiver<()>>,
     }
     impl WorkerConversion for SwitchMock {
         fn profile_hop(&self) -> Option<usize> { Some(self.hop) }
@@ -2074,6 +2075,12 @@ mod tests {
         fn process(&mut self, input: &[f32], _: u32, out: &mut Vec<f32>) -> anyhow::Result<ChunkStats> {
             assert_eq!(input.len(), self.hop);
             self.seen.lock().unwrap().extend_from_slice(input);
+            // A zero-cost mock can finish inside the callback that submitted
+            // its input. Hold only this first result until that callback exits,
+            // so the test actually exercises queued old-voice output.
+            if let Some(gate)=self.first_output_gate.take() {
+                gate.recv_timeout(Duration::from_secs(5))?;
+            }
             out.clear(); out.resize(self.hop,self.value);
             Ok(ChunkStats::default())
         }
@@ -2087,15 +2094,20 @@ mod tests {
         let hop=800;
         let seen=Arc::new(Mutex::new(Vec::new()));
         let primes=Arc::new(AtomicUsize::new(0));
+        let (release_first,first_gate)=mpsc::channel();
+        let mut first_gate=Some(first_gate);
         let slots: [Option<Box<dyn WorkerConversion>>;4]=std::array::from_fn(|i| {
-            Some(Box::new(SwitchMock{hop,value:0.2+i as f32*0.1,seen:seen.clone(),primes:primes.clone()}) as Box<dyn WorkerConversion>)
+            Some(Box::new(SwitchMock{hop,value:0.2+i as f32*0.1,seen:seen.clone(),primes:primes.clone(),first_output_gate:if i==0 {first_gate.take()}else{None}}) as Box<dyn WorkerConversion>)
         });
         let bank=VoiceBank::new(slots,0).unwrap();
         let mut runtime=PluginRuntime::start_inner(
             params.clone(),Arc::new(AtomicBool::new(false)),Arc::new(AtomicBool::new(false)),Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(PluginStatus::new("test"))),&Arc::new(ReloadWaker::default()),RATE,hop,ProcessMode::Realtime,None,Some(Box::new(bank)));
         wait_for(||runtime.converter_ready() && runtime.state.ready_generation.load(Ordering::Acquire)==1 && params.active_voice.load(Ordering::Acquire)==1);
-        runtime.process_block(&mut [&mut vec![0.2;hop]]);
+        let mut initial=vec![0.2;hop];
+        runtime.process_block(&mut [&mut initial]);
+        release_first.send(()).unwrap();
+        assert!(initial.iter().all(|v| *v==0.0));
         wait_for(||runtime.output_consumer.slots()>=hop);
         let mut half=vec![0.4;hop/2];
         runtime.process_block(&mut [&mut half]);
