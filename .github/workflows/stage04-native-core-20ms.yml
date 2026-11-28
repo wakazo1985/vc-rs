@@ -207,7 +207,7 @@ jobs:
            const at::Tensor& W(const std::string& k)const{return w.at(k);}
            at::Tensor conv(const at::Tensor& x,const std::string& k,bool pad=false)const{
             auto a=W(k+".weight");auto n=a.size(2);
-            return at::conv1d(pad?at::constant_pad_nd(x,{(n-1)/2,n/2},0):x,a,W(k+".bias"),{1},{0},{1},1);
+            return at::conv1d(pad?at::constant_pad_nd(x,{(n-1)/2,n/2},0):x,a,W(k+".bias"),at::IntArrayRef{1},at::IntArrayRef{0},at::IntArrayRef{1},1);
            }
            at::Tensor norm(const at::Tensor& x,const std::string& k)const{
             return at::layer_norm(x.transpose(1,2),{hidden},W(k+".gamma"),W(k+".beta"),1e-5,true).transpose(1,2);
@@ -305,20 +305,26 @@ jobs:
             }
             std::cout<<"MODEL "<<p.name<<" exact_tensor_hashes="<<count<<" tensors="<<count<<" elements="<<elements<<" index_count="<<index->ntotal<<" preload_ms="<<ms(start)<<std::endl;
            }
-           // Original RVC k=8, inverse squared distance blend; no active index lookup at rate zero.
-           std::vector<float> mix(const std::vector<float>& x,float rate,float protect,bool voiced)const{
-            if(rate==0.f) return x;
-            require(x.size()==size_t(index->d),"feature dimension");
-            std::array<float,8> d{};std::array<faiss::idx_t,8> ids{};
-            index->search(1,x.data(),8,d.data(),ids.data());
-            double total=0;std::array<double,8> w{};
-            for(int i=0;i<8;++i){require(ids[i]>=0 && std::isfinite(d[i]) && d[i]>0,"invalid or exact-zero distance");w[i]=1.0/(double(d[i])*d[i]);total+=w[i];}
+           // Caller supplies preallocated output. Retrieval at 50 Hz, then Protect at 100 Hz.
+           void mix(const float* x,float* out,float rate)const{
+            if(rate==0.f){std::copy_n(x,768,out);return;}
             require(!index_vectors.empty(),"index vectors not preloaded");
-            std::vector<float> out(x.size(),0);
-            for(int i=0;i<8;++i){require(ids[i]<index->ntotal,"index ID out of range");for(size_t j=0;j<x.size();++j)out[j]+=float(w[i]/total)*index_vectors[size_t(ids[i])*x.size()+j];}
-            const float a=voiced?1.f:protect;
-            for(size_t j=0;j<x.size();++j)out[j]=(out[j]*rate+x[j]*(1-rate))*a+x[j]*(1-a);
-            return out;
+            std::array<float,8> d{};std::array<faiss::idx_t,8> ids{};
+            index->search(1,x,8,d.data(),ids.data());
+            int zeros=0;
+            for(int i=0;i<8;++i){require(ids[i]>=0 && ids[i]<index->ntotal && std::isfinite(d[i]) && d[i]>=0,"invalid index distance");if(d[i]==0)++zeros;}
+            double total=0;std::array<double,8> w{};
+            for(int i=0;i<8;++i){w[i]=zeros?(d[i]==0?1.0:0.0):1.0/(double(d[i])*d[i]);total+=w[i];}
+            for(int j=0;j<768;++j){
+             double sum=0;for(int i=0;i<8;++i)sum+=(w[i]/total)*index_vectors[size_t(ids[i])*768+j];
+             out[j]=float(sum)*rate+x[j]*(1-rate);
+            }
+           }
+           void protect_upsampled(const float* original,const float* retrieved,const float* pitchf,size_t frames,float* out)const{
+            for(size_t t=0;t<frames;++t){
+             const float a=preset->protect<0.5f && pitchf[t]<1.f?preset->protect:1.f;
+             for(int j=0;j<768;++j){size_t k=(t/2)*768+j;out[t*768+j]=retrieved[k]*a+original[k]*(1-a);}
+            }
            }
           };
           int main(){
@@ -334,7 +340,9 @@ jobs:
             std::cout<<"SELECTION_ONLY max_ms="<<worst<<" not_audio_latency=1"<<std::endl;
             for(auto* m:{&f8,&f9}){
              std::vector<float> q(768,0.013f);
-             require(m->mix(q,0,m->preset->protect,true)==q,"index bypass failed");
+             std::vector<float> out(768);
+             m->mix(q.data(),out.data(),0);
+             require(out==q,"index bypass failed");
              // Nonzero-index algorithm is NOT adopted for F8/F9. Actual F6/F7 indexes not available to this public runner.
              std::cout<<"INDEX_BYPASS "<<m->preset->name<<" pass"<<std::endl;
             }
