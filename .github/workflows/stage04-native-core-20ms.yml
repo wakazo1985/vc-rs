@@ -69,24 +69,32 @@ jobs:
           frozen=pathlib.Path("frozen/VoiceBank_03_Presets.json")
           config=json.loads(frozen.read_text())
           cases=[
+              ("F6","VofVoices/maxwell-young-fantastic-max-RVC-v2","model","main","maxwellyoung(FantasticMax).zip","01805b226446741e8b077d102255bd55c7b85caa976f1fc7030033880649708d","be2f20b934aa3609938342cc594580789353cf5e481b5a4c3f3a153087b7189c"),
               ("F8","Rokkonrol/RVC_models","dataset","c4bdb3bb7aef5f7d213f79f57decea9e644fd4d5","Russell Archey [Explore With Us (EWU)].zip","88ba827fe6023d102d6d84a7bc26e1e181b40bb47977ccae1c378b320b3c1582","df8f49d094e57b0abe726d8650de5d865546bce4d893ec59841c51ee0777a08b"),
               ("F9","rayzox57/Joyca_High_RVC","model","035dff8fce32b4efda3e9c25e045e73ac5819812","Joyca_High_Voice_v2_600e.zip","4924376afcc16f3a8c109822239fdc5ce73c0e2459bb9fc71e55564aae0e0c99","d0ea3825eeebaef3531a8eb928ab001908ab7147499f818cfac820bd35074d86")
           ]
           for name,repo,kind,rev,filename,archive_hash,pth_hash in cases:
               p=next(x for x in config["presets"].values() if x["shortcut"]==name)
               fingerprint=p["rvc"]["stage02_model_fingerprint"]
-              assert p["rvc"]["parameters"]["index_rate"]==0
               path=hf_hub_download(repo,filename,repo_type=kind,revision=rev)
               with open(path,"rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()==archive_hash
               with zipfile.ZipFile(path) as z:
                   for ext in (".pth",".index"):
-                      members=[n for n in z.namelist() if n.endswith(ext) and (ext==".pth" or pathlib.PurePosixPath(n).name.startswith("added_"))]
+                      members=[n for n in z.namelist() if n.endswith(ext) and (ext==".pth" or name=="F6" or pathlib.PurePosixPath(n).name.startswith("added_"))]
                       assert len(members)==1
                       target=pathlib.Path(name+ext)
                       with z.open(members[0]) as src,target.open("wb") as dst: shutil.copyfileobj(src,dst)
                       with target.open("rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()==fingerprint[ext[1:]+"_sha256"]
                       print("ORIGINAL_HASH_PASS",name,ext,flush=True)
-              import torch
+          for ext in (".pth",".index"):
+              src=hf_hub_download("John6666/mikuTTS","weights/D/D"+ext,repo_type="space",revision="28d67856b353a962e4916523ba94154e88c3fad6")
+              target=pathlib.Path("F7"+ext)
+              shutil.copyfile(src,target)
+              fp=next(x for x in config["presets"].values() if x["shortcut"]=="F7")["rvc"]["stage02_model_fingerprint"]
+              with target.open("rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()==fp[ext[1:]+"_sha256"]
+              print("ORIGINAL_HASH_PASS","F7",ext,flush=True)
+          import torch
+          for name in ("F6","F7","F8","F9"):
               ckpt=torch.load(name+'.pth',map_location='cpu',weights_only=True)
               with open(name+'.golden.tsv','w') as manifest:
                   for key,t in ckpt['weight'].items():
@@ -104,7 +112,7 @@ jobs:
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git upstream
           git -C upstream checkout 81eed5e8f68b6bed1789f682fe78cdd324495afc
-          python -m pip install scipy==1.14.1 librosa==0.10.2.post1 transformers==4.49.0
+          python -m pip install scipy==1.14.1 librosa==0.10.2.post1 transformers==4.49.0 faiss-cpu==1.10.0
           PYTHONPATH="$PWD/upstream" python - <<'PY'
           import torch
           from infer.module.models import TextEncoder, ResidualCouplingBlock, GeneratorNSF
@@ -112,7 +120,7 @@ jobs:
           import math
           torch.set_num_threads(2)
           with torch.inference_mode():
-              for name in ("F8","F9"):
+              for name in ("F6","F7","F8","F9"):
                   ck=torch.load(name+".pth",map_location="cpu",weights_only=True)
                   cfg=ck["config"]
                   enc=TextEncoder(768,*cfg[2:8],float(cfg[8]),True).eval()
@@ -189,26 +197,64 @@ jobs:
                   y=extract_hubert_features(model,x,v)
                   y.float().contiguous().numpy().tofile("hubert."+v+".f32")
                   print("HUBERT_REFERENCE",v,list(y.shape),flush=True)
+          from huggingface_hub import hf_hub_download
+          from infer.hubert import HubertModelWithFinalProj
+          d=pathlib.Path("applio-contentvec");d.mkdir(exist_ok=True)
+          for file in ("config.json","pytorch_model.bin"):
+              p=hf_hub_download("IAHispano/Applio","Resources/embedders/contentvec/"+file,revision="af1e177")
+              shutil.copyfile(p,d/file)
+          with (d/"pytorch_model.bin").open("rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()=="d8dd400e054ddf4e6be75dab5a2549db748cc99e756a097c496c099f65a4854e"
+          shutil.copyfile(d/"pytorch_model.bin","applio_contentvec.bin")
+          model=HubertModelWithFinalProj.from_pretrained(d,local_files_only=True).eval()
+          with torch.inference_mode():
+              y=model(x).last_hidden_state
+              y.float().contiguous().numpy().tofile("applio.hubert.v2.f32")
           PY
       - name: Generate end-to-end neural reference with same unchanged source and model
         run: |
           PYTHONPATH="$PWD/upstream" python - <<'PY'
-          import torch,numpy as np,math
+          import torch,numpy as np,math,faiss,json,librosa
           from infer.module.models import TextEncoder,ResidualCouplingBlock,GeneratorNSF
           from unittest.mock import patch
+          from infer.rmvpe import RMVPE
           torch.set_num_threads(2)
           feats=torch.from_numpy(np.fromfile("hubert.v2.f32",dtype=np.float32)).reshape(1,-1,768)
           f0=np.fromfile("rmvpe.f0.f32",dtype=np.float32)
           voiced=f0>0
           if voiced.any(): f0[~voiced]=np.interp(np.flatnonzero(~voiced),np.flatnonzero(voiced),f0[voiced])
-          phone=feats.repeat_interleave(2,dim=1)
-          t=min(phone.shape[1],len(f0),5120//160)
-          phone=phone[:,:t]
-          for name,pitch in [("F8",-12),("F9",-16)]:
+          x=np.fromfile("rmvpe.input.f32",dtype=np.float32)
+          original_f0=np.fromfile("rmvpe.f0.f32",dtype=np.float32)
+          scaled=x.copy();q=np.quantile(np.abs(scaled),0.999)
+          if q>0: scaled/=q
+          f6_f0=RMVPE("rmvpe.pt",False,"cpu").infer_from_audio(scaled,thred=0.03)
+          for name in ("F6","F7","F8","F9"):
               ck=torch.load(name+".pth",map_location="cpu",weights_only=True);cfg=ck["config"]
               import json
               params=next(p["rvc"]["parameters"] for p in json.load(open("frozen/VoiceBank_03_Presets.json"))["presets"].values() if p["shortcut"]==name)
-              assert params["pitch_shift_semitones"]==pitch and params["index_rate"]==0
+              pitch=params["pitch_shift_semitones"];rate=params["index_rate"]
+              input_feats=torch.from_numpy(np.fromfile("applio.hubert.v2.f32",dtype=np.float32)).reshape(1,-1,768) if name=="F6" else feats
+              orig=input_feats.clone()
+              if rate:
+                  index=faiss.read_index(name+".index")
+                  vec=index.reconstruct_n(0,index.ntotal)
+                  score,ix=index.search(input_feats[0].numpy(),8)
+                  assert (ix>=0).all() and np.isfinite(score).all()
+                  zero=score==0
+                  weight=np.where(zero.any(axis=1,keepdims=True),zero.astype(np.float64),1/np.maximum(score.astype(np.float64),1e-30)**2)
+                  weight/=weight.sum(axis=1,keepdims=True)
+                  retrieved=np.sum(vec[ix]*weight[:,:,None],axis=1).astype(np.float32)
+                  input_feats=torch.from_numpy(retrieved).unsqueeze(0)*rate+input_feats*(1-rate)
+                  input_feats.contiguous().numpy().tofile(name+".retrieved.f32")
+              fine=f6_f0 if name=="F6" else f0
+              t=min(input_feats.shape[1]*2,len(fine),len(x)//160)
+              phone=input_feats.repeat_interleave(2,dim=1)[:,:t]
+              original=orig.repeat_interleave(2,dim=1)[:,:t]
+              pf=torch.from_numpy(fine[:t].copy()).float().reshape(1,t)*2**(pitch/12)
+              if params["protect"]<0.5 and rate:
+                  a=torch.where(pf<1,params["protect"],1.).unsqueeze(-1)
+                  phone=phone*a+original*(1-a)
+              phone.contiguous().numpy().tofile(name+".phone.f32")
+              pf.contiguous().numpy().tofile(name+".pitchf.f32")
               enc=TextEncoder(768,*cfg[2:8],float(cfg[8]),True).eval()
               flow=ResidualCouplingBlock(cfg[2],cfg[3],5,1,3,gin_channels=cfg[16]).eval()
               sr=cfg[-1] if isinstance(cfg[-1],int) else int(cfg[-1].rstrip("k"))*1000
@@ -217,7 +263,6 @@ jobs:
                   model.load_state_dict({k[len(prefix):]:v for k,v in ck["weight"].items() if k.startswith(prefix)},strict=True)
               flow.remove_weight_norm();gen.remove_weight_norm()
               with torch.inference_mode():
-                  pf=torch.from_numpy(f0[:t].copy()).reshape(1,t)*2**(pitch/12)
                   m=1127*torch.log1p(pf/700)
                   a=1127*math.log(1+50/700);b=1127*math.log(1+1100/700)
                   coarse=torch.where(m>0,(m-a)*254/(b-a)+1,m).clamp(1,255).round().long()
@@ -228,6 +273,12 @@ jobs:
                   with patch("torch.randn_like",return_value=exc):
                       y=gen(z,pf,g=ck["weight"]["emb_g.weight"][0].float().reshape(1,-1,1))
                   y.contiguous().numpy().tofile(name+".pipeline.f32")
+                  if name=="F7":
+                      a=librosa.feature.rms(y=x,frame_length=16000,hop_length=8000)
+                      b=librosa.feature.rms(y=y.reshape(-1).numpy(),frame_length=sr,hop_length=sr//2)
+                      a=torch.nn.functional.interpolate(torch.from_numpy(a).unsqueeze(0),size=y.numel(),mode="linear",align_corners=False)
+                      b=torch.nn.functional.interpolate(torch.from_numpy(b).unsqueeze(0),size=y.numel(),mode="linear",align_corners=False).clamp_min(1e-6)
+                      (y*a.pow(0.75)*b.pow(-0.75)).contiguous().numpy().tofile(name+".rms.f32")
                   print("REFERENCE_PIPELINE",name,t,sr,y.shape,flush=True)
           PY
       - name: Build native model bank and index path
@@ -673,14 +724,22 @@ jobs:
             return at::where(voiced,f,interp);
            }
            void move_to(const at::Device& dev){for(auto* p:{&enc.w,&flow.w,&gen.w})for(auto& kv:*p)kv.second=kv.second.to(dev);}
-           at::Tensor synthesize(const at::Tensor& features,const at::Tensor& f0,int64_t input_len,bool deterministic,int64_t tail_frames=0)const{
-            require(preset.index==0.f,"nonzero index path not yet integrated");
+           at::Tensor synthesize(const at::Tensor& features,const at::Tensor& f0,int64_t input_len,bool deterministic,int64_t tail_frames=0,at::Tensor retrieved={})const{
+            require(preset.index==0.f||retrieved.defined(),"nonzero index needs retrieved features");
             auto base=tail_frames>0?at::cat({features,features.slice(1,features.size(1)-1,features.size(1))},1):features;
             auto phone=base.repeat_interleave(2,1);
             auto t=std::min({phone.size(1),f0.numel(),input_len/160});
             require(t>0,"insufficient frames");
             phone=phone.slice(1,0,t);
-            auto pf=interpolate_f0(f0).slice(0,0,t).reshape({1,t})*std::pow(2.,preset.pitch/12.);
+            auto pf=(std::string(preset.name)=="F6"?f0:interpolate_f0(f0)).slice(0,0,t).reshape({1,t})*std::pow(2.,preset.pitch/12.);
+            if(retrieved.defined()){
+             auto r=tail_frames>0?at::cat({retrieved,retrieved.slice(1,retrieved.size(1)-1,retrieved.size(1))},1):retrieved;
+             r=r.repeat_interleave(2,1).slice(1,0,t);
+             if(preset.protect<0.5f){
+              auto a=at::where(pf.lt(1),at::full_like(pf,preset.protect),at::ones_like(pf)).unsqueeze(-1);
+              phone=r*a+phone*(1-a);
+             }else phone=r;
+            }
             auto m=1127*at::log1p(pf/700);
             double lo=1127*std::log(1+50./700),hi=1127*std::log(1+1100./700);
             auto coarse=at::where(m.gt(0),(m-lo)*254/(hi-lo)+1,m).clamp(1,255).round().to(at::kLong);
@@ -821,10 +880,57 @@ jobs:
             }
            }
           };
+          at::Tensor retrieve_features(const Model& m,const at::Tensor& h){
+           if(m.preset->index==0.f)return h;
+           auto cpu=h.to(at::kCPU).contiguous();auto result=at::empty_like(cpu);
+           for(int64_t i=0;i<cpu.size(1);++i)m.mix(cpu.data_ptr<float>()+i*768,result.data_ptr<float>()+i*768,m.preset->index);
+           return result.to(h.device());
+          }
+          at::Tensor rms_adjust(const at::Tensor& x,const at::Tensor& y,int64_t sr,float rate){
+           if(rate==1.f)return y;
+           auto rms=[](const at::Tensor& x,int64_t sr){
+            return at::constant_pad_nd(x.reshape({1,1,-1}),{sr/2,sr/2},0).unfold(-1,sr,sr/2).square().mean(-1).sqrt();
+           };
+           auto a=at::upsample_linear1d(rms(x,16000),{y.numel()},false,std::nullopt);
+           auto b=at::upsample_linear1d(rms(y,sr),{y.numel()},false,std::nullopt).clamp_min(1e-6);
+           return y*a.pow(1-rate)*b.pow(rate-1);
+          }
+          void verify_indexed_pipeline(const Model& f6,const Model& f7){
+           at::NoGradGuard guard;NativeHubert hubert("hubert.bin"),applio("applio_contentvec.bin");NativeRMVPE rmvpe("rmvpe.pt");
+           auto x=fixture("rmvpe.input.f32",{1,5120});
+           for(auto* m:{&f6,&f7}){
+            auto h=std::string(m->preset->name)=="F6"?applio.forward(x):hubert.forward(x);
+            auto a=x.abs().flatten().sort();auto sorted=std::get<0>(a);double qpos=(sorted.numel()-1)*0.999;auto lo=int64_t(std::floor(qpos));auto frac=qpos-lo;
+            auto q=sorted[lo]*(1-frac)+sorted[std::min(lo+1,sorted.numel()-1)]*frac;
+            auto px=std::string(m->preset->name)=="F6"?x/q.clamp_min(1e-12):x;
+            auto f=rmvpe.decode(rmvpe.hidden(rmvpe.mel(px)));
+            auto retrieved=retrieve_features(*m,h);
+            auto name=std::string(m->preset->name);
+            auto ref=fixture(name+".retrieved.f32",retrieved.sizes());
+            auto err=(retrieved-ref).abs().max().item<float>();
+            require(at::allclose(retrieved,ref,2e-3,2e-3),"original INDEX output mismatch");
+            std::cout<<"INDEX_PARITY "<<name<<" max_abs_error="<<err<<std::endl;
+            NeuralPipeline p(m->checkpoint.toGenericDict(),*m->preset);
+            auto start=Clock::now();auto y=p.synthesize(h,f,x.size(-1),true,0,retrieved);auto elapsed=ms(start);
+            auto expected=fixture(name+".pipeline.f32",y.sizes());
+            auto e=(y-expected).abs().max().item<float>();
+            std::cout<<"INDEXED_PIPELINE "<<name<<" sr="<<p.gen.sr<<" max_abs_error="<<e<<" cpu_synth_ms="<<elapsed<<std::endl;
+            require(at::allclose(y,expected,2e-3,2e-3),"indexed neural fixture mismatch");
+            if(m->preset->rms!=1.f){
+             auto out=rms_adjust(x,y,p.gen.sr,m->preset->rms);
+             auto expected_rms=fixture(name+".rms.f32",out.sizes());
+             std::cout<<"RMS_PARITY "<<name<<" max_abs_error="<<(out-expected_rms).abs().max().item<float>()<<std::endl;
+             require(at::allclose(out,expected_rms,2e-3,2e-3),"RMS reference mismatch");
+            }
+           }
+          }
           int main(int argc,char** argv){
            try{
             // Load both public original checkpoints once; no reloading on selection.
-            Model f8(presets[2]),f9(presets[3]);
+            Model f6(presets[0]),f7(presets[1]),f8(presets[2]),f9(presets[3]);
+            verify_encoder(f6.checkpoint.toGenericDict(),"F6");verify_encoder(f7.checkpoint.toGenericDict(),"F7");
+            verify_flow(f6.checkpoint.toGenericDict(),"F6");verify_flow(f7.checkpoint.toGenericDict(),"F7");
+            verify_generator(f6.checkpoint.toGenericDict(),"F6");verify_generator(f7.checkpoint.toGenericDict(),"F7");
             verify_encoder(f8.checkpoint.toGenericDict(),"F8");
             verify_encoder(f9.checkpoint.toGenericDict(),"F9");
             verify_flow(f8.checkpoint.toGenericDict(),"F8");
@@ -834,6 +940,7 @@ jobs:
             verify_rmvpe();
             verify_hubert();
             verify_pipeline(f8.checkpoint.toGenericDict(),f9.checkpoint.toGenericDict());
+            verify_indexed_pipeline(f6,f7);
             if(argc>1 && std::string(argv[1])=="--gpu-test"){
           #ifdef VOICEBANK_CUDA
              benchmark_gpu(f8.checkpoint.toGenericDict(),f9.checkpoint.toGenericDict());
@@ -841,10 +948,11 @@ jobs:
              throw std::runtime_error("CUDA build required");
           #endif
             }
-            std::atomic<const Model*> selected{&f8};
+            std::array<const Model*,4> bank{&f6,&f7,&f8,&f9};
+            std::atomic<const Model*> selected{&f6};
             require(selected.is_lock_free(),"pointer atomics not lock free");
             double worst=0;
-            for(int i=0;i<10000;++i){auto t=Clock::now();selected.store(i%2?&f8:&f9,std::memory_order_release);auto p=selected.load(std::memory_order_acquire);require(p!=nullptr,"selection");worst=std::max(worst,ms(t));}
+            for(int i=0;i<10000;++i){auto t=Clock::now();selected.store(bank[i%4],std::memory_order_release);auto p=selected.load(std::memory_order_acquire);require(p!=nullptr,"selection");worst=std::max(worst,ms(t));}
             std::cout<<"SELECTION_ONLY max_ms="<<worst<<" not_audio_latency=1"<<std::endl;
             for(auto* m:{&f8,&f9}){
              std::vector<float> q(768,0.013f);
@@ -884,7 +992,7 @@ jobs:
             "model_conversion":false,
             "python_resident":false,
             "acceptance":{"all_four_presets":true,"no_underruns":true,"no_dropped_blocks":true,"max_measured_total_latency_ms":20,"audio_quality_reference_check":true},
-            "native_scope":"F8/F9 original checkpoints, index, selection and official TextEncoder, reverse Flow, GeneratorNSF, RMVPE, HuBERT and F8/F9 fixed-input neural pipeline parity only",
+            "native_scope":"Four originals, indexed F6/F7 fixed-input parity, F8/F9 fixed-input neural parity; F6 Applio source waveform parity separate; GPU benchmark F8/F9 only",
             "gpu_measured":false,
             "audio_latency_measured":false,
             "overall":"NOT_PASSED"
