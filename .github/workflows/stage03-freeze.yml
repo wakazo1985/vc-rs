@@ -1,0 +1,70 @@
+name: Stage 03 freeze selected RVC presets
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/stage03-freeze.yml'
+  push:
+    branches: [stage01-python-verification]
+    paths:
+      - '.github/workflows/stage03-freeze.yml'
+permissions:
+  actions: read
+  contents: read
+jobs:
+  freeze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: VoiceBank-Stage02-WAV
+          path: input
+          github-token: ${{ github.token }}
+          run-id: '46132772286'
+      - name: Freeze chosen samples without regeneration
+        run: |
+          python -u - <<'PY'
+          import json, pathlib, hashlib, shutil, wave
+          root=pathlib.Path("stage03")
+          root.mkdir(exist_ok=True)
+          ref=root/"reference"
+          ref.mkdir(exist_ok=True)
+          config=json.loads(r'''{"project":"Wave Link VoiceBank","stage":3,"revision":"2026-11-28 revised F8 F9","purpose_ja":"工程04に引き継ぐ声別初期値と、その音の基準となるWAV。","presets":{"toddler":{"label_ja":"幼児","shortcut":"F6","processing_order":["rvc"],"rvc":{"engine":"Applio","model_format":"PyTorch","engine_commit":"b04a24baec709cbfac1e4bb9e960dde730906b62","model_name":"Maxwell Young (Fantastic Max)","source_files":["maxwellyoung(FantasticMax).zip"],"stage02_model_fingerprint":{"pth_sha256":"be2f20b934aa3609938342cc594580789353cf5e481b5a4c3f3a153087b7189c","index_sha256":"7c85797b306cae78043a0fa1c6280f1af9fd11f163fd746ccad76516705a4163"},"parameters":{"pitch_shift_semitones":20,"index_rate":0.75,"protect":0.5,"volume_envelope":1,"f0_method":"rmvpe","speaker_id":0}},"reference":{"file":"基準音声/F6_幼児_Maxwell.wav","wav_sha256":"31b72d5dbadab6840e9fa3a444ae663028aad75c1351ee4867b7b1fd830ae0a4","sample_rate_hz":48000,"samples":479040,"channels":1,"pcm_bits":16}},"girl":{"label_ja":"少女","shortcut":"F7","processing_order":["rvc"],"rvc":{"engine":"RVC WebUI","model_format":"PyTorch","engine_commit":"81eed5e8f68b6bed1789f682fe78cdd324495afc","model_name":"D","source_files":["D.pth","D.index"],"stage02_model_fingerprint":{"pth_sha256":"bc0191b5447a8a1e884198b9465db54fb4da91b07f25a684d43f39688a6c8343","index_sha256":"a7912aa4f47471a3d133425416dcb157541f5b68473644589be7f5207ba12cbd"},"parameters":{"pitch_shift_semitones":15,"index_rate":1,"protect":0.33,"rms_mix_rate":0.25,"f0_method":"rmvpe","speaker_id":0}},"reference":{"file":"基準音声/F7_少女_D.wav","wav_sha256":"4126141e1a3e72f24e6d824bf6cc7ebbe6f9b484f8faac4dc2631bf98e6710fb","sample_rate_hz":40000,"samples":399200,"channels":1,"pcm_bits":16}},"male_low":{"label_ja":"男性重低音","shortcut":"F8","processing_order":["rvc"],"rvc":{"engine":"RVC WebUI","model_format":"PyTorch","engine_commit":"81eed5e8f68b6bed1789f682fe78cdd324495afc","model_name":"Russell Archey","source_files":["Russell Archey [Explore With Us (EWU)].zip"],"source":{"repo":"Rokkonrol/RVC_models","repo_type":"dataset","revision":"c4bdb3bb7aef5f7d213f79f57decea9e644fd4d5","archive_sha256":"88ba827fe6023d102d6d84a7bc26e1e181b40bb47977ccae1c378b320b3c1582"},"stage02_model_fingerprint":{"pth_sha256":"df8f49d094e57b0abe726d8650de5d865546bce4d893ec59841c51ee0777a08b","index_sha256":"c5949511df6ae940dd1919c0fb2847e2a50aa2e40a64af6f047393ab42720112"},"parameters":{"pitch_shift_semitones":-12,"index_rate":0,"protect":0.33,"rms_mix_rate":1,"f0_method":"rmvpe","speaker_id":0}},"reference":{"file":"reference/F8_pitch-12_index0.00.wav","wav_sha256":null,"sample_rate_hz":48000,"source_input":"Original_synthetic_JP.wav","measurement":{"model":"F8","pitch":-12,"index_rate":0,"protect":0.33,"rms_mix_rate":1,"elapsed_s":40.97524132500001,"exit":0,"file":"F8_pitch-12_index0.00.wav","sr":48000,"duration":9.48,"peak":0.68829345703125,"rms":0.06790951669735602,"finite":true,"median_f0_hz":65.59540522187244,"status":"pass"}}},"robot":{"label_ja":"ロボット","shortcut":"F9","processing_order":["rvc"],"rvc":{"engine":"RVC WebUI","model_format":"PyTorch","engine_commit":"81eed5e8f68b6bed1789f682fe78cdd324495afc","model_name":"Joyca High","source_files":["Joyca_High_Voice_v2_600e.zip"],"source":{"repo":"rayzox57/Joyca_High_RVC","repo_type":"model","revision":"035dff8fce32b4efda3e9c25e045e73ac5819812","archive_sha256":"4924376afcc16f3a8c109822239fdc5ce73c0e2459bb9fc71e55564aae0e0c99"},"stage02_model_fingerprint":{"pth_sha256":"d0ea3825eeebaef3531a8eb928ab001908ab7147499f818cfac820bd35074d86","index_sha256":"7fec5ee43d97e4688895de25bc265e2d9429770329c2141f203fc82f52bc19ed"},"parameters":{"pitch_shift_semitones":-16,"index_rate":0,"protect":0.33,"rms_mix_rate":1,"f0_method":"rmvpe","speaker_id":0}},"reference":{"file":"reference/F9_pitch-16_index0.00.wav","wav_sha256":null,"sample_rate_hz":48000,"source_input":"Original_synthetic_JP.wav","measurement":{"model":"F9","pitch":-16,"index_rate":0,"protect":0.33,"rms_mix_rate":1,"elapsed_s":27.253535466000017,"exit":0,"file":"F9_pitch-16_index0.00.wav","sr":48000,"duration":9.48,"peak":0.74151611328125,"rms":0.08409952941171811,"finite":true,"median_f0_hz":33.370996354250856,"status":"pass"}}}},"reference_note":"F6/F7 use legacy recorded input; F8/F9 use Stage02 Japanese synthetic input. No claim of matched-input comparison.","legacy_reference_archive":"VoiceBank_03_Presets.zip","source_run_id":46132772286,"source_artifact_id":15258334429,"verification_file":"verification.json"}''')
+          old_presets=json.loads(r'''{"toddler":{"label_ja":"幼児","shortcut":"F6","processing_order":["rvc"],"rvc":{"engine":"Applio","model_format":"PyTorch","engine_commit":"b04a24baec709cbfac1e4bb9e960dde730906b62","model_name":"Maxwell Young (Fantastic Max)","source_files":["maxwellyoung(FantasticMax).zip"],"stage02_model_fingerprint":{"pth_sha256":"be2f20b934aa3609938342cc594580789353cf5e481b5a4c3f3a153087b7189c","index_sha256":"7c85797b306cae78043a0fa1c6280f1af9fd11f163fd746ccad76516705a4163"},"parameters":{"pitch_shift_semitones":20,"index_rate":0.75,"protect":0.5,"volume_envelope":1,"f0_method":"rmvpe","speaker_id":0}},"reference":{"file":"基準音声/F6_幼児_Maxwell.wav","wav_sha256":"31b72d5dbadab6840e9fa3a444ae663028aad75c1351ee4867b7b1fd830ae0a4","sample_rate_hz":48000,"samples":479040,"channels":1,"pcm_bits":16}},"girl":{"label_ja":"少女","shortcut":"F7","processing_order":["rvc"],"rvc":{"engine":"RVC WebUI","model_format":"PyTorch","engine_commit":"81eed5e8f68b6bed1789f682fe78cdd324495afc","model_name":"D","source_files":["D.pth","D.index"],"stage02_model_fingerprint":{"pth_sha256":"bc0191b5447a8a1e884198b9465db54fb4da91b07f25a684d43f39688a6c8343","index_sha256":"a7912aa4f47471a3d133425416dcb157541f5b68473644589be7f5207ba12cbd"},"parameters":{"pitch_shift_semitones":15,"index_rate":1,"protect":0.33,"rms_mix_rate":0.25,"f0_method":"rmvpe","speaker_id":0}},"reference":{"file":"基準音声/F7_少女_D.wav","wav_sha256":"4126141e1a3e72f24e6d824bf6cc7ebbe6f9b484f8faac4dc2631bf98e6710fb","sample_rate_hz":40000,"samples":399200,"channels":1,"pcm_bits":16}}}''')
+          assert all(config["presets"][k]==v for k,v in old_presets.items())
+          results=json.loads(pathlib.Path("input/results.json").read_text())
+          def find(name):
+              paths=list(pathlib.Path("input").rglob(name))
+              assert len(paths)==1, (name,paths)
+              return paths[0]
+          def digest(path): return hashlib.sha256(path.read_bytes()).hexdigest()
+          report={"legacy_presets_unchanged":True,"legacy_reference_audio_included":False,"new_samples":[]}
+          for key in ("male_low","robot"):
+              p=config["presets"][key]
+              r=p["reference"]
+              name=pathlib.Path(r["file"]).name
+              src=find(name)
+              dst=ref/name
+              shutil.copyfile(src,dst)
+              assert digest(src)==digest(dst)
+              row=next(x for x in results if x["file"]==name)
+              assert row["status"]=="pass" and row["index_rate"]==0 and row["pitch"]==p["rvc"]["parameters"]["pitch_shift_semitones"]
+              assert row==r["measurement"]
+              with wave.open(str(dst),"rb") as w:
+                  r.update(wav_sha256=digest(dst),sample_rate_hz=w.getframerate(),samples=w.getnframes(),channels=w.getnchannels(),pcm_bits=w.getsampwidth()*8)
+                  assert w.getframerate()==48000 and w.getnframes()>0
+              shutil.copyfile(find(src.stem+".log"),root/(src.stem+".log"))
+              report["new_samples"].append({"shortcut":p["shortcut"],"file":name,"sha256":r["wav_sha256"],"samples":r["samples"],"sample_rate":r["sample_rate_hz"],"median_f0_hz":row["median_f0_hz"]})
+          shutil.copyfile(find("Original_synthetic_JP.wav"),ref/"Original_synthetic_JP.wav")
+          report["synthetic_input_sha256"]=digest(ref/"Original_synthetic_JP.wav")
+          (root/"VoiceBank_03_Presets.json").write_text(json.dumps(config,ensure_ascii=False,indent=2),encoding="utf-8")
+          (root/"verification.json").write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding="utf-8")
+          print("STAGE03",json.dumps(report,ensure_ascii=False),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoiceBank-Stage03-Frozen
+          path: stage03/
+          if-no-files-found: error
+          retention-days: 30
