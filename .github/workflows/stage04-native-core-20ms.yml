@@ -281,6 +281,182 @@ jobs:
                       (y*a.pow(0.75)*b.pow(-0.75)).contiguous().numpy().tofile(name+".rms.f32")
                   print("REFERENCE_PIPELINE",name,t,sr,y.shape,flush=True)
           PY
+      - name: Build and test host real-time transport
+        run: |
+          cat > rt_audio.hpp <<'EOF'
+          #pragma once
+          #include <array>
+          #include <atomic>
+          #include <algorithm>
+          #include <cmath>
+          #include <cstdint>
+          #include <cstddef>
+          #include <type_traits>
+          namespace voicebank {
+          constexpr int host_rate=48000,feature_rate=16000;
+          constexpr size_t host_hop=480,feature_hop=160,history_frames=5120;
+          constexpr size_t internal_delay=720; // 15 ms scheduling target, not measured physical latency
+          constexpr float pi=3.14159265358979323846f;
+          static_assert(std::atomic<uint64_t>::is_always_lock_free);
+          static_assert(std::atomic<unsigned>::is_always_lock_free);
+          struct InputFrame {uint64_t first;std::array<float,host_hop> samples;};
+          struct OutputFrame {uint64_t first;std::array<float,host_hop> samples;};
+          template<class T,size_t N> struct Spsc {
+           static_assert((N&(N-1))==0&&N>0);
+           static_assert(std::is_trivially_copyable_v<T>);
+           std::array<T,N> data{};
+           alignas(64) std::atomic<uint64_t> write{0};
+           alignas(64) std::atomic<uint64_t> read{0};
+           bool push(const T& item) noexcept {
+            auto w=write.load(std::memory_order_relaxed);
+            if(w-read.load(std::memory_order_acquire)>=N)return false;
+            data[w&(N-1)]=item;write.store(w+1,std::memory_order_release);return true;
+           }
+           bool pop(T& item) noexcept {
+            auto r=read.load(std::memory_order_relaxed);
+            if(r==write.load(std::memory_order_acquire))return false;
+            item=data[r&(N-1)];read.store(r+1,std::memory_order_release);return true;
+           }
+          };
+          struct Counters {std::atomic<uint64_t> input_overrun{0},output_overrun{0},underrun_samples{0},late_samples{0},worker_failures{0},discontinuities{0};};
+          class AudioBridge {
+           Spsc<InputFrame,32> in_;
+           Spsc<OutputFrame,32> out_;
+           InputFrame building_{};
+           OutputFrame pending_{};
+           size_t input_fill_=0,pending_at_=host_hop;
+           uint64_t cursor_=0;
+           public:
+           Counters counts;
+           std::atomic<uint64_t> published_cursor{0};
+           std::atomic<unsigned> selected{0};
+           void callback(const float* input,float* output,size_t n) noexcept {
+            for(size_t i=0;i<n;++i){
+             auto seq=cursor_++;
+             if(input_fill_==0)building_.first=seq;
+             building_.samples[input_fill_++]=std::isfinite(input[i])?input[i]:0.0f;
+             if(input_fill_==host_hop){if(!in_.push(building_))counts.input_overrun.fetch_add(1,std::memory_order_relaxed);input_fill_=0;}
+             output[i]=0;
+             if(seq<internal_delay)continue;
+             auto wanted=seq-internal_delay;
+             bool emitted=false;
+             while(true){
+              if(pending_at_==host_hop){if(!out_.pop(pending_))break;pending_at_=0;}
+              uint64_t available=pending_.first+pending_at_;
+              if(available<wanted){
+               auto skip=std::min<uint64_t>(host_hop-pending_at_,wanted-available);
+               pending_at_+=size_t(skip);counts.late_samples.fetch_add(skip,std::memory_order_relaxed);continue;
+              }
+              if(available==wanted){output[i]=pending_.samples[pending_at_++];emitted=true;break;}
+              break;
+             }
+             if(!emitted)counts.underrun_samples.fetch_add(1,std::memory_order_relaxed);
+            }
+            published_cursor.store(cursor_,std::memory_order_release);
+           }
+           bool take(InputFrame& frame) noexcept{return in_.pop(frame);}
+           bool submit(const OutputFrame& frame) noexcept {
+            if(!out_.push(frame)){counts.output_overrun.fetch_add(1,std::memory_order_relaxed);return false;}return true;
+           }
+          };
+          class Decimator3 {
+           static constexpr int taps=63;
+           std::array<float,taps> h_{},samples_{};int pos_=0,phase_=0;
+           public:
+           Decimator3(){double sum=0;constexpr double fc=0.145;
+            for(int i=0;i<taps;++i){double x=i-(taps-1)*0.5;
+             double s=x==0?2*fc:std::sin(2*pi*fc*x)/(pi*x);
+             double w=.42-.5*std::cos(2*pi*i/(taps-1))+.08*std::cos(4*pi*i/(taps-1));h_[i]=float(s*w);sum+=h_[i];}
+            for(auto& a:h_)a=float(a/sum);
+           }
+           void reset() noexcept{samples_.fill(0);pos_=phase_=0;}
+           void run(const std::array<float,host_hop>& in,std::array<float,feature_hop>& out) noexcept{
+            size_t j=0;for(float x:in){samples_[pos_]=x;pos_=(pos_+1)%taps;
+             if(++phase_==3){phase_=0;double v=0;int p=pos_;for(int k=0;k<taps;++k){p=(p+taps-1)%taps;v+=h_[k]*samples_[p];}out[j++]=float(v);}}
+           }
+          };
+          class SharedHistory {
+           Decimator3 decimator_;
+           std::array<float,history_frames> buf_{};
+           std::array<float,feature_hop> newest_{};
+           public:
+           void reset() noexcept{buf_.fill(0);decimator_.reset();}
+           const std::array<float,history_frames>& append(const InputFrame& frame) noexcept {
+            decimator_.run(frame.samples,newest_);
+            std::move(buf_.begin()+feature_hop,buf_.end(),buf_.begin());
+            std::copy(newest_.begin(),newest_.end(),buf_.end()-feature_hop);
+            return buf_;
+           }
+          };
+          class TailResampler {
+           static constexpr int half=16;
+           std::array<std::array<float,2*half>,6> coeff_{};
+           public:
+           TailResampler(){for(int phase=0;phase<6;++phase){double s=0;double frac=phase/6.;for(int k=0;k<2*half;++k){double x=k-(half-1)-frac;double a=std::abs(x)/half;double w=a>=1?0:.5+.5*std::cos(pi*a);double sinc=x==0?1:std::sin(pi*x)/(pi*x);coeff_[phase][k]=float(w*sinc);s+=coeff_[phase][k];}for(auto& v:coeff_[phase])v=float(v/s);}}
+           bool run(const float* source,size_t count,int sr,std::array<float,host_hop>& out) const noexcept {
+            if(sr==48000){if(count<host_hop)return false;std::copy_n(source+count-host_hop,host_hop,out.begin());return true;}
+            if(sr!=40000||count<400+2*half)return false;
+            const int64_t begin=int64_t(count)-400-half;
+            for(int i=0;i<int(host_hop);++i){int n=i*5;int64_t center=begin+n/6;int phase=n%6;double y=0;
+             for(int k=0;k<2*half;++k){int64_t at=center+k-(half-1);if(at<0||at>=int64_t(count))return false;y+=source[at]*coeff_[phase][k];}out[i]=float(y);}
+            return true;
+           }
+          };
+          // Experimental causal RMS. It is NOT the centered offline RMS reference.
+          // The comparison and quality gate must pass before release.
+          class CausalEnvelope {
+           static constexpr int blocks=100;
+           std::array<double,blocks> x_{},y_{};
+           double sx_=0,sy_=0;int p_=0;float prev_=1;
+           public:
+           void reset() noexcept{x_.fill(0);y_.fill(0);sx_=sy_=0;p_=0;prev_=1;}
+           void run(const InputFrame& input,OutputFrame& output,float mix) noexcept {
+            if(mix>=1)return;
+            double a=0,b=0;for(size_t i=0;i<host_hop;++i){a+=double(input.samples[i])*input.samples[i];b+=double(output.samples[i])*output.samples[i];}
+            sx_+=a-x_[p_];sy_+=b-y_[p_];x_[p_]=a;y_[p_]=b;p_=(p_+1)%blocks;
+            double rms1=std::sqrt(std::max(0.,sx_)/(blocks*host_hop)),rms2=std::sqrt(std::max(0.,sy_)/(blocks*host_hop));
+            float target=float(std::pow(rms1/std::max(rms2,1e-6),1-mix));
+            for(size_t i=0;i<host_hop;++i)output.samples[i]*=prev_+(target-prev_)*float(i+1)/host_hop;
+            prev_=target;
+           }
+          };
+          class SwitchJoin {
+           bool valid_=false;unsigned previous_=0;float last_=0;
+           public:
+           void reset()noexcept{valid_=false;last_=0;}
+           void run(unsigned voice,std::array<float,host_hop>& out) noexcept {
+            if(valid_&&previous_!=voice){constexpr size_t n=96;float first=out[0];for(size_t i=0;i<n;++i){float t=float(i+1)/n;float fade=.5f-.5f*std::cos(pi*t);out[i]+=(last_-first)*(1-fade);}}
+            last_=out.back();previous_=voice;valid_=true;
+           }
+          };
+          } // namespace voicebank
+          EOF
+          cat > test_rt.cpp <<'EOF'
+          #include "rt_audio.hpp"
+          #include <iostream>
+          #include <cassert>
+          #include <vector>
+          using namespace voicebank;
+          int main(){
+           AudioBridge q;std::vector<float> data(48000),out(48000);for(size_t i=0;i<data.size();++i)data[i]=float(i+1)/data.size();
+           for(size_t i=0;i<data.size();i+=240){q.callback(data.data()+i,out.data()+i,240);InputFrame in;while(q.take(in)){OutputFrame o;o.first=in.first;o.samples=in.samples;assert(q.submit(o));}}
+           for(size_t i=0;i<internal_delay;++i)assert(out[i]==0);
+           for(size_t i=internal_delay;i<data.size();++i)assert(out[i]==data[i-internal_delay]);
+           std::cout<<"IDENTITY_DELAY samples="<<internal_delay<<" ms="<<1000.*internal_delay/host_rate<<" underrun="<<q.counts.underrun_samples<<" late="<<q.counts.late_samples<<"\n";
+           assert(q.counts.underrun_samples==0&&q.counts.late_samples==0);
+           AudioBridge slow;for(size_t i=0;i<4800;i+=240){slow.callback(data.data()+i,out.data()+i,240);InputFrame in;while(slow.take(in)){if(in.first==0)continue;OutputFrame o;o.first=in.first;o.samples=in.samples;slow.submit(o);}}
+           std::cout<<"MISSED_BLOCK underrun="<<slow.counts.underrun_samples<<" expected=480\n";assert(slow.counts.underrun_samples==480);
+           Decimator3 d;std::array<float,480> x;std::array<float,160> y;double pass=0,stop=0;for(int freq:{1000,12000}){d.reset();double sum=0;for(int block=0;block<20;++block){for(int i=0;i<480;++i)x[i]=std::sin(2*pi*freq*(block*480+i)/48000);d.run(x,y);if(block>0)for(auto v:y)sum+=v*v;}double rms=std::sqrt(sum/(19*160));if(freq==1000)pass=rms;else stop=rms;}
+           std::cout<<"DECIMATOR pass_rms="<<pass<<" stop_rms="<<stop<<"\n";assert(pass>.68&&pass<.73&&stop<.002);
+           TailResampler r;std::array<float,1200> w;std::array<float,480> v;for(size_t i=0;i<w.size();++i)w[i]=std::sin(2*pi*1000*i/40000);assert(r.run(w.data(),w.size(),40000,v));double err=0;for(size_t i=0;i<v.size();++i){double ref=std::sin(2*pi*1000*(784+i*5./6)/40000);err+=(v[i]-ref)*(v[i]-ref);}err=std::sqrt(err/v.size());std::cout<<"RESAMPLE_40_TO_48 rms_error="<<err<<"\n";assert(err<.002);
+           SharedHistory hist;InputFrame a{};a.samples.fill(.25);auto& h=hist.append(a);assert(h.back()>.24&&h.back()<.26);
+           std::cout<<"RT_INFRA_PASS (identity scheduling and resampling only; no neural or device latency measured)\n";
+          }
+          EOF
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror test_rt.cpp -o test_rt
+          set -o pipefail
+          ./test_rt | tee stage04-native/rt-infra.log
+          cp rt_audio.hpp test_rt.cpp stage04-native/
       - name: Build native model bank and index path
         run: |
           cat > CMakeLists.txt <<'EOF'
@@ -310,6 +486,7 @@ jobs:
           cat > core.cpp <<'EOF'
           #include <torch/csrc/jit/serialization/import_read.h>
           #include <caffe2/serialize/inline_container.h>
+          #include "rt_audio.hpp"
           #include <ATen/ATen.h>
           #include <ATen/core/grad_mode.h>
           #include <algorithm>
@@ -957,10 +1134,10 @@ jobs:
             output_host=at::empty(output.sizes(),at::TensorOptions().dtype(at::kFloat).pinned_memory(true));
             history_host.zero_();
            }
-           const at::Tensor& run(const float* next){
+           const at::Tensor& run_window(const float* shared){
             c10::cuda::CUDAStreamGuard sg(stream);
             auto ptr=history_host.data_ptr<float>();
-            std::memmove(ptr,ptr+hop,(window-hop)*sizeof(float));std::memcpy(ptr+window-hop,next,hop*sizeof(float));
+            std::memcpy(ptr,shared,window*sizeof(float));
             input.copy_(history_host,true);
             if(indexed){
              front->replay();features_host.copy_(features,true);stream.synchronize();
@@ -980,12 +1157,14 @@ jobs:
            std::array<std::unique_ptr<GpuVoice>,4> voices;
            for(size_t i=0;i<4;++i)voices[i]=std::make_unique<GpuVoice>(*bank[i],i==0?applio:hubert,rmvpe,dev,stream);
            auto source=fixture("rmvpe.input.f32",{1,5120});auto src=source.data_ptr<float>();
+           std::array<float,5120> shared{};
+           auto append=[&](const float* next){std::move(shared.begin()+160,shared.end(),shared.begin());std::copy_n(next,160,shared.end()-160);};
            std::array<std::vector<double>,4> times;for(auto& v:times)v.reserve(300);
            std::array<int,4> misses{};
            // Cycle all voices through the same input. No model load or graph capture in loop.
            for(int n=0;n<1200;++n){
             int i=(n/300)%4;
-            auto t=Clock::now();auto& out=voices[i]->run(src+(n%32)*160);double d=ms(t);
+            append(src+(n%32)*160);auto t=Clock::now();auto& out=voices[i]->run_window(shared.data());double d=ms(t);
             times[i].push_back(d);misses[i]+=(d>10.);
             require(at::isfinite(out).all().item<bool>(),"GPU waveform nonfinite");
            }
@@ -993,10 +1172,46 @@ jobs:
             auto& ts=times[i];std::sort(ts.begin(),ts.end());
             std::cout<<"CUDA_FIXED_WINDOW "<<bank[i]->preset->name<<" hop_ms=10 p50_ms="<<ts[149]<<" p99_ms="<<ts[296]<<" max_ms="<<ts.back()<<" deadline_misses="<<misses[i]<<" total_audio_latency=NOT_MEASURED"<<std::endl;
            }
-           // Random access switches over preloaded models; history is not yet shared between voices.
+           // Random access switches over preloaded models and a shared input history.
            // Treat this as switch compute time, not audio continuity or device latency.
-           for(int i=0;i<32;++i){auto t=Clock::now();auto& out=voices[i%4]->run(src+(i%32)*160);require(at::isfinite(out).all().item<bool>(),"switch waveform");std::cout<<"CUDA_SWITCH "<<bank[i%4]->preset->name<<" compute_ms="<<ms(t)<<std::endl;}
+           for(int i=0;i<32;++i){append(src+(i%32)*160);auto t=Clock::now();auto& out=voices[i%4]->run_window(shared.data());require(at::isfinite(out).all().item<bool>(),"switch waveform");std::cout<<"CUDA_SWITCH "<<bank[i%4]->preset->name<<" compute_ms="<<ms(t)<<std::endl;}
           }
+          // Integration point for the host's worker thread. The callback uses only
+          // AudioBridge; this method must never run on the audio thread.
+          struct NativeAudioWorker {
+           voicebank::AudioBridge& bridge;
+           std::array<std::unique_ptr<GpuVoice>,4>& voices;
+           voicebank::SharedHistory history;
+           voicebank::TailResampler resampler;
+           voicebank::CausalEnvelope envelope;
+           voicebank::SwitchJoin join;
+           uint64_t next=0;bool started=false;unsigned previous=4;
+           NativeAudioWorker(voicebank::AudioBridge& b,std::array<std::unique_ptr<GpuVoice>,4>& v):bridge(b),voices(v){}
+           bool step(){
+            voicebank::InputFrame input;
+            if(!bridge.take(input))return false;
+            if(started&&input.first!=next){history.reset();envelope.reset();join.reset();bridge.counts.discontinuities.fetch_add(1,std::memory_order_relaxed);}
+            started=true;next=input.first+voicebank::host_hop;
+            auto& window=history.append(input);
+            unsigned id=bridge.selected.load(std::memory_order_acquire);
+            if(id>=voices.size()){bridge.counts.worker_failures.fetch_add(1,std::memory_order_relaxed);return true;}
+            try{
+             at::NoGradGuard guard;
+             auto& audio=voices[id]->run_window(window.data());
+             voicebank::OutputFrame out{};out.first=input.first;
+             require(resampler.run(audio.data_ptr<float>(),audio.numel(),voices[id]->neural.gen.sr,out.samples),"tail resample");
+             if(previous!=id)envelope.reset();
+             envelope.run(input,out,voices[id]->model.preset->rms);
+             join.run(id,out.samples);previous=id;
+             for(float v:out.samples)require(std::isfinite(v),"invalid output");
+             bridge.submit(out);
+            }catch(const std::exception& e){
+             bridge.counts.worker_failures.fetch_add(1,std::memory_order_relaxed);
+             std::cerr<<"AUDIO_WORKER_FAIL "<<e.what()<<std::endl;
+            }
+            return true;
+           }
+          };
           #endif
           int main(int argc,char** argv){
            try{
@@ -1041,7 +1256,7 @@ jobs:
            }catch(const std::exception& e){std::cerr<<"NATIVE_CORE_FAIL "<<e.what()<<std::endl;return 1;}
           }
           EOF
-          cp CMakeLists.txt core.cpp unpickler.cpp presets.inc stage04-native/
+          cp CMakeLists.txt core.cpp unpickler.cpp presets.inc rt_audio.hpp test_rt.cpp stage04-native/
           cmake -S . -B build -DCMAKE_PREFIX_PATH="$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')" -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target voicebank_native -j2
       - name: Run native code with no Python interpreter
@@ -1066,7 +1281,7 @@ jobs:
             "model_conversion":false,
             "python_resident":false,
             "acceptance":{"all_four_presets":true,"no_underruns":true,"no_dropped_blocks":true,"max_measured_total_latency_ms":20,"audio_quality_reference_check":true},
-            "native_scope":"Four originals, indexed F6/F7 fixed-input parity, F8/F9 fixed-input neural parity; F6 Applio source waveform parity separate; GPU fixed-window benchmark all four; not audio callback or end-to-end latency",
+            "native_scope":"Four originals, indexed F6/F7 fixed-input parity, F8/F9 fixed-input neural parity; F6 Applio source waveform parity separate; GPU benchmark plus experimental worker and tested host transport; physical audio latency not measured",
             "gpu_measured":false,
             "audio_latency_measured":false,
             "overall":"NOT_PASSED"
