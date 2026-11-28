@@ -31,7 +31,8 @@ jobs:
       - name: Acquire exact original checkpoints and indices
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y libfaiss-dev libopenblas-dev
+          sudo apt-get install -y libopenblas-dev
+          git clone --depth 1 --branch v1.10.0 https://github.com/facebookresearch/faiss.git faiss-src
           python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install 'huggingface_hub>=0.26,<1'
           mkdir -p stage04-native
@@ -69,9 +70,13 @@ jobs:
           find_package(OpenMP REQUIRED)
           find_package(BLAS REQUIRED)
           find_package(LAPACK REQUIRED)
-          find_library(FAISS_LIBRARY faiss REQUIRED)
+          set(FAISS_ENABLE_GPU OFF CACHE BOOL "" FORCE)
+          set(FAISS_ENABLE_PYTHON OFF CACHE BOOL "" FORCE)
+          set(FAISS_ENABLE_C_API OFF CACHE BOOL "" FORCE)
+          set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+          add_subdirectory(faiss-src faiss-build EXCLUDE_FROM_ALL)
           add_executable(voicebank_native core.cpp)
-          target_link_libraries(voicebank_native PRIVATE "${TORCH_LIBRARIES}" ${FAISS_LIBRARY} LAPACK::LAPACK BLAS::BLAS OpenMP::OpenMP_CXX)
+          target_link_libraries(voicebank_native PRIVATE "${TORCH_LIBRARIES}" faiss LAPACK::LAPACK BLAS::BLAS OpenMP::OpenMP_CXX)
           set_property(TARGET voicebank_native PROPERTY CXX_STANDARD 17)
           EOF
           cat > core.cpp <<'EOF'
@@ -124,12 +129,13 @@ jobs:
            std::vector<float> mix(const std::vector<float>& x,float rate,float protect,bool voiced)const{
             if(rate==0.f) return x;
             require(x.size()==size_t(index->d),"feature dimension");
-            std::array<float,8> d{};std::array<faiss::Index::idx_t,8> ids{};
+            std::array<float,8> d{};std::array<faiss::idx_t,8> ids{};
             index->search(1,x.data(),8,d.data(),ids.data());
             double total=0;std::array<double,8> w{};
             for(int i=0;i<8;++i){require(ids[i]>=0 && std::isfinite(d[i]) && d[i]>0,"invalid or exact-zero distance");w[i]=1.0/(double(d[i])*d[i]);total+=w[i];}
-            std::vector<float> out(x.size(),0),v(x.size());
-            for(int i=0;i<8;++i){index->reconstruct(ids[i],v.data());for(size_t j=0;j<v.size();++j)out[j]+=float(w[i]/total)*v[j];}
+            std::vector<float> out(x.size(),0),vectors(size_t(index->ntotal)*x.size());
+            index->reconstruct_n(0,index->ntotal,vectors.data());
+            for(int i=0;i<8;++i){require(ids[i]<index->ntotal,"index ID out of range");for(size_t j=0;j<x.size();++j)out[j]+=float(w[i]/total)*vectors[size_t(ids[i])*x.size()+j];}
             const float a=voiced?1.f:protect;
             for(size_t j=0;j<x.size();++j)out[j]=(out[j]*rate+x[j]*(1-rate))*a+x[j]*(1-a);
             return out;
@@ -157,7 +163,7 @@ jobs:
           EOF
           cp CMakeLists.txt core.cpp stage04-native/
           cmake -S . -B build -DCMAKE_PREFIX_PATH="$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')" -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j2
+          cmake --build build --target voicebank_native -j2
       - name: Run native code with no Python interpreter
         run: |
           set -o pipefail
