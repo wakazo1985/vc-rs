@@ -107,6 +107,7 @@ jobs:
            c10::IValue checkpoint;
            std::unique_ptr<faiss::Index> index;
            const Preset* preset;
+           std::vector<float> index_vectors;
            Model(const Preset& p):preset(&p){
             auto start=Clock::now();
             caffe2::serialize::PyTorchStreamReader reader(std::string(p.name)+".pth");
@@ -123,6 +124,10 @@ jobs:
             require(count==457,"unexpected tensor count");
             index.reset(faiss::read_index((std::string(p.name)+".index").c_str()));
             require(index && index->d==768 && index->ntotal>=8,"invalid original index");
+            if(p.index!=0.f){
+             index_vectors.resize(size_t(index->ntotal)*index->d);
+             index->reconstruct_n(0,index->ntotal,index_vectors.data());
+            }
             std::cout<<"MODEL "<<p.name<<" tensors="<<count<<" elements="<<elements<<" index_count="<<index->ntotal<<" preload_ms="<<ms(start)<<std::endl;
            }
            // Original RVC k=8, inverse squared distance blend; no active index lookup at rate zero.
@@ -133,9 +138,9 @@ jobs:
             index->search(1,x.data(),8,d.data(),ids.data());
             double total=0;std::array<double,8> w{};
             for(int i=0;i<8;++i){require(ids[i]>=0 && std::isfinite(d[i]) && d[i]>0,"invalid or exact-zero distance");w[i]=1.0/(double(d[i])*d[i]);total+=w[i];}
-            std::vector<float> out(x.size(),0),vectors(size_t(index->ntotal)*x.size());
-            index->reconstruct_n(0,index->ntotal,vectors.data());
-            for(int i=0;i<8;++i){require(ids[i]<index->ntotal,"index ID out of range");for(size_t j=0;j<x.size();++j)out[j]+=float(w[i]/total)*vectors[size_t(ids[i])*x.size()+j];}
+            require(!index_vectors.empty(),"index vectors not preloaded");
+            std::vector<float> out(x.size(),0);
+            for(int i=0;i<8;++i){require(ids[i]<index->ntotal,"index ID out of range");for(size_t j=0;j<x.size();++j)out[j]+=float(w[i]/total)*index_vectors[size_t(ids[i])*x.size()+j];}
             const float a=voiced?1.f:protect;
             for(size_t j=0;j<x.size();++j)out[j]=(out[j]*rate+x[j]*(1-rate))*a+x[j]*(1-a);
             return out;
