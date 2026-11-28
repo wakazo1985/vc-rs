@@ -48,14 +48,14 @@ jobs:
           old='    case PickleOpCode::BUILD:\n    case PickleOpCode::REDUCE: {'
           assert old in s
           s=s.replace(old,'''    case PickleOpCode::BUILD:
-      if (stack_.size() >= 2 && stack_[stack_.size()-2].isGenericDict() && stack_.back().isGenericDict()) {
-        auto state = stack_.back().toGenericDict();
-        TORCH_CHECK(state.size() == 1 && state.contains(IValue("_metadata")), "unsupported dictionary BUILD state");
-        stack_.pop_back();
-        break;
-      }
-      [[fallthrough]];
-    case PickleOpCode::REDUCE: {''')
+                if (stack_.size() >= 2 && stack_[stack_.size()-2].isGenericDict() && stack_.back().isGenericDict()) {
+                  auto state = stack_.back().toGenericDict();
+                  TORCH_CHECK(state.size() == 1 && state.contains(IValue("_metadata")), "unsupported dictionary BUILD state");
+                  stack_.pop_back();
+                  break;
+                }
+                [[fallthrough]];
+              case PickleOpCode::REDUCE: {''')
           p.write_text(s)
           PATCH
           git clone --depth 1 --branch v1.10.0 https://github.com/facebookresearch/faiss.git faiss-src
