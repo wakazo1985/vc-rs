@@ -104,7 +104,7 @@ jobs:
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git upstream
           git -C upstream checkout 81eed5e8f68b6bed1789f682fe78cdd324495afc
-          python -m pip install scipy==1.14.1
+          python -m pip install scipy==1.14.1 librosa==0.10.2.post1
           PYTHONPATH="$PWD/upstream" python - <<'PY'
           import torch
           from infer.module.models import TextEncoder, ResidualCouplingBlock, GeneratorNSF
@@ -142,6 +142,29 @@ jobs:
                           audio=gen(z2,f0,g=g)
                       audio.contiguous().numpy().tofile(f"{name}.gen{t}.f32")
                       print("REFERENCE_GENERATOR",name,t,audio.shape,flush=True)
+          PY
+      - name: Generate official RMVPE reference from original checkpoint
+        run: |
+          PYTHONPATH="$PWD/upstream" python - <<'PY'
+          import torch, hashlib, shutil, pathlib
+          from huggingface_hub import hf_hub_download
+          from infer.rmvpe import RMVPE
+          src=hf_hub_download("lj1995/VoiceConversionWebUI","rmvpe.pt")
+          shutil.copyfile(src,"rmvpe.pt")
+          with open("rmvpe.pt","rb") as f:
+              print("RMVPE_ORIGINAL_SHA256",hashlib.file_digest(f,"sha256").hexdigest(),flush=True)
+          torch.set_num_threads(2)
+          model=RMVPE("rmvpe.pt",False,"cpu")
+          with torch.inference_mode():
+              a=torch.arange(5120,dtype=torch.float32)/16000
+              x=(torch.sin(a*2*3.141592653589793*123)*0.2+torch.sin(a*2*3.141592653589793*246)*0.06).reshape(1,-1)
+              x[:,0:800]=0
+              mel=model.extract_mel(x)
+              hidden=model.mel2hidden(mel)
+              f0=model.decode(hidden.squeeze(0).numpy(),thred=0.03)
+              for key,val in (("input",x),("mel",mel),("hidden",hidden),("f0",torch.from_numpy(f0))):
+                  val.float().contiguous().numpy().tofile("rmvpe."+key+".f32")
+              print("RMVPE_REFERENCE",list(mel.shape),list(hidden.shape),flush=True)
           PY
       - name: Build native model bank and index path
         run: |
@@ -416,6 +439,96 @@ jobs:
             require(at::allclose(out,ref,1e-3,1e-3),"official GeneratorNSF mismatch");
            }
           }
+          // Native RMVPE: original E2E state_dict, Slaney-normalized HTK mel, U-Net, bidirectional GRU.
+          struct NativeRMVPE {
+           std::unordered_map<std::string,at::Tensor> w;
+           at::Tensor basis,window;
+           explicit NativeRMVPE(const std::string& path){
+            caffe2::serialize::PyTorchStreamReader reader(path);
+            auto root=load_original(reader).toGenericDict();
+            for(auto& kv:root)if(kv.value().isTensor())w.emplace(kv.key().toStringRef(),kv.value().toTensor().to(at::kFloat));
+            require(w.count("fc.0.gru.weight_ih_l0")&&w.count("unet.encoder.bn.weight"),"RMVPE state dictionary");
+            auto opts=at::TensorOptions().dtype(at::kFloat);
+            basis=at::empty({128,513},opts);auto ptr=basis.data_ptr<float>();
+            std::array<double,130> hz{};
+            const double m0=2595*std::log10(1+30.0/700),m1=2595*std::log10(1+8000.0/700);
+            for(int i=0;i<130;++i)hz[i]=700*(std::pow(10,(m0+(m1-m0)*i/129)/2595)-1);
+            for(int i=0;i<128;++i)for(int j=0;j<513;++j){
+             double f=j*16000.0/1024;
+             double lo=(f-hz[i])/(hz[i+1]-hz[i]),hi=(hz[i+2]-f)/(hz[i+2]-hz[i+1]);
+             ptr[i*513+j]=float(std::max(0.0,std::min(lo,hi))*2/(hz[i+2]-hz[i]));
+            }
+            window=at::hann_window(1024,true,opts);
+           }
+           const at::Tensor& W(const std::string& k)const{return w.at(k);}
+           at::Tensor conv(const at::Tensor& x,const std::string& k,int64_t pad=1)const{
+            std::optional<at::Tensor> b;if(w.count(k+".bias"))b=W(k+".bias");
+            return at::conv2d(x,W(k+".weight"),b,at::IntArrayRef{1,1},at::IntArrayRef{pad,pad},at::IntArrayRef{1,1},1);
+           }
+           at::Tensor bn(const at::Tensor& x,const std::string& k)const{
+            return at::batch_norm(x,W(k+".weight"),W(k+".bias"),W(k+".running_mean"),W(k+".running_var"),false,0.01,1e-5,true);
+           }
+           at::Tensor block(const at::Tensor& x,const std::string& k)const{
+            auto h=at::relu(bn(conv(x,k+".conv.0"),k+".conv.1"));
+            h=at::relu(bn(conv(h,k+".conv.3"),k+".conv.4"));
+            return h+(w.count(k+".shortcut.weight")?conv(x,k+".shortcut",0):x);
+           }
+           at::Tensor blocks(at::Tensor x,const std::string& k)const{
+            for(int i=0;i<4;++i)x=block(x,k+"."+std::to_string(i));return x;
+           }
+           at::Tensor mel(const at::Tensor& input)const{
+            auto framed=at::reflection_pad1d(input.unsqueeze(1),{512,512}).squeeze(1).unfold(-1,1024,160)*window;
+            auto fft=at::fft_rfft(framed,1024,-1,std::nullopt);
+            auto mag=at::abs(fft).transpose(1,2);
+            return at::log(at::matmul(basis,mag).clamp_min(1e-5));
+           }
+           at::Tensor hidden(const at::Tensor& m)const{
+            auto t=m.size(2);auto n=(32-t%32)%32;
+            auto x=at::constant_pad_nd(m,{0,n},0).transpose(1,2).unsqueeze(1);
+            x=bn(x,"unet.encoder.bn");std::vector<at::Tensor> skip;
+            for(int i=0;i<5;++i){x=blocks(x,"unet.encoder.layers."+std::to_string(i)+".conv");skip.push_back(x);x=at::avg_pool2d(x,{2,2},{2,2},{0,0},false,true,std::nullopt);}
+            for(int i=0;i<4;++i)x=blocks(x,"unet.intermediate.layers."+std::to_string(i)+".conv");
+            for(int i=0;i<5;++i){
+             auto k="unet.decoder.layers."+std::to_string(i);
+             x=at::conv_transpose2d(x,W(k+".conv1.0.weight"),std::nullopt,{2,2},{1,1},{1,1},1,{1,1});
+             x=at::relu(bn(x,k+".conv1.1"));
+             x=blocks(at::cat({x,skip[4-i]},1),k+".conv2");
+            }
+            x=conv(x,"cnn").transpose(1,2).flatten(2);
+            std::vector<at::Tensor> p;
+            for(auto suffix:{"","_reverse"})for(auto key:{"weight_ih_l0","weight_hh_l0","bias_ih_l0","bias_hh_l0"})p.push_back(W(std::string("fc.0.gru.")+key+suffix));
+            auto hx=at::zeros({2,x.size(0),256},x.options());
+            x=std::get<0>(at::gru(x,hx,p,true,1,0.0,false,true,true));
+            return at::sigmoid(at::linear(x,W("fc.1.weight"),W("fc.1.bias"))).slice(1,0,t).contiguous();
+           }
+           at::Tensor decode(const at::Tensor& h)const{
+            auto sal=h.squeeze(0);auto centers=sal.argmax(1,true);
+            auto offsets=at::arange(9,centers.options()).reshape({1,9});
+            auto ids=centers+offsets;
+            auto probs=at::constant_pad_nd(sal,{4,4},0).gather(1,ids);
+            auto cents=at::constant_pad_nd(at::arange(360,sal.options().dtype(at::kDouble))*20+1997.3794084376191,{4,4},0);
+            auto values=cents.index_select(0,ids.reshape({-1})).reshape(ids.sizes());
+            auto avg=(probs.to(at::kDouble)*values).sum(1)/probs.sum(1).to(at::kDouble);
+            auto f=10*at::pow(2,avg/1200);
+            return at::where(std::get<0>(sal.max(1)).le(0.03),at::zeros_like(f),f).to(at::kFloat);
+           }
+          };
+          at::Tensor fixture(const std::string& path,at::IntArrayRef sizes){
+           auto x=at::empty(sizes,at::TensorOptions().dtype(at::kFloat));
+           std::ifstream in(path,std::ios::binary);in.read(static_cast<char*>(x.data_ptr()),x.nbytes());
+           require(in.gcount()==static_cast<std::streamsize>(x.nbytes()),"missing RMVPE fixture");
+           return x;
+          }
+          void verify_rmvpe(){
+           at::NoGradGuard guard;NativeRMVPE model("rmvpe.pt");
+           auto x=fixture("rmvpe.input.f32",{1,5120});
+           auto t=Clock::now();auto mel=model.mel(x);auto h=model.hidden(mel);auto f0=model.decode(h);auto elapsed=ms(t);
+           auto mref=fixture("rmvpe.mel.f32",mel.sizes()),href=fixture("rmvpe.hidden.f32",h.sizes()),fref=fixture("rmvpe.f0.f32",f0.sizes());
+           std::cout<<"RMVPE mel_max_error="<<(mel-mref).abs().max().item<float>()<<" hidden_max_error="<<(h-href).abs().max().item<float>()<<" f0_max_hz="<<(f0-fref).abs().max().item<float>()<<" cpu_ms="<<elapsed<<std::endl;
+           require(at::allclose(mel,mref,1e-4,1e-4),"mel mismatch");
+           require(at::allclose(h,href,1e-4,1e-4),"RMVPE salience mismatch");
+           require(at::allclose(f0,fref,1e-4,0.05),"RMVPE F0 mismatch");
+          }
           struct Model {
            c10::IValue checkpoint;
            std::unique_ptr<faiss::Index> index;
@@ -489,6 +602,7 @@ jobs:
             verify_flow(f9.checkpoint.toGenericDict(),"F9");
             verify_generator(f8.checkpoint.toGenericDict(),"F8");
             verify_generator(f9.checkpoint.toGenericDict(),"F9");
+            verify_rmvpe();
             std::atomic<const Model*> selected{&f8};
             require(selected.is_lock_free(),"pointer atomics not lock free");
             double worst=0;
@@ -502,7 +616,7 @@ jobs:
              // Nonzero-index algorithm is NOT adopted for F8/F9. Actual F6/F7 indexes not available to this public runner.
              std::cout<<"INDEX_BYPASS "<<m->preset->name<<" pass"<<std::endl;
             }
-            std::cout<<"NATIVE_CORE_PASS preload_selection_text_encoder_reverse_flow_generator; full_neural_inference=not_implemented; audio_latency=not_measured"<<std::endl;
+            std::cout<<"NATIVE_CORE_PASS preload_selection_text_encoder_reverse_flow_generator_rmvpe; full_neural_inference=not_implemented; audio_latency=not_measured"<<std::endl;
             return 0;
            }catch(const std::exception& e){std::cerr<<"NATIVE_CORE_FAIL "<<e.what()<<std::endl;return 1;}
           }
@@ -532,7 +646,7 @@ jobs:
             "model_conversion":false,
             "python_resident":false,
             "acceptance":{"all_four_presets":true,"no_underruns":true,"no_dropped_blocks":true,"max_measured_total_latency_ms":20,"audio_quality_reference_check":true},
-            "native_scope":"F8/F9 original checkpoints, index, selection and official TextEncoder, reverse Flow and GeneratorNSF parity only",
+            "native_scope":"F8/F9 original checkpoints, index, selection and official TextEncoder, reverse Flow, GeneratorNSF and RMVPE parity only",
             "gpu_measured":false,
             "audio_latency_measured":false,
             "overall":"NOT_PASSED"
