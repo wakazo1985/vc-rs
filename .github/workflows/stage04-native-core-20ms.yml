@@ -107,7 +107,7 @@ jobs:
           python -m pip install scipy==1.14.1
           PYTHONPATH="$PWD/upstream" python - <<'PY'
           import torch
-          from infer.module.models import TextEncoder
+          from infer.module.models import TextEncoder, ResidualCouplingBlock
           torch.set_num_threads(2)
           with torch.inference_mode():
               for name in ("F8","F9"):
@@ -115,12 +115,19 @@ jobs:
                   cfg=ck["config"]
                   enc=TextEncoder(768,*cfg[2:8],float(cfg[8]),True).eval()
                   enc.load_state_dict({k[6:]:v for k,v in ck["weight"].items() if k.startswith("enc_p.")},strict=True)
+                  flow=ResidualCouplingBlock(cfg[2],cfg[3],5,1,3,gin_channels=cfg[16]).eval()
+                  flow.load_state_dict({k[5:]:v for k,v in ck["weight"].items() if k.startswith("flow.")},strict=True)
+                  flow.remove_weight_norm()
                   for t in (8,33):
                       phone=(torch.arange(t*768,dtype=torch.float32).remainder(97)-48).reshape(1,t,768)/97
                       pitch=torch.arange(t,dtype=torch.long).remainder(254).reshape(1,t)+1
                       m,logs,mask=enc(phone,pitch,torch.tensor([t-2]))
                       torch.cat((m,logs,mask),dim=1).contiguous().numpy().tofile(f"{name}.enc{t}.f32")
                       print("REFERENCE_ENCODER",name,t,m.shape,flush=True)
+                      z=(torch.arange(t*cfg[2],dtype=torch.float32).remainder(67)-33).reshape(1,cfg[2],t)/67
+                      g=ck["weight"]["emb_g.weight"][0].float().reshape(1,-1,1)
+                      flow(z,mask,g=g,reverse=True).contiguous().numpy().tofile(f"{name}.flow{t}.f32")
+                      print("REFERENCE_FLOW",name,t,flush=True)
           PY
       - name: Build native model bank and index path
         run: |
@@ -264,6 +271,64 @@ jobs:
             require(at::allclose(out,ref,1e-4,1e-4),"official TextEncoder mismatch");
            }
           }
+          // RVC reverse residual coupling: weight-normalized WN, flip, mean-only coupling.
+          struct ReverseFlow {
+           std::unordered_map<std::string,at::Tensor> w;
+           int64_t hidden,inter;
+           explicit ReverseFlow(const c10::impl::GenericDict& root){
+            auto config=root.at(c10::IValue("config"));auto cfg=config.toListRef();
+            inter=cfg[2].toInt();hidden=cfg[3].toInt();
+            auto weights=root.at(c10::IValue("weight")).toGenericDict();
+            for(auto& kv:weights){
+             auto k=kv.key().toStringRef();
+             if(k.rfind("flow.",0)==0||k=="emb_g.weight")w.emplace(k,kv.value().toTensor().to(at::kFloat));
+            }
+            std::vector<std::string> keys;
+            for(auto& kv:w)if(kv.first.size()>9&&kv.first.substr(kv.first.size()-9)==".weight_v")keys.push_back(kv.first);
+            for(auto& k:keys){
+             auto base=k.substr(0,k.size()-9);
+             auto v=w.at(k);
+             w.emplace(base+".weight",at::_weight_norm(v,w.at(base+".weight_g"),0));
+            }
+           }
+           at::Tensor conv(const at::Tensor& x,const std::string& k)const{
+            auto a=w.at(k+".weight");int64_t padding=(a.size(2)-1)/2;
+            return at::conv1d(x,a,w.at(k+".bias"),at::IntArrayRef{1},at::IntArrayRef{padding},at::IntArrayRef{1},1);
+           }
+           at::Tensor forward(at::Tensor x,const at::Tensor& mask,int64_t sid)const{
+            auto g=w.at("emb_g.weight").select(0,sid).reshape({1,-1,1});
+            for(int f=6;f>=0;f-=2){
+             x=at::flip(x,{1});
+             auto k="flow.flows."+std::to_string(f);
+             auto x0=x.slice(1,0,inter/2),x1=x.slice(1,inter/2,inter);
+             auto h=conv(x0,k+".pre")*mask;
+             auto cond=conv(g,k+".enc.cond_layer"),out=at::zeros_like(h);
+             for(int i=0;i<3;++i){
+              auto s=std::to_string(i);
+              auto a=conv(h,k+".enc.in_layers."+s)+cond.slice(1,i*2*hidden,(i+1)*2*hidden);
+              auto acts=at::tanh(a.slice(1,0,hidden))*at::sigmoid(a.slice(1,hidden,2*hidden));
+              auto res=conv(acts,k+".enc.res_skip_layers."+s);
+              if(i<2){h=(h+res.slice(1,0,hidden))*mask;out=out+res.slice(1,hidden,2*hidden);}
+              else out=out+res;
+             }
+             auto m=conv(out*mask,k+".post")*mask;
+             x=at::cat({x0,(x1-m)*mask},1);
+            }
+            return x.contiguous();
+           }
+          };
+          void verify_flow(const c10::impl::GenericDict& root,const std::string& name){
+           at::NoGradGuard guard;ReverseFlow flow(root);
+           for(int64_t t:{8,33}){
+            auto z=(at::arange(t*flow.inter,at::TensorOptions().dtype(at::kFloat)).remainder(67)-33).reshape({1,flow.inter,t})/67;
+            auto mask=at::arange(t,at::TensorOptions().dtype(at::kLong)).lt(t-2).reshape({1,1,t}).to(at::kFloat);
+            auto start=Clock::now();auto out=flow.forward(z,mask,0);auto elapsed=ms(start);
+            auto ref=at::empty_like(out);std::ifstream in(name+".flow"+std::to_string(t)+".f32",std::ios::binary);
+            in.read(static_cast<char*>(ref.data_ptr()),ref.nbytes());require(in.gcount()==static_cast<std::streamsize>(ref.nbytes()),"missing flow reference");
+            std::cout<<"REVERSE_FLOW "<<name<<" frames="<<t<<" max_abs_error="<<(out-ref).abs().max().item<float>()<<" cpu_ms="<<elapsed<<std::endl;
+            require(at::allclose(out,ref,1e-4,1e-4),"official reverse flow mismatch");
+           }
+          }
           struct Model {
            c10::IValue checkpoint;
            std::unique_ptr<faiss::Index> index;
@@ -333,6 +398,8 @@ jobs:
             Model f8(presets[2]),f9(presets[3]);
             verify_encoder(f8.checkpoint.toGenericDict(),"F8");
             verify_encoder(f9.checkpoint.toGenericDict(),"F9");
+            verify_flow(f8.checkpoint.toGenericDict(),"F8");
+            verify_flow(f9.checkpoint.toGenericDict(),"F9");
             std::atomic<const Model*> selected{&f8};
             require(selected.is_lock_free(),"pointer atomics not lock free");
             double worst=0;
@@ -346,7 +413,7 @@ jobs:
              // Nonzero-index algorithm is NOT adopted for F8/F9. Actual F6/F7 indexes not available to this public runner.
              std::cout<<"INDEX_BYPASS "<<m->preset->name<<" pass"<<std::endl;
             }
-            std::cout<<"NATIVE_CORE_PASS preload_selection_and_text_encoder; full_neural_inference=not_implemented; audio_latency=not_measured"<<std::endl;
+            std::cout<<"NATIVE_CORE_PASS preload_selection_text_encoder_reverse_flow; full_neural_inference=not_implemented; audio_latency=not_measured"<<std::endl;
             return 0;
            }catch(const std::exception& e){std::cerr<<"NATIVE_CORE_FAIL "<<e.what()<<std::endl;return 1;}
           }
@@ -376,7 +443,7 @@ jobs:
             "model_conversion":false,
             "python_resident":false,
             "acceptance":{"all_four_presets":true,"no_underruns":true,"no_dropped_blocks":true,"max_measured_total_latency_ms":20,"audio_quality_reference_check":true},
-            "native_scope":"F8/F9 original checkpoints, index, selection and official TextEncoder parity only",
+            "native_scope":"F8/F9 original checkpoints, index, selection and official TextEncoder and reverse Flow parity only",
             "gpu_measured":false,
             "audio_latency_measured":false,
             "overall":"NOT_PASSED"
