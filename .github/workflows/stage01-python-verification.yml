@@ -1,0 +1,98 @@
+name: Stage 01 Python model verification
+on:
+  push:
+    branches: [stage01-python-verification]
+    paths:
+      - '.github/workflows/stage01-python-verification.yml'
+  workflow_dispatch:
+permissions: {}
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install CPU verification tools
+        run: |
+          python -m pip install --disable-pip-version-check torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --disable-pip-version-check numpy faiss-cpu huggingface_hub
+      - name: Verify publicly distributed model archives
+        shell: bash
+        run: |
+          python -u - <<'PY'
+          import hashlib, json, tempfile, pathlib, zipfile, traceback
+          import torch, numpy as np, faiss
+          from huggingface_hub import hf_hub_download, HfApi
+          print("VERSIONS", torch.__version__, faiss.__version__, np.__version__)
+          models = [
+              ("Russell Archey", "Rokkonrol/RVC_models", "dataset", "Russell Archey [Explore With Us (EWU)].zip"),
+              ("Joyca High", "rayzox57/Joyca_High_RVC", "model", "Joyca_High_Voice_v2_600e.zip"),
+          ]
+          def digest(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for block in iter(lambda: f.read(1048576), b""):
+                      h.update(block)
+              return h.hexdigest()
+          failed = False
+          for name, repo, kind, filename in models:
+              report = {"model": name, "repository": repo, "filename": filename}
+              try:
+                  info = HfApi().repo_info(repo, repo_type=kind, files_metadata=True)
+                  report["revision"] = info.sha
+                  report["license"] = (info.card_data or {}).get("license")
+                  item = next(x for x in info.siblings if x.rfilename == filename)
+                  lfs = item.lfs
+                  report["published_sha256"] = getattr(lfs, "sha256", None)
+                  if isinstance(lfs, dict):
+                      report["published_sha256"] = lfs.get("sha256")
+                  path = hf_hub_download(repo, filename, repo_type=kind, revision=info.sha)
+                  report["downloaded_sha256"] = digest(path)
+                  report["matches_published"] = report["downloaded_sha256"] == report["published_sha256"] if report["published_sha256"] else None
+                  print("ARCHIVE", json.dumps(report, ensure_ascii=False), flush=True)
+                  if report["matches_published"] is False:
+                      raise ValueError("Published checksum mismatch")
+                  with zipfile.ZipFile(path) as z, tempfile.TemporaryDirectory() as td:
+                      if z.testzip() is not None:
+                          raise ValueError("ZIP CRC failure")
+                      report["members"] = []
+                      for i, member in enumerate(z.infolist()):
+                          suffix = pathlib.PurePosixPath(member.filename).suffix.lower()
+                          if suffix not in (".pth", ".index"):
+                              continue
+                          target = pathlib.Path(td) / (str(i) + suffix)
+                          with z.open(member) as src, target.open("wb") as dest:
+                              import shutil
+                              shutil.copyfileobj(src, dest)
+                          entry = {"name": member.filename, "sha256": digest(target), "bytes": target.stat().st_size}
+                          report["members"].append(entry)
+                          if suffix == ".pth":
+                              ckpt = torch.load(target, map_location="cpu", weights_only=True)
+                              weight = ckpt.get("weight", {})
+                              entry.update(version=str(ckpt.get("version")), f0=ckpt.get("f0"), sr=ckpt.get("sr"), config=ckpt.get("config"), tensor_count=len(weight), finite=all(torch.isfinite(t).all().item() for t in weight.values() if torch.is_tensor(t)))
+                              if not weight or not entry["finite"]:
+                                  raise ValueError("Missing or nonfinite model weights")
+                          else:
+                              idx = faiss.read_index(str(target))
+                              entry.update(dim=idx.d, count=idx.ntotal, trained=idx.is_trained)
+                              if idx.ntotal <= 0 or not idx.is_trained:
+                                  raise ValueError("Empty or untrained index")
+                              q = np.random.default_rng(0).standard_normal((8, idx.d)).astype(np.float32)
+                              distances, ids = idx.search(q, min(8, idx.ntotal))
+                              entry["search_ok"] = bool(np.isfinite(distances[:,0]).all() and (ids[:,0] >= 0).all())
+                              if not entry["search_ok"]:
+                                  raise ValueError("FAISS search did not return valid nearest neighbors")
+                          print("MEMBER", json.dumps(entry, ensure_ascii=False, default=str), flush=True)
+                      if not any(x["name"].lower().endswith(".pth") for x in report["members"]) or not any(x["name"].lower().endswith(".index") for x in report["members"]):
+                          raise ValueError("Expected PTH and INDEX")
+                  report["status"] = "pass"
+              except Exception as e:
+                  failed = True
+                  report["status"] = "fail"
+                  report["error"] = str(e)
+                  traceback.print_exc()
+              print("RESULT", json.dumps(report, ensure_ascii=False, default=str), flush=True)
+          raise SystemExit(int(failed))
+          PY
