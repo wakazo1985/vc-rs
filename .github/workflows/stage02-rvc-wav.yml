@@ -16,6 +16,7 @@ jobs:
     timeout-minutes: 45
     env:
       CUDA_VISIBLE_DEVICES: ''
+      TORCH_FORCE_WEIGHTS_ONLY_LOAD: '1'
       OMP_NUM_THREADS: '2'
       MKL_NUM_THREADS: '2'
     steps:
@@ -26,8 +27,11 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg libsndfile1 libportaudio2 open-jtalk open-jtalk-mecab-naist-jdic hts-voice-nitech-jp-atr503-m001
-          git clone --depth 1 https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git rvc
+          git init rvc
           cd rvc
+          git remote add origin https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git
+          git fetch --depth 1 origin 81eed5e8f68b6bed1789f682fe78cdd324495afc
+          git checkout --detach FETCH_HEAD
           git rev-parse HEAD
           sed -i 's|https://mirrors.pku.edu.cn/pypi/simple|https://pypi.org/simple|;s|https://mirrors.nju.edu.cn/pytorch/whl/cpu|https://download.pytorch.org/whl/cpu|' requirments_cpu_py312.txt
           python -m pip install -r requirments_cpu_py312.txt
@@ -76,6 +80,8 @@ jobs:
       - name: Run original RVC CLI comparisons
         working-directory: rvc
         run: |
+          export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+          python -m infer.cli --help
           python -u - <<'PY'
           import pathlib, subprocess, json, sys, os, time
           import numpy as np, soundfile as sf, librosa
@@ -85,7 +91,7 @@ jobs:
           results=[]
           for key,pitch,rate in cases:
               target=out/f"{key}_pitch{pitch}_index{rate:.2f}.wav"
-              cmd=[sys.executable,"infer/cli.py","--model",f"assets/weights/{key}.pth","--index",f"assets/indices/{key}.index","--input",str(source),"--output",str(target),"--pitch",str(pitch),"--f0-method","rmvpe","--index-rate",str(rate),"--protect","0.33","--rms-mix-rate","1.0","--overwrite"]
+              cmd=[sys.executable,"-m","infer.cli","--model",f"assets/weights/{key}.pth","--index",f"assets/indices/{key}.index","--input",str(source),"--output",str(target),"--pitch",str(pitch),"--f0-method","rmvpe","--index-rate",str(rate),"--protect","0.33","--rms-mix-rate","1.0","--overwrite"]
               start=time.monotonic()
               proc=subprocess.run(cmd, capture_output=True,text=True)
               (out/(target.stem+".log")).write_text(proc.stdout+"\n"+proc.stderr)
