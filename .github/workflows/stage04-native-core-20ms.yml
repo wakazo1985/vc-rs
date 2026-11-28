@@ -188,6 +188,46 @@ jobs:
                   y.float().contiguous().numpy().tofile("hubert."+v+".f32")
                   print("HUBERT_REFERENCE",v,list(y.shape),flush=True)
           PY
+      - name: Generate end-to-end neural reference with same unchanged source and model
+        run: |
+          PYTHONPATH="$PWD/upstream" python - <<'PY'
+          import torch,numpy as np,math
+          from infer.module.models import TextEncoder,ResidualCouplingBlock,GeneratorNSF
+          from unittest.mock import patch
+          torch.set_num_threads(2)
+          feats=torch.from_numpy(np.fromfile("hubert.v2.f32",dtype=np.float32)).reshape(1,-1,768)
+          f0=np.fromfile("rmvpe.f0.f32",dtype=np.float32)
+          voiced=f0>0
+          if voiced.any(): f0[~voiced]=np.interp(np.flatnonzero(~voiced),np.flatnonzero(voiced),f0[voiced])
+          phone=feats.repeat_interleave(2,dim=1)
+          t=min(phone.shape[1],len(f0),5120//160)
+          phone=phone[:,:t]
+          for name,pitch in [("F8",-12),("F9",-16)]:
+              ck=torch.load(name+".pth",map_location="cpu",weights_only=True);cfg=ck["config"]
+              import json
+              params=next(p["rvc"]["parameters"] for p in json.load(open("frozen/VoiceBank_03_Presets.json"))["presets"].values() if p["shortcut"]==name)
+              assert params["pitch_shift_semitones"]==pitch and params["index_rate"]==0
+              enc=TextEncoder(768,*cfg[2:8],float(cfg[8]),True).eval()
+              flow=ResidualCouplingBlock(cfg[2],cfg[3],5,1,3,gin_channels=cfg[16]).eval()
+              sr=cfg[-1] if isinstance(cfg[-1],int) else int(cfg[-1].rstrip("k"))*1000
+              gen=GeneratorNSF(cfg[2],*cfg[9:15],gin_channels=cfg[16],sr=sr,is_half=False).eval()
+              for model,prefix in [(enc,"enc_p."),(flow,"flow."),(gen,"dec.")]:
+                  model.load_state_dict({k[len(prefix):]:v for k,v in ck["weight"].items() if k.startswith(prefix)},strict=True)
+              flow.remove_weight_norm();gen.remove_weight_norm()
+              with torch.inference_mode():
+                  pf=torch.from_numpy(f0[:t].copy()).reshape(1,t)*2**(pitch/12)
+                  m=1127*torch.log1p(pf/700)
+                  a=1127*math.log(1+50/700);b=1127*math.log(1+1100/700)
+                  coarse=torch.where(m>0,(m-a)*254/(b-a)+1,m).clamp(1,255).round().long()
+                  mu,logs,mask=enc(phone,coarse,torch.tensor([t]))
+                  noise=(torch.arange(mu.numel(),dtype=torch.float32).remainder(37)-18).reshape_as(mu)/18
+                  z=flow((mu+logs.exp()*noise*0.66666)*mask,mask,g=ck["weight"]["emb_g.weight"][0].float().reshape(1,-1,1),reverse=True)*mask
+                  upp=math.prod(cfg[12]);exc=(torch.arange(t*upp,dtype=torch.float32).remainder(31)-15).reshape(1,t*upp,1)/15
+                  with patch("torch.randn_like",return_value=exc):
+                      y=gen(z,pf,g=ck["weight"]["emb_g.weight"][0].float().reshape(1,-1,1))
+                  y.contiguous().numpy().tofile(name+".pipeline.f32")
+                  print("REFERENCE_PIPELINE",name,t,sr,y.shape,flush=True)
+          PY
       - name: Build native model bank and index path
         run: |
           cat > CMakeLists.txt <<'EOF'
@@ -602,6 +642,55 @@ jobs:
             require(at::allclose(y,ref,1e-3,1e-3),"HuBERT mismatch");
            }
           }
+          // Shared feature and pitch engines, per-model preloaded synthesizer; no file I/O in forward.
+          struct NeuralPipeline {
+           TextEncoder enc;ReverseFlow flow;Generator gen;
+           const Preset& preset;
+           NeuralPipeline(const c10::impl::GenericDict& root,const Preset& p):enc(root),flow(root),gen(root),preset(p){}
+           static at::Tensor interpolate_f0(const at::Tensor& f){
+            auto idx=at::arange(f.numel(),f.options().dtype(at::kLong));
+            auto voiced=f.gt(0);
+            auto left=std::get<0>(at::cummax(at::where(voiced,idx,at::full_like(idx,-1)),0));
+            auto right=at::flip(std::get<0>(at::cummin(at::flip(at::where(voiced,idx,at::full_like(idx,f.numel())),{0}),0)),{0});
+            auto l=at::where(left.ge(0),left,right).clamp(0,f.numel()-1);
+            auto r=at::where(right.lt(f.numel()),right,left).clamp(0,f.numel()-1);
+            auto frac=(idx-l).to(f.scalar_type())/(r-l).clamp_min(1).to(f.scalar_type());
+            auto interp=f.index_select(0,l)+(f.index_select(0,r)-f.index_select(0,l))*frac;
+            return at::where(voiced,f,interp);
+           }
+           at::Tensor synthesize(const at::Tensor& features,const at::Tensor& f0,int64_t input_len,bool deterministic)const{
+            require(preset.index==0.f,"nonzero index path not yet integrated");
+            auto phone=features.repeat_interleave(2,1);
+            auto t=std::min({phone.size(1),f0.numel(),input_len/160});
+            require(t>0,"insufficient frames");
+            phone=phone.slice(1,0,t);
+            auto pf=interpolate_f0(f0).slice(0,0,t).reshape({1,t})*std::pow(2.,preset.pitch/12.);
+            auto m=1127*at::log1p(pf/700);
+            double lo=1127*std::log(1+50./700),hi=1127*std::log(1+1100./700);
+            auto coarse=at::where(m.gt(0),(m-lo)*254/(hi-lo)+1,m).clamp(1,255).round().to(at::kLong);
+            auto stats=enc.forward(phone,coarse,at::full({1},t,coarse.options()));
+            auto mu=stats.slice(1,0,enc.inter),logs=stats.slice(1,enc.inter,2*enc.inter),mask=stats.slice(1,2*enc.inter,2*enc.inter+1);
+            auto latent=deterministic?(at::arange(mu.numel(),mu.options()).remainder(37)-18).reshape(mu.sizes())/18:at::randn_like(mu);
+            auto z=flow.forward((mu+logs.exp()*latent*0.66666)*mask,mask,0)*mask;
+            auto noise=deterministic?(at::arange(t*gen.upp,pf.options()).remainder(31)-15).reshape({1,t*gen.upp,1})/15:at::randn({1,t*gen.upp,1},pf.options());
+            return gen.forward(z,pf,noise,0);
+           }
+          };
+          void verify_pipeline(const c10::impl::GenericDict& f8,const c10::impl::GenericDict& f9){
+           at::NoGradGuard guard;NativeHubert hubert("hubert.bin");NativeRMVPE rmvpe("rmvpe.pt");
+           NeuralPipeline a(f8,presets[2]),b(f9,presets[3]);
+           auto x=fixture("rmvpe.input.f32",{1,5120});
+           auto start=Clock::now();auto h=hubert.forward(x);auto hu=ms(start);
+           start=Clock::now();auto f=rmvpe.decode(rmvpe.hidden(rmvpe.mel(x)));auto rm=ms(start);
+           for(auto* p:{&a,&b}){
+            start=Clock::now();auto y=p->synthesize(h,f,x.size(-1),true);auto synth=ms(start);
+            auto ref=fixture(std::string(p->preset.name)+".pipeline.f32",y.sizes());
+            auto err=(y-ref).abs();
+            std::cout<<"PIPELINE "<<p->preset.name<<" samples="<<y.numel()<<" max_abs_error="<<err.max().item<float>()<<" rms_error="<<err.square().mean().sqrt().item<float>()<<" hubert_ms="<<hu<<" rmvpe_ms="<<rm<<" synth_ms="<<synth<<" total_compute_ms="<<hu+rm+synth<<" total_audio_latency=NOT_MEASURED"<<std::endl;
+            require(at::isfinite(y).all().item<bool>() && y.abs().max().item<float>()>1e-5,"invalid pipeline waveform");
+            require(at::allclose(y,ref,2e-3,2e-3),"end-to-end fixture mismatch");
+           }
+          }
           struct Model {
            c10::IValue checkpoint;
            std::unique_ptr<faiss::Index> index;
@@ -677,6 +766,7 @@ jobs:
             verify_generator(f9.checkpoint.toGenericDict(),"F9");
             verify_rmvpe();
             verify_hubert();
+            verify_pipeline(f8.checkpoint.toGenericDict(),f9.checkpoint.toGenericDict());
             std::atomic<const Model*> selected{&f8};
             require(selected.is_lock_free(),"pointer atomics not lock free");
             double worst=0;
@@ -690,7 +780,7 @@ jobs:
              // Nonzero-index algorithm is NOT adopted for F8/F9. Actual F6/F7 indexes not available to this public runner.
              std::cout<<"INDEX_BYPASS "<<m->preset->name<<" pass"<<std::endl;
             }
-            std::cout<<"NATIVE_CORE_PASS preload_selection_text_encoder_reverse_flow_generator_rmvpe_hubert; full_pipeline=not_implemented; audio_latency=not_measured"<<std::endl;
+            std::cout<<"NATIVE_CORE_PASS preload_selection_text_encoder_reverse_flow_generator_rmvpe_hubert; fixed_input_pipeline_test; realtime_pipeline=not_implemented; audio_latency=not_measured"<<std::endl;
             return 0;
            }catch(const std::exception& e){std::cerr<<"NATIVE_CORE_FAIL "<<e.what()<<std::endl;return 1;}
           }
@@ -720,7 +810,7 @@ jobs:
             "model_conversion":false,
             "python_resident":false,
             "acceptance":{"all_four_presets":true,"no_underruns":true,"no_dropped_blocks":true,"max_measured_total_latency_ms":20,"audio_quality_reference_check":true},
-            "native_scope":"F8/F9 original checkpoints, index, selection and official TextEncoder, reverse Flow, GeneratorNSF, RMVPE and HuBERT parity only",
+            "native_scope":"F8/F9 original checkpoints, index, selection and official TextEncoder, reverse Flow, GeneratorNSF, RMVPE, HuBERT and F8/F9 fixed-input neural pipeline parity only",
             "gpu_measured":false,
             "audio_latency_measured":false,
             "overall":"NOT_PASSED"
