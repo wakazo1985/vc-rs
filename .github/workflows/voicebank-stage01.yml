@@ -1,12 +1,13 @@
 name: VoiceBank Stage01 public model verification
 on:
-  push:
-    branches: [voicebank-stage01-verification]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
   verify:
+    if: github.head_ref == 'voicebank-stage01-verification' || github.ref_name == 'voicebank-stage01-verification'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
