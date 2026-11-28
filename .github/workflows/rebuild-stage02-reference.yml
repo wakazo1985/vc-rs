@@ -23,6 +23,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install system FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          command -v ffmpeg
+          ffmpeg -version
       - name: Install CPU PyTorch and official inference dependencies
         run: |
           python -m pip install --upgrade pip
@@ -44,7 +50,9 @@ jobs:
         run: |
           cd engine
           python -c 'from infer.vc.modules import VC; from infer.rmvpe import RMVPE; import av, numpy, librosa; print("RVC_IMPORT_OK", av.__version__, numpy.__version__, librosa.__version__)'
-          ffmpeg -version | head -n 1
+          python -c 'import shutil, subprocess; p=shutil.which("ffmpeg"); assert p, "FFmpeg binary missing"; subprocess.run([p,"-version"],check=True)' 
+          python -c 'import numpy as np, soundfile as sf; sf.write("/tmp/rvc-preflight.wav",np.zeros(16000,dtype=np.float32),16000)'
+          python -c 'from infer.audio import load_audio; import numpy as np; a=load_audio("/tmp/rvc-preflight.wav",16000); assert len(a)==16000 and np.isfinite(a).all(); print("RVC_AUDIO_LOAD_OK")'
       - name: Verify public checkpoints and generate common input
         env:
           ENGINE: ${{ matrix.engine }}
