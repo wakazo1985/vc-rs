@@ -104,7 +104,7 @@ jobs:
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git upstream
           git -C upstream checkout 81eed5e8f68b6bed1789f682fe78cdd324495afc
-          python -m pip install scipy==1.14.1 librosa==0.10.2.post1
+          python -m pip install scipy==1.14.1 librosa==0.10.2.post1 transformers==4.49.0
           PYTHONPATH="$PWD/upstream" python - <<'PY'
           import torch
           from infer.module.models import TextEncoder, ResidualCouplingBlock, GeneratorNSF
@@ -165,6 +165,28 @@ jobs:
               for key,val in (("input",x),("mel",mel),("hidden",hidden),("f0",torch.from_numpy(f0))):
                   val.float().contiguous().numpy().tofile("rmvpe."+key+".f32")
               print("RMVPE_REFERENCE",list(mel.shape),list(hidden.shape),flush=True)
+          PY
+      - name: Generate official HuBERT reference from unchanged distributed checkpoint
+        run: |
+          PYTHONPATH="$PWD/upstream" python - <<'PY'
+          import hashlib, pathlib, torch, shutil
+          from huggingface_hub import snapshot_download
+          from infer.hubert import load_hubert_model,extract_hubert_features
+          dest=pathlib.Path("upstream/assets")
+          snapshot_download("lj1995/VoiceConversionWebUI",revision="1be9d36",allow_patterns=["hubert_base/*"],local_dir=dest)
+          src=dest/"hubert_base/pytorch_model.bin"
+          with src.open("rb") as f:
+              assert hashlib.file_digest(f,"sha256").hexdigest()=="cc8c20f4b90a520757260197a3ff2505705a7adbd20ad9eeaa4e1a9b38442ef5"
+          shutil.copyfile(src,"hubert.bin")
+          torch.set_num_threads(2)
+          model=load_hubert_model("cpu",False)
+          import numpy as np
+          x=torch.from_numpy(np.fromfile("rmvpe.input.f32",dtype=np.float32)).reshape(1,-1)
+          with torch.inference_mode():
+              for v in ("v1","v2"):
+                  y=extract_hubert_features(model,x,v)
+                  y.float().contiguous().numpy().tofile("hubert."+v+".f32")
+                  print("HUBERT_REFERENCE",v,list(y.shape),flush=True)
           PY
       - name: Build native model bank and index path
         run: |
@@ -529,6 +551,57 @@ jobs:
            require(at::allclose(h,href,1e-4,1e-4),"RMVPE salience mismatch");
            require(at::allclose(f0,fref,1e-4,0.05),"RMVPE F0 mismatch");
           }
+          // The distributed RVC HuBERT config is group-norm CNN, post-norm 12-layer encoder, 768 channels.
+          struct NativeHubert {
+           std::unordered_map<std::string,at::Tensor> w;
+           at::Tensor pos_weight;
+           explicit NativeHubert(const std::string& path){
+            caffe2::serialize::PyTorchStreamReader reader(path);
+            auto root=load_original(reader).toGenericDict();
+            for(auto& kv:root)if(kv.value().isTensor())w.emplace(kv.key().toStringRef(),kv.value().toTensor().to(at::kFloat));
+            const std::string k="encoder.pos_conv_embed.conv";
+            if(w.count(k+".weight"))pos_weight=W(k+".weight");
+            else if(w.count(k+".parametrizations.weight.original0"))pos_weight=at::_weight_norm(W(k+".parametrizations.weight.original1"),W(k+".parametrizations.weight.original0"),2);
+            else pos_weight=at::_weight_norm(W(k+".weight_v"),W(k+".weight_g"),2);
+           }
+           const at::Tensor& W(const std::string& k)const{return w.at(k);}
+           at::Tensor norm(const at::Tensor& x,const std::string& k)const{return at::layer_norm(x,{x.size(-1)},W(k+".weight"),W(k+".bias"),1e-5,true);}
+           at::Tensor linear(const at::Tensor& x,const std::string& k)const{return at::linear(x,W(k+".weight"),W(k+".bias"));}
+           at::Tensor forward(const at::Tensor& input,bool v1=false)const{
+            auto x=input.unsqueeze(1);
+            for(int i=0;i<7;++i){
+             auto k="feature_extractor.conv_layers."+std::to_string(i);
+             x=at::conv1d(x,W(k+".conv.weight"),std::nullopt,at::IntArrayRef{i==0?5:2},at::IntArrayRef{0},at::IntArrayRef{1},1);
+             if(i==0)x=at::group_norm(x,512,W(k+".layer_norm.weight"),W(k+".layer_norm.bias"),1e-5,true);
+             x=at::gelu(x,"none");
+            }
+            x=linear(norm(x.transpose(1,2),"feature_projection.layer_norm"),"feature_projection.projection");
+            auto pos=at::conv1d(x.transpose(1,2),pos_weight,W("encoder.pos_conv_embed.conv.bias"),at::IntArrayRef{1},at::IntArrayRef{64},at::IntArrayRef{1},16).slice(-1,0,x.size(1));
+            x=norm(x+at::gelu(pos,"none").transpose(1,2),"encoder.layer_norm");
+            for(int i=0;i<(v1?9:12);++i){
+             auto k="encoder.layers."+std::to_string(i),a=k+".attention";
+             auto b=x.size(0),t=x.size(1);
+             auto q=linear(x,a+".q_proj").reshape({b,t,12,64}).transpose(1,2)*0.125;
+             auto key=linear(x,a+".k_proj").reshape({b,t,12,64}).transpose(1,2);
+             auto v=linear(x,a+".v_proj").reshape({b,t,12,64}).transpose(1,2);
+             auto att=at::matmul(at::softmax(at::matmul(q,key.transpose(-1,-2)),-1),v).transpose(1,2).contiguous().reshape({b,t,768});
+             x=norm(x+linear(att,a+".out_proj"),k+".layer_norm");
+             auto ff=linear(at::gelu(linear(x,k+".feed_forward.intermediate_dense"),"none"),k+".feed_forward.output_dense");
+             x=norm(x+ff,k+".final_layer_norm");
+            }
+            return (v1?linear(x,"final_proj"):x).contiguous();
+           }
+          };
+          void verify_hubert(){
+           at::NoGradGuard guard;NativeHubert model("hubert.bin");
+           auto x=fixture("rmvpe.input.f32",{1,5120});
+           for(bool v1:{true,false}){
+            auto t=Clock::now();auto y=model.forward(x,v1);auto elapsed=ms(t);
+            auto ref=fixture(v1?"hubert.v1.f32":"hubert.v2.f32",y.sizes());
+            std::cout<<"HUBERT "<<(v1?"v1":"v2")<<" max_abs_error="<<(y-ref).abs().max().item<float>()<<" cpu_ms="<<elapsed<<std::endl;
+            require(at::allclose(y,ref,1e-3,1e-3),"HuBERT mismatch");
+           }
+          }
           struct Model {
            c10::IValue checkpoint;
            std::unique_ptr<faiss::Index> index;
@@ -603,6 +676,7 @@ jobs:
             verify_generator(f8.checkpoint.toGenericDict(),"F8");
             verify_generator(f9.checkpoint.toGenericDict(),"F9");
             verify_rmvpe();
+            verify_hubert();
             std::atomic<const Model*> selected{&f8};
             require(selected.is_lock_free(),"pointer atomics not lock free");
             double worst=0;
@@ -616,7 +690,7 @@ jobs:
              // Nonzero-index algorithm is NOT adopted for F8/F9. Actual F6/F7 indexes not available to this public runner.
              std::cout<<"INDEX_BYPASS "<<m->preset->name<<" pass"<<std::endl;
             }
-            std::cout<<"NATIVE_CORE_PASS preload_selection_text_encoder_reverse_flow_generator_rmvpe; full_neural_inference=not_implemented; audio_latency=not_measured"<<std::endl;
+            std::cout<<"NATIVE_CORE_PASS preload_selection_text_encoder_reverse_flow_generator_rmvpe_hubert; full_pipeline=not_implemented; audio_latency=not_measured"<<std::endl;
             return 0;
            }catch(const std::exception& e){std::cerr<<"NATIVE_CORE_FAIL "<<e.what()<<std::endl;return 1;}
           }
@@ -646,7 +720,7 @@ jobs:
             "model_conversion":false,
             "python_resident":false,
             "acceptance":{"all_four_presets":true,"no_underruns":true,"no_dropped_blocks":true,"max_measured_total_latency_ms":20,"audio_quality_reference_check":true},
-            "native_scope":"F8/F9 original checkpoints, index, selection and official TextEncoder, reverse Flow, GeneratorNSF and RMVPE parity only",
+            "native_scope":"F8/F9 original checkpoints, index, selection and official TextEncoder, reverse Flow, GeneratorNSF, RMVPE and HuBERT parity only",
             "gpu_measured":false,
             "audio_latency_measured":false,
             "overall":"NOT_PASSED"
