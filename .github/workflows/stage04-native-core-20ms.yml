@@ -1075,8 +1075,8 @@ jobs:
            auto rms=[](const at::Tensor& x,int64_t sr){
             return at::constant_pad_nd(x.reshape({1,1,-1}),{sr/2,sr/2},0).unfold(-1,sr,sr/2).square().mean(-1).sqrt();
            };
-           auto a=at::upsample_linear1d(rms(x,16000),{y.numel()},false,std::nullopt);
-           auto b=at::upsample_linear1d(rms(y,sr),{y.numel()},false,std::nullopt).clamp_min(1e-6);
+           auto a=at::upsample_linear1d(rms(x,16000),at::IntArrayRef{y.numel()},false,std::optional<double>{});
+           auto b=at::upsample_linear1d(rms(y,sr),at::IntArrayRef{y.numel()},false,std::optional<double>{}).clamp_min(1e-6);
            return y*a.pow(1-rate)*b.pow(rate-1);
           }
           void verify_indexed_pipeline(const Model& f6,const Model& f7){
