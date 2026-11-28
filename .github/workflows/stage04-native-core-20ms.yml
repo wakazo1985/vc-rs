@@ -31,7 +31,33 @@ jobs:
       - name: Acquire exact original checkpoints and indices
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y libopenblas-dev
+          sudo apt-get install -y libopenblas-dev libssl-dev
+          curl --fail --location --retry 3 https://raw.githubusercontent.com/pytorch/pytorch/v2.7.1/torch/csrc/jit/serialization/unpickler.cpp -o unpickler.cpp
+          python - <<'PATCH'
+          from pathlib import Path
+          p=Path('unpickler.cpp')
+          s=p.read_text()
+          marker='} else if (module_name == "collections" && class_name == "OrderedDict") {'
+          start=s.index(marker)
+          end=s.index('} else if (module_name == "torch" && class_name == "device") {',start)
+          old=s[start:end]
+          assert 'stack_.back() = IValue();' in old
+          # Preserve actual OrderedDict keys and insertion order in the native dict.
+          s=s[:start]+old.replace('stack_.back() = IValue();','TORCH_CHECK(stack_.back().isTuple() && stack_.back().toTupleRef().elements().empty(), "unsupported OrderedDict constructor");\n      stack_.back() = c10::impl::GenericDict(c10::AnyType::get(), c10::AnyType::get());')+s[end:]
+          # Python state_dict may also include _metadata as object state.
+          old='    case PickleOpCode::BUILD:\n    case PickleOpCode::REDUCE: {'
+          assert old in s
+          s=s.replace(old,'''    case PickleOpCode::BUILD:
+      if (stack_.size() >= 2 && stack_[stack_.size()-2].isGenericDict() && stack_.back().isGenericDict()) {
+        auto state = stack_.back().toGenericDict();
+        TORCH_CHECK(state.size() == 1 && state.contains(IValue("_metadata")), "unsupported dictionary BUILD state");
+        stack_.pop_back();
+        break;
+      }
+      [[fallthrough]];
+    case PickleOpCode::REDUCE: {''')
+          p.write_text(s)
+          PATCH
           git clone --depth 1 --branch v1.10.0 https://github.com/facebookresearch/faiss.git faiss-src
           python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install 'huggingface_hub>=0.26,<1'
@@ -59,6 +85,12 @@ jobs:
                       with z.open(members[0]) as src,target.open("wb") as dst: shutil.copyfileobj(src,dst)
                       with target.open("rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()==fingerprint[ext[1:]+"_sha256"]
                       print("ORIGINAL_HASH_PASS",name,ext,flush=True)
+              import torch
+              ckpt=torch.load(name+'.pth',map_location='cpu',weights_only=True)
+              with open(name+'.golden.tsv','w') as manifest:
+                  for key,t in ckpt['weight'].items():
+                      raw=t.detach().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+                      print(key,t.numel(),t.element_size(),hashlib.sha256(raw).hexdigest(),sep='\t',file=manifest)
           shutil.copyfile(frozen,"stage04-native/VoiceBank_03_Presets.json")
           PY
       - name: Build native model bank and index path
@@ -67,6 +99,7 @@ jobs:
           cmake_minimum_required(VERSION 3.18)
           project(voicebank_native LANGUAGES CXX)
           find_package(Torch REQUIRED)
+          find_package(OpenSSL REQUIRED)
           find_package(OpenMP REQUIRED)
           find_package(BLAS REQUIRED)
           find_package(LAPACK REQUIRED)
@@ -75,7 +108,8 @@ jobs:
           set(FAISS_ENABLE_C_API OFF CACHE BOOL "" FORCE)
           set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
           add_subdirectory(faiss-src faiss-build EXCLUDE_FROM_ALL)
-          add_executable(voicebank_native core.cpp)
+          add_executable(voicebank_native core.cpp unpickler.cpp)
+          target_link_libraries(voicebank_native PRIVATE OpenSSL::Crypto)
           target_link_libraries(voicebank_native PRIVATE "${TORCH_LIBRARIES}" faiss LAPACK::LAPACK BLAS::BLAS OpenMP::OpenMP_CXX)
           set_property(TARGET voicebank_native PROPERTY CXX_STANDARD 17)
           EOF
@@ -83,6 +117,13 @@ jobs:
           #include <torch/csrc/jit/serialization/import_read.h>
           #include <caffe2/serialize/inline_container.h>
           #include <ATen/ATen.h>
+          #include <torch/csrc/jit/serialization/unpickler.h>
+          #include <openssl/sha.h>
+          #include <fstream>
+          #include <iomanip>
+          #include <sstream>
+          #include <unordered_map>
+          #include <cstring>
           #include <faiss/Index.h>
           #include <faiss/index_io.h>
           #include <array>
@@ -103,6 +144,25 @@ jobs:
           constexpr int sample_rate=48000;
           constexpr int target_samples=960;
           static_assert(target_samples*1000/sample_rate==20);
+          c10::IValue load_original(caffe2::serialize::PyTorchStreamReader& archive){
+           auto record=archive.getRecord("data.pkl");
+           auto& ptr=std::get<0>(record);
+           auto size=std::get<1>(record);
+           size_t pos=0;
+           auto input=[&](char* dst,size_t n){n=std::min(n,size-pos);std::memcpy(dst,static_cast<const char*>(ptr.get())+pos,n);pos+=n;return n;};
+           auto storage=[&](const std::string& key){return std::get<0>(archive.getRecord("data/"+key));};
+           torch::jit::Unpickler u(input,nullptr,nullptr,storage,at::Device(at::kCPU),false,torch::jit::Unpickler::defaultTypeParser,nullptr);
+           u.set_version(archive.version());
+           return u.parse_ivalue();
+          }
+          std::string digest_tensor(const at::Tensor& t){
+           auto b=t.contiguous();
+           unsigned char digest[SHA256_DIGEST_LENGTH];
+           SHA256(static_cast<const unsigned char*>(b.data_ptr()),b.nbytes(),digest);
+           std::ostringstream out;
+           for(auto x:digest)out<<std::hex<<std::setw(2)<<std::setfill('0')<<int(x);
+           return out.str();
+          }
           struct Model {
            c10::IValue checkpoint;
            std::unique_ptr<faiss::Index> index;
@@ -111,24 +171,32 @@ jobs:
            Model(const Preset& p):preset(&p){
             auto start=Clock::now();
             caffe2::serialize::PyTorchStreamReader reader(std::string(p.name)+".pth");
-            checkpoint=torch::jit::readArchiveAndTensors("data","","",std::nullopt,std::nullopt,at::Device(at::kCPU),reader);
+            checkpoint=load_original(reader);
             auto root=checkpoint.toGenericDict();
             auto weights=root.at(c10::IValue("weight")).toGenericDict();
+            std::ifstream golden(std::string(p.name)+".golden.tsv");
+            require(bool(golden),"missing golden manifest");
+            std::unordered_map<std::string,std::string> hashes;
+            std::string key,h; long long n,b;
+            while(golden>>key>>n>>b>>h) hashes.emplace(key,h);
             long count=0; long long elements=0;
             for(auto& kv:weights){
              auto t=kv.value().toTensor();
              require(t.device().is_cpu(),"device mapping");
              require(at::isfinite(t).all().item<bool>(),"nonfinite");
+             auto key=kv.key().toStringRef();
+             require(hashes.at(key)==digest_tensor(t),"tensor bytes mismatch");
+             hashes.erase(key);
              ++count;elements+=t.numel();
             }
-            require(count==457,"unexpected tensor count");
+            require(count==457 && hashes.empty(),"unexpected tensor count");
             index.reset(faiss::read_index((std::string(p.name)+".index").c_str()));
             require(index && index->d==768 && index->ntotal>=8,"invalid original index");
             if(p.index!=0.f){
              index_vectors.resize(size_t(index->ntotal)*index->d);
              index->reconstruct_n(0,index->ntotal,index_vectors.data());
             }
-            std::cout<<"MODEL "<<p.name<<" tensors="<<count<<" elements="<<elements<<" index_count="<<index->ntotal<<" preload_ms="<<ms(start)<<std::endl;
+            std::cout<<"MODEL "<<p.name<<" exact_tensor_hashes="<<count<<" tensors="<<count<<" elements="<<elements<<" index_count="<<index->ntotal<<" preload_ms="<<ms(start)<<std::endl;
            }
            // Original RVC k=8, inverse squared distance blend; no active index lookup at rate zero.
            std::vector<float> mix(const std::vector<float>& x,float rate,float protect,bool voiced)const{
@@ -166,7 +234,7 @@ jobs:
            }catch(const std::exception& e){std::cerr<<"NATIVE_CORE_FAIL "<<e.what()<<std::endl;return 1;}
           }
           EOF
-          cp CMakeLists.txt core.cpp stage04-native/
+          cp CMakeLists.txt core.cpp unpickler.cpp stage04-native/
           cmake -S . -B build -DCMAKE_PREFIX_PATH="$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')" -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target voicebank_native -j2
       - name: Run native code with no Python interpreter
