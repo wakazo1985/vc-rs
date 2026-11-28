@@ -1,0 +1,91 @@
+name: Stage01 Python RVC inference
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inference:
+    if: github.head_ref == 'voicebank-stage01-verification' || github.ref_name == 'voicebank-stage01-verification'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [russell, joyca]
+    env:
+      MODEL: ${{ matrix.model }}
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Python smoke test
+        run: python -c "import sys; print('PYTHON_OK',sys.version)"
+      - name: Fetch upstream official RVC and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libsndfile1 libportaudio2 espeak-ng
+          git clone --depth 1 https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git rvc
+          git -C rvc rev-parse HEAD
+          cd rvc
+          sed -e 's@https://mirrors.pku.edu.cn/pypi/simple@https://pypi.org/simple@g' -e 's@https://mirrors.nju.edu.cn/pytorch/whl/cpu@https://download.pytorch.org/whl/cpu@g' requirments_cpu_py312.txt > /tmp/rvc-requirements.txt
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r /tmp/rvc-requirements.txt
+          python -m pip install huggingface_hub
+      - name: Download official feature and pitch models
+        working-directory: rvc
+        run: |
+          hf download lj1995/VoiceConversionWebUI --revision main --include 'hubert_base/*' --local-dir assets
+          hf download lj1995/VoiceConversionWebUI rmvpe.pt --revision main --local-dir assets/rmvpe
+      - name: Download and verify unchanged model
+        run: |
+          python - <<'PY'
+          import hashlib, pathlib, zipfile, requests, os, shutil
+          models={
+            'russell': ('https://huggingface.co/datasets/Rokkonrol/RVC_models/resolve/main/Russell%20Archey%20%5BExplore%20With%20Us%20%28EWU%29%5D.zip','88ba827fe6023d102d6d84a7bc26e1e181b40bb47977ccae1c378b320b3c1582'),
+            'joyca': ('https://huggingface.co/rayzox57/Joyca_High_RVC/resolve/main/Joyca_High_Voice_v2_600e.zip','4924376afcc16f3a8c109822239fdc5ce73c0e2459bb9fc71e55564aae0e0c99')}
+          url, expected = models[os.environ['MODEL']]
+          h=hashlib.sha256()
+          with requests.get(url,stream=True,timeout=(20,120)) as r:
+              r.raise_for_status()
+              with open('model.zip','wb') as f:
+                  for c in r.iter_content(1024*1024): h.update(c); f.write(c)
+          assert h.hexdigest()==expected, h.hexdigest()
+          print('PUBLIC_ARCHIVE_SHA256',h.hexdigest())
+          root=pathlib.Path('rvc/assets')
+          with zipfile.ZipFile('model.zip') as z:
+              assert z.testzip() is None
+              for suffix,folder in [('.pth','weights'),('.index','indices')]:
+                  names=[n for n in z.namelist() if n.lower().endswith(suffix)]
+                  assert len(names)==1,names
+                  target=root/folder/('test'+suffix)
+                  target.parent.mkdir(parents=True,exist_ok=True)
+                  with z.open(names[0]) as src,target.open('wb') as dst: shutil.copyfileobj(src,dst)
+          PY
+      - name: Run upstream Python CLI on synthetic test speech
+        working-directory: rvc
+        run: |
+          mkdir -p ../report
+          espeak-ng -v en-us -s 145 -w /tmp/stage01-input.wav 'This is a neutral voice conversion test. One two three four five.'
+          if [ "$MODEL" = russell ]; then pitch=-12; rate=0.75; else pitch=-20; rate=0; fi
+          echo "Temporary test settings: pitch=$pitch index=$rate protect=0.33"
+          python infer/cli.py --model assets/weights/test.pth --input /tmp/stage01-input.wav --output /tmp/stage01-output.wav --pitch "$pitch" --f0-method rmvpe --index assets/indices/test.index --index-rate "$rate" --protect 0.33
+          python - <<'PY'
+          import soundfile as sf, numpy as np, json, subprocess, pathlib, os
+          x,sr=sf.read('/tmp/stage01-output.wav')
+          inp,isr=sf.read('/tmp/stage01-input.wav')
+          assert x.size>0 and np.isfinite(x).all() and np.max(np.abs(x))>1e-4
+          report={'model':os.environ['MODEL'],'status':'pass','source_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'source_audio':'synthetic espeak, not user recording','sample_rate':sr,'samples':len(x),'seconds':len(x)/sr,'input_seconds':len(inp)/isr,'rms':float(np.sqrt(np.mean(x*x))),'peak':float(np.max(np.abs(x))),'test_only_settings':True,'realtime_latency':'not tested','cpp_equivalence':'not tested'}
+          print(json.dumps(report,indent=2))
+          pathlib.Path('../report/result.json').write_text(json.dumps(report,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage01-python-${{ matrix.model }}
+          path: report/
+          if-no-files-found: warn
+          retention-days: 7
