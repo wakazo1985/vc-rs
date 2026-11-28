@@ -9,11 +9,11 @@ permissions:
 jobs:
   reference:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        engine: [rvc]
+        engine: [applio, rvc]
     env:
       OMP_NUM_THREADS: '2'
       MKL_NUM_THREADS: '2'
@@ -49,6 +49,10 @@ jobs:
       - name: Preflight official RVC imports before fetching models
         run: |
           cd engine
+          if [ "${{ matrix.engine }}" = applio ]; then
+            python -c 'from rvc.infer.infer import VoiceConverter; print("APPLIO_IMPORT_OK")'
+            exit 0
+          fi
           python -c 'from infer.vc.modules import VC; from infer.rmvpe import RMVPE; import av, numpy, librosa; print("RVC_IMPORT_OK", av.__version__, numpy.__version__, librosa.__version__)'
           python -c 'import shutil, subprocess; p=shutil.which("ffmpeg"); assert p, "FFmpeg binary missing"; subprocess.run([p,"-version"],check=True)' 
           python -c 'import numpy as np, soundfile as sf; sf.write("/tmp/rvc-preflight.wav",np.zeros(16000,dtype=np.float32),16000)'
@@ -127,6 +131,7 @@ jobs:
           source=root/"source-commit.txt"
           input_path=out/"00_input_LibriSpeech.wav"
           results=[]
+          import itertools
           # Log missing/unexpected keys on actual official network load; do not modify any weights.
           original_load=torch.nn.Module.load_state_dict
           def audited_load(self,*args,**kwargs):
@@ -146,7 +151,9 @@ jobs:
               os.environ["outside_index_root"]=str(root/"private-models")
               from infer.vc.modules import VC
               vc=VC(SimpleNamespace(device="cpu",is_half=False,x_pad=1,x_query=6,x_center=38,x_max=41))
+          candidates={"toddler":[(p,i) for p,i in itertools.product([8,12,16,20],[0.75,1.0])],"girl":[(p,i) for p,i in itertools.product([8,12,16],[0.75,1.0])],"D":[(15,1.0)],"robot":[(p,i) for p,i in itertools.product([-4,0,4],[0.75,1.0])]}
           for name,m in manifest.items():
+            for pitch,index_rate in candidates[name]:
               result={"voice":name,"engine":os.environ["ENGINE"],"commit":source.read_text().strip(),**{k:v for k,v in m.items() if k.endswith("sha256")}}
               try:
                   ix=faiss.read_index(m["index"])
@@ -154,15 +161,15 @@ jobs:
                   assert ix.d==768 and ix.ntotal>0 and ix.is_trained
                   del ix
                   # Candidate pitch for male input, not author-certified optimum.
-                  pitch={"toddler":12,"girl":12,"D":15,"robot":0}[name]
+                  # Candidate matrix, not author-certified settings.
                   # Applio API defaults; RVC reference settings from official API.
                   applio=os.environ["ENGINE"]=="applio"
-                  index_rate=0.75 if name!="D" else 1.0
+                  # Original weights and index unchanged.
                   protect=0.5 if applio else 0.33
                   rms=1.0 if applio else 0.25
                   result.update(pitch=pitch,index_rate=index_rate,protect=protect,rms_mix=rms,f0="rmvpe",sid=0,device="cpu",precision="float32")
                   random.seed(42);np.random.seed(42);torch.manual_seed(42)
-                  dest=out/(name+"_official_reference.wav")
+                  dest=out/(f"{name}_pitch{pitch:+d}_index{index_rate:.2f}.wav")
                   start=time.monotonic()
                   if applio:
                       vc.convert_audio(audio_input_path=str(input_path),audio_output_path=str(dest),model_path=m["pth"],index_path=m["index"],pitch=pitch,f0_method="rmvpe",index_rate=index_rate,volume_envelope=rms,protect=protect,embedder_model="contentvec",f0_autotune=False,proposed_pitch=False,sid=0,inference_engine="torch")
