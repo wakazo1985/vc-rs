@@ -1,0 +1,194 @@
+name: Stage 04 native core 20ms gate
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/stage04-native-core-20ms.yml'
+  push:
+    branches: [stage01-python-verification]
+    paths:
+      - '.github/workflows/stage04-native-core-20ms.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: VoiceBank-Stage03-Frozen
+          path: frozen
+          github-token: ${{ github.token }}
+          run-id: '46134456010'
+      - name: Acquire exact original checkpoints and indices
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libfaiss-dev libopenblas-dev
+          python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install 'huggingface_hub>=0.26,<1'
+          mkdir -p stage04-native
+          python - <<'PY'
+          import hashlib, zipfile, pathlib, shutil, json
+          from huggingface_hub import hf_hub_download
+          frozen=pathlib.Path("frozen/VoiceBank_03_Presets.json")
+          config=json.loads(frozen.read_text())
+          cases=[
+              ("F8","Rokkonrol/RVC_models","dataset","c4bdb3bb7aef5f7d213f79f57decea9e644fd4d5","Russell Archey [Explore With Us (EWU)].zip","88ba827fe6023d102d6d84a7bc26e1e181b40bb47977ccae1c378b320b3c1582","df8f49d094e57b0abe726d8650de5d865546bce4d893ec59841c51ee0777a08b"),
+              ("F9","rayzox57/Joyca_High_RVC","model","035dff8fce32b4efda3e9c25e045e73ac5819812","Joyca_High_Voice_v2_600e.zip","4924376afcc16f3a8c109822239fdc5ce73c0e2459bb9fc71e55564aae0e0c99","d0ea3825eeebaef3531a8eb928ab001908ab7147499f818cfac820bd35074d86")
+          ]
+          for name,repo,kind,rev,filename,archive_hash,pth_hash in cases:
+              p=next(x for x in config["presets"].values() if x["shortcut"]==name)
+              fingerprint=p["rvc"]["stage02_model_fingerprint"]
+              assert p["rvc"]["parameters"]["index_rate"]==0
+              path=hf_hub_download(repo,filename,repo_type=kind,revision=rev)
+              with open(path,"rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()==archive_hash
+              with zipfile.ZipFile(path) as z:
+                  for ext in (".pth",".index"):
+                      members=[n for n in z.namelist() if n.endswith(ext) and (ext==".pth" or pathlib.PurePosixPath(n).name.startswith("added_"))]
+                      assert len(members)==1
+                      target=pathlib.Path(name+ext)
+                      with z.open(members[0]) as src,target.open("wb") as dst: shutil.copyfileobj(src,dst)
+                      with target.open("rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()==fingerprint[ext[1:]+"_sha256"]
+                      print("ORIGINAL_HASH_PASS",name,ext,flush=True)
+          shutil.copyfile(frozen,"stage04-native/VoiceBank_03_Presets.json")
+          PY
+      - name: Build native model bank and index path
+        run: |
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.18)
+          project(voicebank_native LANGUAGES CXX)
+          find_package(Torch REQUIRED)
+          find_package(OpenMP REQUIRED)
+          find_package(BLAS REQUIRED)
+          find_package(LAPACK REQUIRED)
+          find_library(FAISS_LIBRARY faiss REQUIRED)
+          add_executable(voicebank_native core.cpp)
+          target_link_libraries(voicebank_native PRIVATE "${TORCH_LIBRARIES}" ${FAISS_LIBRARY} LAPACK::LAPACK BLAS::BLAS OpenMP::OpenMP_CXX)
+          set_property(TARGET voicebank_native PROPERTY CXX_STANDARD 17)
+          EOF
+          cat > core.cpp <<'EOF'
+          #include <torch/csrc/jit/serialization/import_read.h>
+          #include <caffe2/serialize/inline_container.h>
+          #include <ATen/ATen.h>
+          #include <faiss/Index.h>
+          #include <faiss/index_io.h>
+          #include <array>
+          #include <atomic>
+          #include <chrono>
+          #include <cmath>
+          #include <iostream>
+          #include <memory>
+          #include <stdexcept>
+          #include <vector>
+          using Clock=std::chrono::steady_clock;
+          double ms(Clock::time_point t){return std::chrono::duration<double,std::milli>(Clock::now()-t).count();}
+          void require(bool v,const char* msg){if(!v) throw std::runtime_error(msg);}
+          struct Preset{const char* name;int pitch;float index,protect,rms;};
+          constexpr std::array<Preset,4> presets{{
+           {"F6",20,.75f,.5f,1.f},{"F7",15,1.f,.33f,.25f},
+           {"F8",-12,0.f,.33f,1.f},{"F9",-16,0.f,.33f,1.f}}};
+          constexpr int sample_rate=48000;
+          constexpr int target_samples=960;
+          static_assert(target_samples*1000/sample_rate==20);
+          struct Model {
+           c10::IValue checkpoint;
+           std::unique_ptr<faiss::Index> index;
+           const Preset* preset;
+           Model(const Preset& p):preset(&p){
+            auto start=Clock::now();
+            caffe2::serialize::PyTorchStreamReader reader(std::string(p.name)+".pth");
+            checkpoint=torch::jit::readArchiveAndTensors("data","","",std::nullopt,std::nullopt,at::Device(at::kCPU),reader);
+            auto root=checkpoint.toGenericDict();
+            auto weights=root.at(c10::IValue("weight")).toGenericDict();
+            long count=0; long long elements=0;
+            for(auto& kv:weights){
+             auto t=kv.value().toTensor();
+             require(t.device().is_cpu(),"device mapping");
+             require(at::isfinite(t).all().item<bool>(),"nonfinite");
+             ++count;elements+=t.numel();
+            }
+            require(count==457,"unexpected tensor count");
+            index.reset(faiss::read_index((std::string(p.name)+".index").c_str()));
+            require(index && index->d==768 && index->ntotal>=8,"invalid original index");
+            std::cout<<"MODEL "<<p.name<<" tensors="<<count<<" elements="<<elements<<" index_count="<<index->ntotal<<" preload_ms="<<ms(start)<<std::endl;
+           }
+           // Original RVC k=8, inverse squared distance blend; no active index lookup at rate zero.
+           std::vector<float> mix(const std::vector<float>& x,float rate,float protect,bool voiced)const{
+            if(rate==0.f) return x;
+            require(x.size()==size_t(index->d),"feature dimension");
+            std::array<float,8> d{};std::array<faiss::Index::idx_t,8> ids{};
+            index->search(1,x.data(),8,d.data(),ids.data());
+            double total=0;std::array<double,8> w{};
+            for(int i=0;i<8;++i){require(ids[i]>=0 && std::isfinite(d[i]) && d[i]>0,"invalid or exact-zero distance");w[i]=1.0/(double(d[i])*d[i]);total+=w[i];}
+            std::vector<float> out(x.size(),0),v(x.size());
+            for(int i=0;i<8;++i){index->reconstruct(ids[i],v.data());for(size_t j=0;j<v.size();++j)out[j]+=float(w[i]/total)*v[j];}
+            const float a=voiced?1.f:protect;
+            for(size_t j=0;j<x.size();++j)out[j]=(out[j]*rate+x[j]*(1-rate))*a+x[j]*(1-a);
+            return out;
+           }
+          };
+          int main(){
+           try{
+            // Load both public original checkpoints once; no reloading on selection.
+            Model f8(presets[2]),f9(presets[3]);
+            std::atomic<const Model*> selected{&f8};
+            require(selected.is_lock_free(),"pointer atomics not lock free");
+            double worst=0;
+            for(int i=0;i<10000;++i){auto t=Clock::now();selected.store(i%2?&f8:&f9,std::memory_order_release);auto p=selected.load(std::memory_order_acquire);require(p!=nullptr,"selection");worst=std::max(worst,ms(t));}
+            std::cout<<"SELECTION_ONLY max_ms="<<worst<<" not_audio_latency=1"<<std::endl;
+            for(auto* m:{&f8,&f9}){
+             std::vector<float> q(768,0.013f);
+             require(m->mix(q,0,m->preset->protect,true)==q,"index bypass failed");
+             // Nonzero-index algorithm is NOT adopted for F8/F9. Actual F6/F7 indexes not available to this public runner.
+             std::cout<<"INDEX_BYPASS "<<m->preset->name<<" pass"<<std::endl;
+            }
+            std::cout<<"NATIVE_CORE_PASS preload_and_selection_only; neural_inference=not_implemented; audio_latency=not_measured"<<std::endl;
+            return 0;
+           }catch(const std::exception& e){std::cerr<<"NATIVE_CORE_FAIL "<<e.what()<<std::endl;return 1;}
+          }
+          EOF
+          cp CMakeLists.txt core.cpp stage04-native/
+          cmake -S . -B build -DCMAKE_PREFIX_PATH="$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j2
+      - name: Run native code with no Python interpreter
+        run: |
+          set -o pipefail
+          env -u PYTHONPATH ./build/voicebank_native | tee stage04-native/native.log
+          ldd build/voicebank_native > stage04-native/dependencies.txt
+          if grep -q libpython stage04-native/dependencies.txt; then exit 1; fi
+      - name: Establish strict 20ms acceptance gate
+        if: always()
+        run: |
+          mkdir -p stage04-native
+          cat > stage04-native/acceptance.json <<'EOF'
+          {
+            "total_latency_limit_ms":20,
+            "measurement_scope":"microphone input to audible output including host, queue, GPU and device buffering",
+            "sample_rate_hz":48000,
+            "max_total_latency_samples_at_48k":960,
+            "processing_hop_candidates_ms":[5,10],
+            "note":"Official RVC feature/pitch geometry must be preserved or independently validated; 5ms is host callback candidate, not proven neural hop.",
+            "original_files_only":true,
+            "model_conversion":false,
+            "python_resident":false,
+            "acceptance":{"all_four_presets":true,"no_underruns":true,"no_dropped_blocks":true,"max_measured_total_latency_ms":20,"audio_quality_reference_check":true},
+            "native_scope":"F8/F9 model preloading, original index read, atomic pointer selection and bypass only",
+            "gpu_measured":false,
+            "audio_latency_measured":false,
+            "overall":"NOT_PASSED"
+          }
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: VoiceBank-Stage04-Native-Core-20ms
+          path: stage04-native/
+          retention-days: 30
