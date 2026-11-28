@@ -91,8 +91,36 @@ jobs:
               with open(name+'.golden.tsv','w') as manifest:
                   for key,t in ckpt['weight'].items():
                       raw=t.detach().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
-                      print(key,t.numel(),t.element_size(),hashlib.sha256(raw).hexdigest(),sep='\t',file=manifest)
+                      print(key,t.numel(),t.element_size(),str(t.dtype).split('.')[-1],','.join(map(str,t.shape)) or '-',hashlib.sha256(raw).hexdigest(),sep='\t',file=manifest)
           shutil.copyfile(frozen,"stage04-native/VoiceBank_03_Presets.json")
+          rows=[]
+          for p in sorted(config["presets"].values(),key=lambda p:p["shortcut"]):
+              a=p["rvc"]["parameters"]
+              env=a["rms_mix_rate"] if "rms_mix_rate" in a else a["volume_envelope"]
+              rows.append(' {"%s",%d,%.2ff,%.2ff,%.2ff},' % (p["shortcut"],a["pitch_shift_semitones"],a["index_rate"],a["protect"],env))
+          pathlib.Path("presets.inc").write_text("\n".join(rows)+"\n")
+          PY
+      - name: Generate official TextEncoder reference
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git upstream
+          git -C upstream checkout 81eed5e8f68b6bed1789f682fe78cdd324495afc
+          python -m pip install scipy==1.14.1
+          PYTHONPATH="$PWD/upstream" python - <<'PY'
+          import torch
+          from infer.module.models import TextEncoder
+          torch.set_num_threads(2)
+          with torch.inference_mode():
+              for name in ("F8","F9"):
+                  ck=torch.load(name+".pth",map_location="cpu",weights_only=True)
+                  cfg=ck["config"]
+                  enc=TextEncoder(768,*cfg[2:8],float(cfg[8]),True).eval()
+                  enc.load_state_dict({k[6:]:v for k,v in ck["weight"].items() if k.startswith("enc_p.")},strict=True)
+                  for t in (8,33):
+                      phone=(torch.arange(t*768,dtype=torch.float32).remainder(97)-48).reshape(1,t,768)/97
+                      pitch=torch.arange(t,dtype=torch.long).remainder(254).reshape(1,t)+1
+                      m,logs,mask=enc(phone,pitch,torch.tensor([t-2]))
+                      torch.cat((m,logs,mask),dim=1).contiguous().numpy().tofile(f"{name}.enc{t}.f32")
+                      print("REFERENCE_ENCODER",name,t,m.shape,flush=True)
           PY
       - name: Build native model bank and index path
         run: |
@@ -118,6 +146,8 @@ jobs:
           #include <torch/csrc/jit/serialization/import_read.h>
           #include <caffe2/serialize/inline_container.h>
           #include <ATen/ATen.h>
+          #include <ATen/core/grad_mode.h>
+          #include <algorithm>
           #include <torch/csrc/jit/serialization/unpickler.h>
           #include <openssl/sha.h>
           #include <fstream>
@@ -140,8 +170,8 @@ jobs:
           void require(bool v,const char* msg){if(!v) throw std::runtime_error(msg);}
           struct Preset{const char* name;int pitch;float index,protect,rms;};
           constexpr std::array<Preset,4> presets{{
-           {"F6",20,.75f,.5f,1.f},{"F7",15,1.f,.33f,.25f},
-           {"F8",-12,0.f,.33f,1.f},{"F9",-16,0.f,.33f,1.f}}};
+          #include "presets.inc"
+          }};
           constexpr int sample_rate=48000;
           constexpr int target_samples=960;
           static_assert(target_samples*1000/sample_rate==20);
@@ -164,6 +194,76 @@ jobs:
            for(auto x:digest)out<<std::hex<<std::setw(2)<<std::setfill('0')<<int(x);
            return out.str();
           }
+          struct TextEncoder {
+           std::unordered_map<std::string,at::Tensor> w;
+           int64_t hidden,heads,layers,inter;
+           explicit TextEncoder(const c10::impl::GenericDict& root){
+            auto config=root.at(c10::IValue("config"));auto cfg=config.toListRef();
+            inter=cfg[2].toInt();hidden=cfg[3].toInt();heads=cfg[5].toInt();layers=cfg[6].toInt();
+            auto weights=root.at(c10::IValue("weight")).toGenericDict();
+            for(auto& kv:weights){auto key=kv.key().toStringRef();if(key.rfind("enc_p.",0)==0)w.emplace(key.substr(6),kv.value().toTensor().to(at::kFloat));}
+            require(hidden%heads==0,"encoder head geometry");
+           }
+           const at::Tensor& W(const std::string& k)const{return w.at(k);}
+           at::Tensor conv(const at::Tensor& x,const std::string& k,bool pad=false)const{
+            auto a=W(k+".weight");auto n=a.size(2);
+            return at::conv1d(pad?at::constant_pad_nd(x,{(n-1)/2,n/2},0):x,a,W(k+".bias"),{1},{0},{1},1);
+           }
+           at::Tensor norm(const at::Tensor& x,const std::string& k)const{
+            return at::layer_norm(x.transpose(1,2),{hidden},W(k+".gamma"),W(k+".beta"),1e-5,true).transpose(1,2);
+           }
+           at::Tensor relative(const at::Tensor& x,int64_t t)const{
+            auto win=(x.size(1)-1)/2;auto pad=std::max<int64_t>(t-win-1,0);auto start=std::max<int64_t>(win+1-t,0);
+            return at::constant_pad_nd(x,{0,0,pad,pad},0).slice(1,start,start+2*t-1);
+           }
+           at::Tensor attention(const at::Tensor& x,const at::Tensor& mask,const std::string& k)const{
+            auto b=x.size(0),t=x.size(2),d=hidden/heads;
+            auto q=conv(x,k+".conv_q").reshape({b,heads,d,t}).transpose(2,3)/std::sqrt(double(d));
+            auto key=conv(x,k+".conv_k").reshape({b,heads,d,t}).transpose(2,3);
+            auto v=conv(x,k+".conv_v").reshape({b,heads,d,t}).transpose(2,3);
+            auto score=at::matmul(q,key.transpose(-2,-1));
+            auto r=at::matmul(q,relative(W(k+".emb_rel_k"),t).unsqueeze(0).transpose(-2,-1));
+            r=at::constant_pad_nd(r,{0,1},0).reshape({b,heads,2*t*t});
+            r=at::constant_pad_nd(r,{0,t-1},0).reshape({b,heads,t+1,2*t-1}).slice(2,0,t).slice(3,t-1,2*t-1);
+            auto p=at::softmax((score+r).masked_fill((mask.unsqueeze(2)*mask.unsqueeze(-1)).eq(0),-1e4),-1);
+            auto out=at::matmul(p,v);
+            r=at::constant_pad_nd(p,{0,t-1},0).reshape({b,heads,2*t*t-t});
+            r=at::constant_pad_nd(r,{t,0},0).reshape({b,heads,t,2*t}).slice(3,1,2*t);
+            out=out+at::matmul(r,relative(W(k+".emb_rel_v"),t).unsqueeze(0));
+            return conv(out.transpose(2,3).contiguous().reshape({b,hidden,t}),k+".conv_o");
+           }
+           at::Tensor forward(const at::Tensor& phone,const at::Tensor& pitch,const at::Tensor& lengths)const{
+            auto t=phone.size(1);
+            auto x=at::linear(phone,W("emb_phone.weight"),W("emb_phone.bias"))+at::embedding(W("emb_pitch.weight"),pitch,-1,false,false);
+            x=at::leaky_relu(x*std::sqrt(double(hidden)),0.1).transpose(1,2);
+            auto mask=at::arange(t,lengths.options()).unsqueeze(0).lt(lengths.unsqueeze(1)).unsqueeze(1).to(x.scalar_type());
+            x=x*mask;
+            for(int i=0;i<layers;++i){
+             auto n=std::to_string(i);
+             x=norm(x+attention(x,mask,"encoder.attn_layers."+n),"encoder.norm_layers_1."+n);
+             auto y=at::relu(conv(x*mask,"encoder.ffn_layers."+n+".conv_1",true));
+             y=conv(y*mask,"encoder.ffn_layers."+n+".conv_2",true)*mask;
+             x=norm(x+y,"encoder.norm_layers_2."+n);
+            }
+            auto stats=conv(x*mask,"proj")*mask;require(stats.size(1)==2*inter,"encoder projection");
+            return at::cat({stats,mask},1).contiguous();
+           }
+          };
+          void verify_encoder(const c10::impl::GenericDict& root,const std::string& name){
+           at::NoGradGuard guard;
+           TextEncoder enc(root);
+           for(int64_t t:{8,33}){
+            auto phone=(at::arange(t*768,at::TensorOptions().dtype(at::kFloat)).remainder(97)-48).reshape({1,t,768})/97;
+            auto pitch=at::arange(t,at::TensorOptions().dtype(at::kLong)).remainder(254).reshape({1,t})+1;
+            auto lengths=at::full({1},t-2,at::TensorOptions().dtype(at::kLong));
+            auto start=Clock::now();auto out=enc.forward(phone,pitch,lengths);auto elapsed=ms(start);
+            auto ref=at::empty_like(out);std::ifstream in(name+".enc"+std::to_string(t)+".f32",std::ios::binary);
+            in.read(static_cast<char*>(ref.data_ptr()),ref.nbytes());
+            require(in.gcount()==static_cast<std::streamsize>(ref.nbytes()),"missing encoder reference");
+            std::cout<<"TEXT_ENCODER "<<name<<" frames="<<t<<" max_abs_error="<<(out-ref).abs().max().item<float>()<<" cpu_ms="<<elapsed<<std::endl;
+            require(at::allclose(out,ref,1e-4,1e-4),"official TextEncoder mismatch");
+           }
+          }
           struct Model {
            c10::IValue checkpoint;
            std::unique_ptr<faiss::Index> index;
@@ -177,20 +277,26 @@ jobs:
             auto weights=root.at(c10::IValue("weight")).toGenericDict();
             std::ifstream golden(std::string(p.name)+".golden.tsv");
             require(bool(golden),"missing golden manifest");
-            std::unordered_map<std::string,std::string> hashes;
-            std::string key,h; long long n,b;
-            while(golden>>key>>n>>b>>h) hashes.emplace(key,h);
+            struct TensorMeta{long long n,b;std::string dtype,shape,hash;};
+            std::unordered_map<std::string,TensorMeta> hashes;
+            std::string key;TensorMeta meta;
+            while(golden>>key>>meta.n>>meta.b>>meta.dtype>>meta.shape>>meta.hash) require(hashes.emplace(key,meta).second,"duplicate tensor");
+            const auto expected_count=hashes.size();
             long count=0; long long elements=0;
             for(auto& kv:weights){
              auto t=kv.value().toTensor();
              require(t.device().is_cpu(),"device mapping");
              require(at::isfinite(t).all().item<bool>(),"nonfinite");
              auto key=kv.key().toStringRef();
-             require(hashes.at(key)==digest_tensor(t),"tensor bytes mismatch");
+             const auto& m=hashes.at(key);
+             std::ostringstream shape;
+             for(int64_t i=0;i<t.dim();++i){if(i)shape<<",";shape<<t.size(i);}
+             auto dtype=t.scalar_type()==at::kHalf?"float16":t.scalar_type()==at::kFloat?"float32":t.scalar_type()==at::kLong?"int64":t.scalar_type()==at::kDouble?"float64":t.scalar_type()==at::kInt?"int32":"unsupported";
+             require(m.n==t.numel() && m.b==t.element_size() && m.dtype==dtype && m.shape==(t.dim()?shape.str():"-") && m.hash==digest_tensor(t),"tensor metadata or bytes mismatch");
              hashes.erase(key);
              ++count;elements+=t.numel();
             }
-            require(count==457 && hashes.empty(),"unexpected tensor count");
+            require(size_t(count)==expected_count && count>0 && hashes.empty(),"unexpected tensor count");
             index.reset(faiss::read_index((std::string(p.name)+".index").c_str()));
             require(index && index->d==768 && index->ntotal>=8,"invalid original index");
             if(p.index!=0.f){
@@ -219,6 +325,8 @@ jobs:
            try{
             // Load both public original checkpoints once; no reloading on selection.
             Model f8(presets[2]),f9(presets[3]);
+            verify_encoder(f8.checkpoint.toGenericDict(),"F8");
+            verify_encoder(f9.checkpoint.toGenericDict(),"F9");
             std::atomic<const Model*> selected{&f8};
             require(selected.is_lock_free(),"pointer atomics not lock free");
             double worst=0;
@@ -230,12 +338,12 @@ jobs:
              // Nonzero-index algorithm is NOT adopted for F8/F9. Actual F6/F7 indexes not available to this public runner.
              std::cout<<"INDEX_BYPASS "<<m->preset->name<<" pass"<<std::endl;
             }
-            std::cout<<"NATIVE_CORE_PASS preload_and_selection_only; neural_inference=not_implemented; audio_latency=not_measured"<<std::endl;
+            std::cout<<"NATIVE_CORE_PASS preload_selection_and_text_encoder; full_neural_inference=not_implemented; audio_latency=not_measured"<<std::endl;
             return 0;
            }catch(const std::exception& e){std::cerr<<"NATIVE_CORE_FAIL "<<e.what()<<std::endl;return 1;}
           }
           EOF
-          cp CMakeLists.txt core.cpp unpickler.cpp stage04-native/
+          cp CMakeLists.txt core.cpp unpickler.cpp presets.inc stage04-native/
           cmake -S . -B build -DCMAKE_PREFIX_PATH="$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')" -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target voicebank_native -j2
       - name: Run native code with no Python interpreter
@@ -260,7 +368,7 @@ jobs:
             "model_conversion":false,
             "python_resident":false,
             "acceptance":{"all_four_presets":true,"no_underruns":true,"no_dropped_blocks":true,"max_measured_total_latency_ms":20,"audio_quality_reference_check":true},
-            "native_scope":"F8/F9 model preloading, original index read, atomic pointer selection and bypass only",
+            "native_scope":"F8/F9 original checkpoints, index, selection and official TextEncoder parity only",
             "gpu_measured":false,
             "audio_latency_measured":false,
             "overall":"NOT_PASSED"
