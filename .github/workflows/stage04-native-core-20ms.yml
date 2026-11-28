@@ -771,52 +771,6 @@ jobs:
             require(at::allclose(y,ref,2e-3,2e-3),"end-to-end fixture mismatch");
            }
           }
-          #ifdef VOICEBANK_CUDA
-          // Fixed-window GPU test. This is compute and transfer timing, NOT mic-to-output latency.
-          void benchmark_gpu(const c10::impl::GenericDict& f8,const c10::impl::GenericDict& f9){
-           at::NoGradGuard guard;
-           at::Device dev(at::kCUDA,0);
-           c10::cuda::CUDAGuard device_guard(dev);
-           NativeHubert hubert("hubert.bin");NativeRMVPE rmvpe("rmvpe.pt");
-           NeuralPipeline a(f8,presets[2]),b(f9,presets[3]);
-           a.move_to(dev);b.move_to(dev);
-           for(auto* p:{&hubert.w,&rmvpe.w})for(auto& kv:*p)kv.second=kv.second.to(dev);
-           hubert.pos_weight=hubert.pos_weight.to(dev);rmvpe.basis=rmvpe.basis.to(dev);rmvpe.window=rmvpe.window.to(dev);
-           require(cudaDeviceSynchronize()==cudaSuccess,"CUDA weight preload sync");
-           auto stream=c10::cuda::getStreamFromPool(false,0);
-           c10::cuda::CUDAStreamGuard stream_guard(stream);
-           auto host=fixture("rmvpe.input.f32",{1,5120}).pin_memory();
-           auto static_input=host.to(dev);
-           // 10 ms hop at 16k; three 10 ms output frames for future SOLA integration.
-           // Past window reuse does NOT establish the algorithmic or host latency.
-           constexpr int hop=160,tail=3;
-           for(auto* p:{&a,&b}){
-            auto forward=[&](){
-             auto h=hubert.forward(static_input);auto f=rmvpe.decode(rmvpe.hidden(rmvpe.mel(static_input)));
-             return p->synthesize(h,f,static_input.size(-1),false,tail);
-            };
-            for(int i=0;i<5;++i){auto y=forward();stream.synchronize();require(at::isfinite(y).all().item<bool>(),"CUDA eager waveform nonfinite");}
-            at::cuda::CUDAGraph graph;
-            at::Tensor output;
-            graph.capture_begin();output=forward();graph.capture_end();stream.synchronize();
-            auto host_output=at::empty(output.sizes(),at::TensorOptions().dtype(at::kFloat).pinned_memory(true));
-            auto source=fixture("rmvpe.input.f32",{1,5120});
-            auto a0=host.data_ptr<float>();auto src=source.data_ptr<float>();
-            std::vector<double> times;times.reserve(300);int misses=0;
-            for(int i=0;i<300;++i){
-             // Overlap input history is allocated once; copy next hop from cyclic fixture.
-             std::memmove(a0,a0+hop,(5120-hop)*sizeof(float));
-             std::memcpy(a0+5120-hop,src+(i%32)*hop,hop*sizeof(float));
-             auto t=Clock::now();
-             static_input.copy_(host,true);graph.replay();host_output.copy_(output,true);stream.synchronize();
-             auto d=ms(t);times.push_back(d);if(d>10)++misses;
-             require(at::isfinite(host_output).all().item<bool>(),"CUDA graph waveform nonfinite");
-            }
-            std::sort(times.begin(),times.end());
-            std::cout<<"CUDA_FIXED_WINDOW "<<p->preset.name<<" hop_ms=10 frames="<<tail<<" p50_ms="<<times[149]<<" p99_ms="<<times[296]<<" max_ms="<<times.back()<<" deadline_misses="<<misses<<" total_audio_latency=NOT_MEASURED"<<std::endl;
-           }
-          }
-          #endif
           struct Model {
            c10::IValue checkpoint;
            std::unique_ptr<faiss::Index> index;
@@ -880,10 +834,35 @@ jobs:
             }
            }
           };
+          // Batch retrieval scratch is allocated at initialization. CPU search is outside CUDA Graph.
+          struct RetrievalScratch {
+           std::vector<float> distances;
+           std::vector<faiss::idx_t> ids;
+           explicit RetrievalScratch(int64_t frames):distances(frames*8),ids(frames*8){}
+           void run(const Model& m,const at::Tensor& h,at::Tensor& result){
+            require(h.device().is_cpu()&&result.device().is_cpu()&&h.is_contiguous()&&result.is_contiguous(),"retrieval needs contiguous CPU tensors");
+            require(h.sizes()==result.sizes()&&h.size(0)==1&&h.size(2)==768,"retrieval shape");
+            if(m.preset->index==0.f){result.copy_(h);return;}
+            int64_t n=h.size(1);
+            require(size_t(n*8)<=distances.size(),"retrieval scratch too small");
+            const float* x=h.data_ptr<float>();float* out=result.data_ptr<float>();
+            m.index->search(n,x,8,distances.data(),ids.data());
+            for(int64_t t=0;t<n;++t){
+             auto d=distances.data()+t*8;auto ix=ids.data()+t*8;
+             std::array<double,8> w{};int zeros=0;double total=0;
+             for(int k=0;k<8;++k){require(ix[k]>=0&&ix[k]<m.index->ntotal&&std::isfinite(d[k])&&d[k]>=0,"invalid retrieval neighbor");zeros+=(d[k]==0);}
+             for(int k=0;k<8;++k){w[k]=zeros?(d[k]==0?1.:0.):1./(double(d[k])*d[k]);total+=w[k];}
+             for(int j=0;j<768;++j){
+              double sum=0;for(int k=0;k<8;++k)sum+=w[k]/total*m.index_vectors[size_t(ix[k])*768+j];
+              out[t*768+j]=float(sum)*m.preset->index+x[t*768+j]*(1-m.preset->index);
+             }
+            }
+           }
+          };
           at::Tensor retrieve_features(const Model& m,const at::Tensor& h){
            if(m.preset->index==0.f)return h;
            auto cpu=h.to(at::kCPU).contiguous();auto result=at::empty_like(cpu);
-           for(int64_t i=0;i<cpu.size(1);++i)m.mix(cpu.data_ptr<float>()+i*768,result.data_ptr<float>()+i*768,m.preset->index);
+           RetrievalScratch scratch(cpu.size(1));scratch.run(m,cpu,result);
            return result.to(h.device());
           }
           at::Tensor rms_adjust(const at::Tensor& x,const at::Tensor& y,int64_t sr,float rate){
@@ -924,6 +903,101 @@ jobs:
             }
            }
           }
+          #ifdef VOICEBANK_CUDA
+          // Actual four-model GPU compute harness, not a host/audio end-to-end latency test.
+          struct GpuVoice {
+           const Model& model;
+           NeuralPipeline neural;
+           NativeHubert& hubert;
+           NativeRMVPE& rmvpe;
+           c10::cuda::CUDAStream stream;
+           at::Tensor history_host,input,features,f0,retrieved,features_host,retrieved_host,output,output_host;
+           std::unique_ptr<RetrievalScratch> scratch;
+           std::unique_ptr<at::cuda::CUDAGraph> front,back,combined;
+           bool indexed;
+           static constexpr int64_t window=5120,hop=160,tail=3;
+           GpuVoice(const Model& m,NativeHubert& h,NativeRMVPE& r,const at::Device& dev,c10::cuda::CUDAStream s):model(m),neural(m.checkpoint.toGenericDict(),*m.preset),hubert(h),rmvpe(r),stream(s),indexed(m.preset->index!=0.f){
+            c10::cuda::CUDAStreamGuard sg(stream);
+            neural.move_to(dev);
+            history_host=at::zeros({1,window},at::TensorOptions().dtype(at::kFloat).pinned_memory(true));
+            input=history_host.to(dev);
+            auto make_front=[&](){
+             auto pitch_input=input;
+             if(std::string(model.preset->name)=="F6"){
+              auto values=std::get<0>(input.abs().flatten().sort());
+              double pos=(window-1)*0.999;auto lo=int64_t(pos);
+              auto q=values[lo]*(1-(pos-lo))+values[lo+1]*(pos-lo);
+              pitch_input=input/q.clamp_min(1e-12);
+             }
+             features=hubert.forward(input);
+             f0=rmvpe.decode(rmvpe.hidden(rmvpe.mel(pitch_input)));
+            };
+            auto fixture_input=fixture("rmvpe.input.f32",{1,window});
+            history_host.copy_(fixture_input);input.copy_(history_host,true);stream.synchronize();
+            make_front();stream.synchronize();
+            if(indexed){
+             features_host=at::empty(features.sizes(),at::TensorOptions().dtype(at::kFloat).pinned_memory(true));
+             retrieved_host=at::empty_like(features_host,features_host.options());
+             scratch=std::make_unique<RetrievalScratch>(features.size(1));
+             retrieved=at::empty_like(features);
+             features_host.copy_(features,true);stream.synchronize();
+             scratch->run(model,features_host,retrieved_host);retrieved.copy_(retrieved_host,true);
+            }
+            auto synth=[&](){output=neural.synthesize(features,f0,window,false,tail,indexed?retrieved:at::Tensor{});};
+            for(int i=0;i<4;++i){make_front();synth();stream.synchronize();}
+            if(indexed){
+             front=std::make_unique<at::cuda::CUDAGraph>();
+             front->capture_begin();make_front();front->capture_end();stream.synchronize();
+             back=std::make_unique<at::cuda::CUDAGraph>();
+             back->capture_begin();synth();back->capture_end();stream.synchronize();
+            }else{
+             combined=std::make_unique<at::cuda::CUDAGraph>();
+             combined->capture_begin();make_front();synth();combined->capture_end();stream.synchronize();
+            }
+            output_host=at::empty(output.sizes(),at::TensorOptions().dtype(at::kFloat).pinned_memory(true));
+            history_host.zero_();
+           }
+           const at::Tensor& run(const float* next){
+            c10::cuda::CUDAStreamGuard sg(stream);
+            auto ptr=history_host.data_ptr<float>();
+            std::memmove(ptr,ptr+hop,(window-hop)*sizeof(float));std::memcpy(ptr+window-hop,next,hop*sizeof(float));
+            input.copy_(history_host,true);
+            if(indexed){
+             front->replay();features_host.copy_(features,true);stream.synchronize();
+             scratch->run(model,features_host,retrieved_host);
+             retrieved.copy_(retrieved_host,true);back->replay();
+            }else combined->replay();
+            output_host.copy_(output,true);stream.synchronize();return output_host;
+           }
+          };
+          void benchmark_gpu(const std::array<const Model*,4>& bank){
+           at::NoGradGuard guard;at::Device dev(at::kCUDA,0);c10::cuda::CUDAGuard dg(dev);
+           NativeHubert hubert("hubert.bin"),applio("applio_contentvec.bin");NativeRMVPE rmvpe("rmvpe.pt");
+           for(auto* w:{&hubert.w,&applio.w,&rmvpe.w})for(auto& kv:*w)kv.second=kv.second.to(dev);
+           hubert.pos_weight=hubert.pos_weight.to(dev);applio.pos_weight=applio.pos_weight.to(dev);rmvpe.basis=rmvpe.basis.to(dev);rmvpe.window=rmvpe.window.to(dev);
+           require(cudaDeviceSynchronize()==cudaSuccess,"GPU preload");
+           auto stream=c10::cuda::getStreamFromPool(false,0);
+           std::array<std::unique_ptr<GpuVoice>,4> voices;
+           for(size_t i=0;i<4;++i)voices[i]=std::make_unique<GpuVoice>(*bank[i],i==0?applio:hubert,rmvpe,dev,stream);
+           auto source=fixture("rmvpe.input.f32",{1,5120});auto src=source.data_ptr<float>();
+           std::array<std::vector<double>,4> times;for(auto& v:times)v.reserve(300);
+           std::array<int,4> misses{};
+           // Cycle all voices through the same input. No model load or graph capture in loop.
+           for(int n=0;n<1200;++n){
+            int i=(n/300)%4;
+            auto t=Clock::now();auto& out=voices[i]->run(src+(n%32)*160);double d=ms(t);
+            times[i].push_back(d);misses[i]+=(d>10.);
+            require(at::isfinite(out).all().item<bool>(),"GPU waveform nonfinite");
+           }
+           for(int i=0;i<4;++i){
+            auto& ts=times[i];std::sort(ts.begin(),ts.end());
+            std::cout<<"CUDA_FIXED_WINDOW "<<bank[i]->preset->name<<" hop_ms=10 p50_ms="<<ts[149]<<" p99_ms="<<ts[296]<<" max_ms="<<ts.back()<<" deadline_misses="<<misses[i]<<" total_audio_latency=NOT_MEASURED"<<std::endl;
+           }
+           // Random access switches over preloaded models; history is not yet shared between voices.
+           // Treat this as switch compute time, not audio continuity or device latency.
+           for(int i=0;i<32;++i){auto t=Clock::now();auto& out=voices[i%4]->run(src+(i%32)*160);require(at::isfinite(out).all().item<bool>(),"switch waveform");std::cout<<"CUDA_SWITCH "<<bank[i%4]->preset->name<<" compute_ms="<<ms(t)<<std::endl;}
+          }
+          #endif
           int main(int argc,char** argv){
            try{
             // Load both public original checkpoints once; no reloading on selection.
@@ -941,14 +1015,14 @@ jobs:
             verify_hubert();
             verify_pipeline(f8.checkpoint.toGenericDict(),f9.checkpoint.toGenericDict());
             verify_indexed_pipeline(f6,f7);
+            std::array<const Model*,4> bank{&f6,&f7,&f8,&f9};
             if(argc>1 && std::string(argv[1])=="--gpu-test"){
           #ifdef VOICEBANK_CUDA
-             benchmark_gpu(f8.checkpoint.toGenericDict(),f9.checkpoint.toGenericDict());
+             benchmark_gpu(bank);
           #else
              throw std::runtime_error("CUDA build required");
           #endif
             }
-            std::array<const Model*,4> bank{&f6,&f7,&f8,&f9};
             std::atomic<const Model*> selected{&f6};
             require(selected.is_lock_free(),"pointer atomics not lock free");
             double worst=0;
@@ -992,7 +1066,7 @@ jobs:
             "model_conversion":false,
             "python_resident":false,
             "acceptance":{"all_four_presets":true,"no_underruns":true,"no_dropped_blocks":true,"max_measured_total_latency_ms":20,"audio_quality_reference_check":true},
-            "native_scope":"Four originals, indexed F6/F7 fixed-input parity, F8/F9 fixed-input neural parity; F6 Applio source waveform parity separate; GPU benchmark F8/F9 only",
+            "native_scope":"Four originals, indexed F6/F7 fixed-input parity, F8/F9 fixed-input neural parity; F6 Applio source waveform parity separate; GPU fixed-window benchmark all four; not audio callback or end-to-end latency",
             "gpu_measured":false,
             "audio_latency_measured":false,
             "overall":"NOT_PASSED"
