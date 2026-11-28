@@ -107,7 +107,9 @@ jobs:
           python -m pip install scipy==1.14.1
           PYTHONPATH="$PWD/upstream" python - <<'PY'
           import torch
-          from infer.module.models import TextEncoder, ResidualCouplingBlock
+          from infer.module.models import TextEncoder, ResidualCouplingBlock, GeneratorNSF
+          from unittest.mock import patch
+          import math
           torch.set_num_threads(2)
           with torch.inference_mode():
               for name in ("F8","F9"):
@@ -118,6 +120,11 @@ jobs:
                   flow=ResidualCouplingBlock(cfg[2],cfg[3],5,1,3,gin_channels=cfg[16]).eval()
                   flow.load_state_dict({k[5:]:v for k,v in ck["weight"].items() if k.startswith("flow.")},strict=True)
                   flow.remove_weight_norm()
+                  sr=cfg[-1] if isinstance(cfg[-1],int) else int(cfg[-1].rstrip("k"))*1000
+                  gen=GeneratorNSF(cfg[2],*cfg[9:15],gin_channels=cfg[16],sr=sr,is_half=False).eval()
+                  gen.load_state_dict({k[4:]:v for k,v in ck["weight"].items() if k.startswith("dec.")},strict=True)
+                  gen.remove_weight_norm()
+                  upp=math.prod(cfg[12])
                   for t in (8,33):
                       phone=(torch.arange(t*768,dtype=torch.float32).remainder(97)-48).reshape(1,t,768)/97
                       pitch=torch.arange(t,dtype=torch.long).remainder(254).reshape(1,t)+1
@@ -128,6 +135,13 @@ jobs:
                       g=ck["weight"]["emb_g.weight"][0].float().reshape(1,-1,1)
                       flow(z,mask,g=g,reverse=True).contiguous().numpy().tofile(f"{name}.flow{t}.f32")
                       print("REFERENCE_FLOW",name,t,flush=True)
+                      z2=flow(z,mask,g=g,reverse=True)*mask
+                      f0=torch.where(torch.arange(t)%4==0,0.,110.+torch.arange(t)*3).reshape(1,t)
+                      noise=(torch.arange(t*upp,dtype=torch.float32).remainder(31)-15).reshape(1,t*upp,1)/15
+                      with patch("torch.randn_like",return_value=noise):
+                          audio=gen(z2,f0,g=g)
+                      audio.contiguous().numpy().tofile(f"{name}.gen{t}.f32")
+                      print("REFERENCE_GENERATOR",name,t,audio.shape,flush=True)
           PY
       - name: Build native model bank and index path
         run: |
@@ -329,6 +343,79 @@ jobs:
             require(at::allclose(out,ref,1e-4,1e-4),"official reverse flow mismatch");
            }
           }
+          // RVC neural source-filter decoder; deterministic injected excitation noise for parity tests.
+          struct Generator {
+           std::unordered_map<std::string,at::Tensor> w;
+           std::vector<int64_t> rates,kernels;
+           std::vector<std::vector<int64_t>> dilations;
+           int64_t sr,upp=1;bool block1;
+           explicit Generator(const c10::impl::GenericDict& root){
+            auto config=root.at(c10::IValue("config"));auto cfg=config.toListRef();
+            block1=cfg[9].toStringRef()=="1";
+            auto ds=cfg[11].toListRef();
+            for(auto& d:ds){std::vector<int64_t> a;for(auto& v:d.toListRef())a.push_back(v.toInt());dilations.push_back(a);}
+            for(auto& v:cfg[12].toListRef()){rates.push_back(v.toInt());upp*=v.toInt();}
+            for(auto& v:cfg[14].toListRef())kernels.push_back(v.toInt());
+            sr=cfg[17].isInt()?cfg[17].toInt():std::stoll(cfg[17].toStringRef())*1000;
+            auto weights=root.at(c10::IValue("weight")).toGenericDict();
+            for(auto& kv:weights){auto k=kv.key().toStringRef();if(k.rfind("dec.",0)==0||k=="emb_g.weight")w.emplace(k,kv.value().toTensor().to(at::kFloat));}
+            std::vector<std::string> keys;
+            for(auto& kv:w)if(kv.first.size()>9&&kv.first.substr(kv.first.size()-9)==".weight_v")keys.push_back(kv.first);
+            for(auto& k:keys){auto base=k.substr(0,k.size()-9);w.emplace(base+".weight",at::_weight_norm(w.at(k),w.at(base+".weight_g"),0));}
+           }
+           at::Tensor conv(const at::Tensor& x,const std::string& k,int64_t stride=1,int64_t pad=-1,int64_t dil=1)const{
+            auto a=w.at(k+".weight");if(pad<0)pad=(a.size(2)-1)*dil/2;
+            std::optional<at::Tensor> bias;if(w.count(k+".bias"))bias=w.at(k+".bias");
+            return at::conv1d(x,a,bias,at::IntArrayRef{stride},at::IntArrayRef{pad},at::IntArrayRef{dil},1);
+           }
+           at::Tensor source(const at::Tensor& f0,const at::Tensor& noise)const{
+            auto f=f0.unsqueeze(-1);
+            auto rad=f/double(sr)*at::arange(1,upp+1,f.options());
+            auto last=at::fmod(rad.slice(-1,upp-1,upp).to(at::kFloat)+0.5,1.0)-0.5;
+            auto acc=at::fmod(last.cumsum(1),1.0).to(f.scalar_type());
+            rad=rad+at::constant_pad_nd(acc,{0,0,1,-1},0);
+            auto sine=at::sin(rad.reshape({f.size(0),-1,1})*(2.0*3.14159265358979323846))*0.1;
+            auto uv=f.gt(0).to(f.scalar_type()).repeat_interleave(upp,1);
+            auto waves=sine*uv+(uv*0.003+(1-uv)*0.1/3.0)*noise;
+            return at::tanh(at::linear(waves,w.at("dec.m_source.l_linear.weight"),w.at("dec.m_source.l_linear.bias"))).transpose(1,2);
+           }
+           at::Tensor residual(at::Tensor x,const std::string& k,const std::vector<int64_t>& ds)const{
+            for(size_t i=0;i<ds.size();++i){auto n=std::to_string(i);
+             auto y=conv(at::leaky_relu(x,0.1),k+(block1?".convs1.":".convs.")+n,1,-1,ds[i]);
+             if(block1)y=conv(at::leaky_relu(y,0.1),k+".convs2."+n);
+             x=x+y;
+            }return x;
+           }
+           at::Tensor forward(at::Tensor x,const at::Tensor& f0,const at::Tensor& noise,int64_t sid)const{
+            auto har=source(f0,noise);auto g=w.at("emb_g.weight").select(0,sid).reshape({1,-1,1});
+            x=conv(x,"dec.conv_pre");if(w.count("dec.cond.weight"))x=x+conv(g,"dec.cond");
+            int64_t rest=upp;
+            for(size_t i=0;i<rates.size();++i){auto k="dec.ups."+std::to_string(i);auto u=rates[i];rest/=u;
+             x=at::conv_transpose1d(at::leaky_relu(x,0.1),w.at(k+".weight"),w.at(k+".bias"),{u},{(kernels[i]-u)/2},{0},1,{1});
+             x=x+conv(har,"dec.noise_convs."+std::to_string(i),rest,rest==1?0:rest/2);
+             at::Tensor sum;
+             for(size_t j=0;j<dilations.size();++j){auto y=residual(x,"dec.resblocks."+std::to_string(i*dilations.size()+j),dilations[j]);sum=sum.defined()?sum+y:y;}
+             x=sum/double(dilations.size());
+            }
+            return at::tanh(conv(at::leaky_relu(x,0.01),"dec.conv_post")).contiguous();
+           }
+          };
+          void verify_generator(const c10::impl::GenericDict& root,const std::string& name){
+           at::NoGradGuard guard;Generator gen(root);ReverseFlow flow(root);
+           for(int64_t t:{8,33}){
+            auto opts=at::TensorOptions().dtype(at::kFloat);
+            auto z=(at::arange(t*flow.inter,opts).remainder(67)-33).reshape({1,flow.inter,t})/67;
+            auto mask=at::arange(t,at::TensorOptions().dtype(at::kLong)).lt(t-2).reshape({1,1,t}).to(at::kFloat);
+            z=flow.forward(z,mask,0)*mask;
+            auto a=at::arange(t,opts);auto f0=at::where(a.remainder(4).eq(0),at::zeros_like(a),110+a*3).reshape({1,t});
+            auto noise=(at::arange(t*gen.upp,opts).remainder(31)-15).reshape({1,t*gen.upp,1})/15;
+            auto start=Clock::now();auto out=gen.forward(z,f0,noise,0);auto elapsed=ms(start);
+            auto ref=at::empty_like(out);std::ifstream in(name+".gen"+std::to_string(t)+".f32",std::ios::binary);
+            in.read(static_cast<char*>(ref.data_ptr()),ref.nbytes());require(in.gcount()==static_cast<std::streamsize>(ref.nbytes()),"missing generator reference");
+            std::cout<<"GENERATOR "<<name<<" frames="<<t<<" max_abs_error="<<(out-ref).abs().max().item<float>()<<" cpu_ms="<<elapsed<<std::endl;
+            require(at::allclose(out,ref,1e-3,1e-3),"official GeneratorNSF mismatch");
+           }
+          }
           struct Model {
            c10::IValue checkpoint;
            std::unique_ptr<faiss::Index> index;
@@ -400,6 +487,8 @@ jobs:
             verify_encoder(f9.checkpoint.toGenericDict(),"F9");
             verify_flow(f8.checkpoint.toGenericDict(),"F8");
             verify_flow(f9.checkpoint.toGenericDict(),"F9");
+            verify_generator(f8.checkpoint.toGenericDict(),"F8");
+            verify_generator(f9.checkpoint.toGenericDict(),"F9");
             std::atomic<const Model*> selected{&f8};
             require(selected.is_lock_free(),"pointer atomics not lock free");
             double worst=0;
@@ -413,7 +502,7 @@ jobs:
              // Nonzero-index algorithm is NOT adopted for F8/F9. Actual F6/F7 indexes not available to this public runner.
              std::cout<<"INDEX_BYPASS "<<m->preset->name<<" pass"<<std::endl;
             }
-            std::cout<<"NATIVE_CORE_PASS preload_selection_text_encoder_reverse_flow; full_neural_inference=not_implemented; audio_latency=not_measured"<<std::endl;
+            std::cout<<"NATIVE_CORE_PASS preload_selection_text_encoder_reverse_flow_generator; full_neural_inference=not_implemented; audio_latency=not_measured"<<std::endl;
             return 0;
            }catch(const std::exception& e){std::cerr<<"NATIVE_CORE_FAIL "<<e.what()<<std::endl;return 1;}
           }
@@ -443,7 +532,7 @@ jobs:
             "model_conversion":false,
             "python_resident":false,
             "acceptance":{"all_four_presets":true,"no_underruns":true,"no_dropped_blocks":true,"max_measured_total_latency_ms":20,"audio_quality_reference_check":true},
-            "native_scope":"F8/F9 original checkpoints, index, selection and official TextEncoder and reverse Flow parity only",
+            "native_scope":"F8/F9 original checkpoints, index, selection and official TextEncoder, reverse Flow and GeneratorNSF parity only",
             "gpu_measured":false,
             "audio_latency_measured":false,
             "overall":"NOT_PASSED"
