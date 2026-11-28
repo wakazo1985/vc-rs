@@ -1,0 +1,237 @@
+name: Stage 04 context and stage profiling
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/stage04-context-profile.yml'
+  push:
+    branches: [stage01-python-verification]
+    paths:
+      - '.github/workflows/stage04-context-profile.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  stream:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CUDA_VISIBLE_DEVICES: ''
+      TORCH_FORCE_WEIGHTS_ONLY_LOAD: '1'
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare official RVC CPU environment
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg libsndfile1 libportaudio2 open-jtalk open-jtalk-mecab-naist-jdic hts-voice-nitech-jp-atr503-m001
+          git init rvc
+          cd rvc
+          git remote add origin https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git
+          git fetch --depth 1 origin 81eed5e8f68b6bed1789f682fe78cdd324495afc
+          git checkout --detach FETCH_HEAD
+          git rev-parse HEAD
+          sed -i 's|https://mirrors.pku.edu.cn/pypi/simple|https://pypi.org/simple|;s|https://mirrors.nju.edu.cn/pytorch/whl/cpu|https://download.pytorch.org/whl/cpu|' requirments_cpu_py312.txt
+          python -m pip install -r requirments_cpu_py312.txt
+          python -m pip install 'huggingface_hub>=0.26,<1'
+      - name: Acquire exact verified archives and inference assets
+        working-directory: rvc
+        run: |
+          python -u - <<'PY'
+          import pathlib, hashlib, zipfile, shutil
+          from huggingface_hub import hf_hub_download, snapshot_download
+          snapshot_download("lj1995/VoiceConversionWebUI", allow_patterns=["hubert_base/*"], local_dir="assets")
+          hf_hub_download("lj1995/VoiceConversionWebUI", "rmvpe.pt", local_dir="assets/rmvpe")
+          models = [
+              ("F8", "Rokkonrol/RVC_models", "dataset", "c4bdb3bb7aef5f7d213f79f57decea9e644fd4d5", "Russell Archey [Explore With Us (EWU)].zip", "88ba827fe6023d102d6d84a7bc26e1e181b40bb47977ccae1c378b320b3c1582"),
+              ("F9", "rayzox57/Joyca_High_RVC", "model", "035dff8fce32b4efda3e9c25e045e73ac5819812", "Joyca_High_Voice_v2_600e.zip", "4924376afcc16f3a8c109822239fdc5ce73c0e2459bb9fc71e55564aae0e0c99"),
+          ]
+          for key, repo, kind, revision, filename, expected in models:
+              archive = hf_hub_download(repo, filename, repo_type=kind, revision=revision)
+              with open(archive,"rb") as f:
+                  actual = hashlib.file_digest(f,"sha256").hexdigest()
+              if actual != expected:
+                  raise RuntimeError(f"{key} SHA-256 mismatch {actual}")
+              with zipfile.ZipFile(archive) as z:
+                  for suffix in (".pth",".index"):
+                      members = [m for m in z.infolist() if m.filename.lower().endswith(suffix)]
+                      if suffix == ".index":
+                          members = [m for m in members if pathlib.PurePosixPath(m.filename).name.startswith("added_")]
+                      if len(members) != 1:
+                          raise RuntimeError(f"{key} unexpected {suffix} candidates: {members}")
+                      target = pathlib.Path("assets/weights" if suffix == ".pth" else "assets/indices") / (key+suffix)
+                      target.parent.mkdir(parents=True,exist_ok=True)
+                      with z.open(members[0]) as src,target.open("wb") as dst:
+                          shutil.copyfileobj(src,dst)
+                      print(key, target, actual, flush=True)
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: VoiceBank-Stage03-Frozen
+          path: frozen
+          github-token: ${{ github.token }}
+          run-id: '46134456010'
+      - name: Benchmark official realtime inference on frozen input
+        working-directory: rvc
+        run: |
+          export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+          python -u - <<'PY'
+          import os, pathlib, sys, hashlib, json, time, traceback, csv
+          import numpy as np, soundfile as sf, torch, torch.nn.functional as F, librosa
+          import infer.rtrvc as upstream
+          from torchaudio.transforms import Resample
+          from configs.config import Config
+          from infer.rtrvc import RVC
+          torch.set_num_threads(2)
+          torch.set_num_interop_threads(1)
+          torch.manual_seed(42)
+          root=pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          frozen=root/"frozen"
+          out=root/"stage04"
+          out.mkdir(exist_ok=True)
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          config_path=frozen/"VoiceBank_03_Presets.json"
+          config=json.loads(config_path.read_text())
+          verification=json.loads((frozen/"verification.json").read_text())
+          src=frozen/"reference/Original_synthetic_JP.wav"
+          assert sha(src)==verification["synthetic_input_sha256"]
+          (out/"VoiceBank_03_Presets.json").write_bytes(config_path.read_bytes())
+          audio,sr=sf.read(src,dtype="float32")
+          assert audio.ndim==1
+          x=Resample(sr,48000)(torch.from_numpy(audio)) if sr!=48000 else torch.from_numpy(audio)
+          # Exactly the first three seconds, including onset; never regenerate the reference input.
+          x=x[:144000].contiguous()
+          sf.write(out/"input_first_3s.wav",x.numpy(),48000,subtype="PCM_16")
+          cfg=Config()
+          assert str(cfg.device)=="cpu" and not cfg.is_half
+          rows=[]; reports=[]
+          previous=None
+          stage_times={}
+          def timed(fn, name):
+              def call(*args, **kwargs):
+                  start=time.perf_counter()
+                  try: return fn(*args, **kwargs)
+                  finally: stage_times[name]=stage_times.get(name,0)+(time.perf_counter()-start)*1000
+              return call
+          upstream.extract_hubert_features=timed(upstream.extract_hubert_features,"hubert_ms")
+          for key in ("male_low","robot"):
+              p=config["presets"][key]
+              name=p["shortcut"]
+              r=p["rvc"]
+              prm=r["parameters"]
+              assert prm["index_rate"]==0 and prm["rms_mix_rate"]==1 and prm["speaker_id"]==0
+              assert r["engine_commit"]=="81eed5e8f68b6bed1789f682fe78cdd324495afc"
+              for ext,folder in (("pth","weights"),("index","indices")):
+                  assert sha(pathlib.Path(f"assets/{folder}/{name}.{ext}"))==r["stage02_model_fingerprint"][ext+"_sha256"]
+              ref=frozen/p["reference"]["file"]
+              assert sha(ref)==p["reference"]["wav_sha256"]
+              # Upstream realtime API has no protect argument. With index disabled,
+              # the offline retrieval blend is inactive; exact audio equivalence remains unproved.
+              load_start=time.perf_counter()
+              engine=RVC(prm["pitch_shift_semitones"],0,f"assets/weights/{name}.pth",f"assets/indices/{name}.index",0,cfg,previous)
+              assert engine.net_g is not None and engine.tgt_sr==48000
+              previous=engine
+              engine.get_f0=timed(engine.get_f0,"rmvpe_ms")
+              engine.net_g.infer=timed(engine.net_g.infer,"synth_ms")
+              baseline=None
+              print("MODEL",name,"load_ms",(time.perf_counter()-load_start)*1000,flush=True)
+              for context in (320,160,80):
+                  ms=20
+                  label=f"{name}_{ms}ms_ctx{context}ms"
+                  try:
+                      # Official realtime_gui.py geometry; 320ms past context, 10ms overlap/search.
+                      zc=480
+                      block=48*ms
+                      overlap=search=zc
+                      extra=(context//10)*zc
+                      total=extra+overlap+search+block
+                      dry=torch.zeros(total)
+                      buf=torch.zeros(total//3)
+                      tail=torch.zeros(overlap)
+                      fade=torch.sin(.5*torch.pi*torch.linspace(0,1,overlap))**2
+                      kernel=torch.ones(1,1,overlap)
+                      rs=Resample(48000,16000)
+                      engine.cache_pitch.zero_()
+                      engine.cache_pitchf.zero_()
+                      def process(chunk):
+                          dry[:-block]=dry[block:].clone()
+                          dry[-block:]=chunk
+                          b16=block//3
+                          buf[:-b16]=buf[b16:].clone()
+                          buf[-b16-160:]=rs(dry[-block-2*zc:])[160:]
+                          result=engine.infer(buf,b16,extra//zc,(block+overlap+search)//zc,prm["f0_method"])
+                          assert result.ndim==1 and result.numel()>=block+overlap+search
+                          window=result[None,None,:overlap+search]
+                          corr=F.conv1d(window,tail[None,None,:])
+                          den=torch.sqrt(F.conv1d(window.square(),kernel)+1e-8)
+                          offset=int(torch.argmax(corr[0,0]/den[0,0]))
+                          result=result[offset:].clone()
+                          result[:overlap]*=fade
+                          result[:overlap]+=tail*(1-fade)
+                          tail.copy_(result[block:block+overlap])
+                          return result[:block].clone(),offset
+                      t=time.perf_counter()
+                      with torch.inference_mode():
+                          process(torch.zeros(block))
+                          warm_ms=(time.perf_counter()-t)*1000
+                          dry.zero_();buf.zero_();tail.zero_()
+                          engine.cache_pitch.zero_();engine.cache_pitchf.zero_()
+                          torch.manual_seed(42)
+                          output=[]; timing=[]; offsets=[]
+                          profile=[]
+                          # Flush two overlap/search blocks at the end; preserve output length.
+                          padded=F.pad(x,(0,(-x.numel())%block))
+                          padded=F.pad(padded,(0,2*block))
+                          for i,chunk in enumerate(padded.split(block)):
+                              stage_times.clear()
+                              t=time.perf_counter()
+                              y,offset=process(chunk)
+                              elapsed=(time.perf_counter()-t)*1000
+                              assert torch.isfinite(y).all()
+                              output.append(y); timing.append(elapsed); offsets.append(offset)
+                              stages={k:float(stage_times.get(k,0)) for k in ("hubert_ms","rmvpe_ms","synth_ms")}
+                              stages["other_ms"]=max(0,elapsed-sum(stages.values()))
+                              profile.append(stages)
+                              rows.append(dict(case=label,block=i,processing_ms=elapsed,sola_offset_samples=offset,deadline_missed=elapsed>ms,**stages))
+                          y=torch.cat(output).numpy()
+                      assert np.max(np.abs(y))>1e-5
+                      peak=float(np.max(np.abs(y)))
+                      sf.write(out/(label+".wav"),y,48000,subtype="FLOAT")
+                      arr=np.asarray(timing)
+                      nominal_delay_ms=ms+20
+                      report=dict(case=label,status="measured",pitch=prm["pitch_shift_semitones"],index_rate=0,block_ms=ms,context_ms=context,rmvpe_input_samples=min(total//3,5120*((block//3+800-1)//5120+1)-160),crossfade_ms=10,search_ms=10,blocks=len(arr),first_ms=float(arr[0]),warmup_ms=warm_ms,p50_ms=float(np.median(arr)),p95_ms=float(np.percentile(arr,95)),max_ms=float(arr.max()),deadline_misses=int(np.sum(arr>ms)),nominal_buffer_geometry_ms=nominal_delay_ms,geometry_plus_p95_ms=nominal_delay_ms+float(np.percentile(arr,95)),peak=peak,rms=float(np.sqrt(np.mean(y*y))),clipping_samples=int(np.sum(np.abs(y)>=1)),output_sha256=sha(out/(label+".wav")),latency_note="CPU compute and nominal geometry only; no measured device roundtrip; deadline failure causes backlog in live host")
+                      report["stage_p50_ms"]={k:float(np.median([q[k] for q in profile])) for k in profile[0]}
+                      report["stage_p95_ms"]={k:float(np.percentile([q[k] for q in profile],95)) for k in profile[0]}
+                      if context==320:
+                          baseline=y.copy()
+                      assert baseline is not None
+                      # Spectral difference is descriptive, not a perceptual quality or equivalence pass.
+                      mag=lambda a: np.abs(librosa.stft(a,n_fft=1024,hop_length=240))
+                      m0,m1=mag(baseline),mag(y)
+                      mask=np.maximum(m0,m1)>1e-3
+                      delta=20*np.log10(np.maximum(m1,1e-5))-20*np.log10(np.maximum(m0,1e-5))
+                      report["baseline_relative_log_spectral_rmse_db"]=float(np.sqrt(np.mean(delta[mask]**2))) if mask.any() else None
+                      report["baseline_relative_waveform_rmse"]=float(np.sqrt(np.mean((baseline-y)**2)))
+                      report["boundary_jump_p95"]=float(np.percentile(np.abs(y[block::block]-y[block-1:-1:block]),95))
+                  except Exception as e:
+                      traceback.print_exc()
+                      report=dict(case=label,status="error",error=str(e))
+                  reports.append(report)
+                  print("PROFILE04",json.dumps(report,ensure_ascii=False),flush=True)
+          with (out/"block_timing.csv").open("w",newline="") as f:
+              w=csv.DictWriter(f,fieldnames=["case","block","processing_ms","sola_offset_samples","deadline_missed","hubert_ms","rmvpe_ms","synth_ms","other_ms"])
+              w.writeheader();w.writerows(rows)
+          (out/"results.json").write_text(json.dumps(reports,indent=2),encoding="utf-8")
+          (out/"scope.txt").write_text("Original upstream realtime RVC; F8/F9 only; CPU offline simulation with 20 ms frames and 320/160/80 ms past context. Same frozen model settings and input; context shorter than official RMVPE window changes pitch analysis. No automatic adoption of shorter context. No VST3, no native C++ inference, no GPU or host timing, no assertion of offline waveform equivalence. F6/F7 preserved but not tested. No model conversion or settings change.",encoding="utf-8")
+          raise SystemExit(int(any(r["status"]!="measured" for r in reports)))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: VoiceBank-Stage04-Context-Profile
+          path: stage04/
+          if-no-files-found: warn
+          retention-days: 30

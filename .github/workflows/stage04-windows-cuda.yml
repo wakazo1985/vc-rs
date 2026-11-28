@@ -1,0 +1,124 @@
+name: Stage 04 Windows CUDA native build
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/stage04-windows-cuda.yml']
+  push:
+    branches: [stage01-python-verification]
+    paths: ['.github/workflows/stage04-windows-cuda.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 55
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: VoiceBank-Stage04-Native-Core-20ms
+          path: native
+          github-token: ${{ github.token }}
+          run-id: '46142190635'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.8.1'
+          method: network
+          sub-packages: '["nvcc","cudart","cublas","cublas_dev","cufft","cufft_dev","curand","curand_dev","cusolver","cusolver_dev","cusparse","cusparse_dev","nvrtc","nvrtc_dev","nvtx","thrust","visual_studio_integration"]'
+          use-github-cache: 'false'
+      - name: Acquire official dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          nvcc --version
+          curl.exe --fail --location --retry 3 "https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-2.7.1%2Bcu128.zip" -o libtorch.zip
+          if ($LASTEXITCODE) { throw "LibTorch download failed" }
+          7z x libtorch.zip -y
+          if ($LASTEXITCODE) { throw "LibTorch extract failed" }
+          git clone --depth 1 --branch v1.10.0 https://github.com/facebookresearch/faiss.git native/faiss-src
+          if ($LASTEXITCODE) { throw "FAISS checkout failed" }
+          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install openblas:x64-windows openssl:x64-windows
+          if ($LASTEXITCODE) { throw "Native dependency install failed" }
+          curl.exe --fail --location --retry 3 "https://raw.githubusercontent.com/pytorch/pytorch/v2.7.1/torch/csrc/jit/serialization/unpickler.h" -o native/upstream_unpickler.h
+          if ($LASTEXITCODE) { throw "Unpickler header download failed" }
+      - name: Isolate checkpoint parser from MSVC DLL imports
+        shell: pwsh
+        run: |
+          @'
+          import pathlib,re
+          p=pathlib.Path("native")
+          header=(p/"upstream_unpickler.h").read_text()
+          header=header.replace("class TORCH_API Unpickler", "class VoicebankUnpickler")
+          header=re.sub(r"\bUnpickler\b","VoicebankUnpickler",header)
+          header=re.sub(r"\brestoreAccurateTypeTags\b","voicebankRestoreAccurateTypeTags",header)
+          assert "class VoicebankUnpickler" in header
+          (p/"voicebank_unpickler.h").write_text(header)
+          for name in ("core.cpp","unpickler.cpp"):
+              path=p/name
+              s=path.read_text()
+              s=s.replace("#include <torch/csrc/jit/serialization/unpickler.h>", '#include "voicebank_unpickler.h"')
+              s=re.sub(r"\bUnpickler\b","VoicebankUnpickler",s)
+              s=re.sub(r"\brestoreAccurateTypeTags\b","voicebankRestoreAccurateTypeTags",s)
+              assert '"voicebank_unpickler.h"' in s
+              path.write_text(s)
+          cm=p/"CMakeLists.txt"
+          s=cm.read_text().replace("find_package(Torch REQUIRED)",'add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)\nfind_package(Torch REQUIRED)')
+          s=s.replace('set(FAISS_ENABLE_GPU OFF CACHE BOOL "" FORCE)','set(FAISS_ENABLE_MKL OFF CACHE BOOL "" FORCE)\nset(FAISS_ENABLE_GPU OFF CACHE BOOL "" FORCE)')
+          s=s.replace("find_package(OpenMP REQUIRED)","find_package(OpenMP REQUIRED COMPONENTS CXX)")
+          cm.write_text(s)
+          # LibTorch enables CUDA in CMake even though FAISS is CPU-only. Restrict
+          # every FAISS OpenMP discovery to CXX rather than asking MSVC for OpenMP_CUDA.
+          patched=0
+          for cm in (p/"faiss-src").rglob("CMakeLists.txt"):
+              s=cm.read_text(encoding="utf-8")
+              out=s.replace("find_package(OpenMP REQUIRED)","find_package(OpenMP REQUIRED COMPONENTS CXX)")
+              if out!=s:
+                  cm.write_text(out,encoding="utf-8")
+                  patched+=1
+          assert patched>0
+          print("FAISS_OPENMP_CXX_PATCHED",patched)
+          '@ | Set-Content -Encoding utf8 prepare_windows.py
+          python prepare_windows.py
+          if ($LASTEXITCODE) { throw "Windows compatibility patch failed" }
+      - name: Build native CUDA DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:TORCH_CUDA_ARCH_LIST = '12.0'
+          $prefix = (Resolve-Path libtorch).Path
+          $vcpkg = "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          cmake -S native -B build -G "Visual Studio 17 2022" -A x64 "-DCMAKE_TOOLCHAIN_FILE=$vcpkg" "-DCMAKE_PREFIX_PATH=$prefix" -DVCPKG_TARGET_TRIPLET=x64-windows -DBLA_VENDOR=OpenBLAS -DVOICEBANK_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DTORCH_CUDA_ARCH_LIST=12.0
+          if ($LASTEXITCODE) { throw "CMake configure failed" }
+          cmake --build build --config Release --target voicebank_core voicebank_native --parallel 2
+          if ($LASTEXITCODE) { throw "Windows CUDA build failed" }
+          New-Item -ItemType Directory -Force win-result | Out-Null
+          Copy-Item build/Release/voicebank_core.dll,build/Release/voicebank_native.exe win-result/
+          Copy-Item native/core.cpp,native/CMakeLists.txt,native/rt_audio.hpp,native/presets.inc,native/unpickler.cpp,native/voicebank_unpickler.h win-result/
+          Copy-Item native/acceptance.json win-result/cpu-acceptance.json
+          'Compilation only. No GPU or Wave Link runtime test. Not an installable VST3.' | Set-Content win-result/README.txt
+      - name: Validate exports and dependency names
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)') + '/Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dump = Get-ChildItem "$vs/VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (!$dump) { throw "dumpbin missing" }
+          $exports = & $dump.FullName /exports win-result/voicebank_core.dll | Out-String
+          $exports | Set-Content win-result/exports.txt
+          foreach ($symbol in @('voicebank_create','voicebank_destroy','voicebank_select','voicebank_process','voicebank_get_counters','voicebank_scheduled_delay_samples')) {
+            if ($exports -notmatch "\b$symbol\b") { throw "Missing export $symbol" }
+          }
+          $deps = & $dump.FullName /dependents win-result/voicebank_core.dll | Out-String
+          $deps | Set-Content win-result/dependencies.txt
+          if ($deps -match 'python[0-9]*\.dll') { throw "Unexpected Python runtime dependency" }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: VoiceBank-Stage04-Windows-CUDA-Compile
+          path: win-result/
+          if-no-files-found: warn

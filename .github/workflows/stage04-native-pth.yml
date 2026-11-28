@@ -1,0 +1,120 @@
+name: Stage 04 native PTH loading probe
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/stage04-native-pth.yml'
+  push:
+    branches: [stage01-python-verification]
+    paths:
+      - '.github/workflows/stage04-native-pth.yml'
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install C++ build dependency and acquire verified original models
+        run: |
+          python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install 'huggingface_hub>=0.26,<1'
+          mkdir -p stage04-native
+          python - <<'PY'
+          import hashlib, zipfile, pathlib, shutil
+          from huggingface_hub import hf_hub_download
+          cases=[
+              ("F8","Rokkonrol/RVC_models","dataset","c4bdb3bb7aef5f7d213f79f57decea9e644fd4d5","Russell Archey [Explore With Us (EWU)].zip","88ba827fe6023d102d6d84a7bc26e1e181b40bb47977ccae1c378b320b3c1582","df8f49d094e57b0abe726d8650de5d865546bce4d893ec59841c51ee0777a08b"),
+              ("F9","rayzox57/Joyca_High_RVC","model","035dff8fce32b4efda3e9c25e045e73ac5819812","Joyca_High_Voice_v2_600e.zip","4924376afcc16f3a8c109822239fdc5ce73c0e2459bb9fc71e55564aae0e0c99","d0ea3825eeebaef3531a8eb928ab001908ab7147499f818cfac820bd35074d86")
+          ]
+          for name,repo,kind,rev,filename,archive_hash,pth_hash in cases:
+              path=hf_hub_download(repo,filename,repo_type=kind,revision=rev)
+              with open(path,"rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()==archive_hash
+              with zipfile.ZipFile(path) as z:
+                  members=[n for n in z.namelist() if n.endswith(".pth")]
+                  assert len(members)==1
+                  with z.open(members[0]) as src,open(name+".pth","wb") as dst: shutil.copyfileobj(src,dst)
+              with open(name+".pth","rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()==pth_hash
+              print(name,pth_hash,flush=True)
+          PY
+      - name: Build standalone LibTorch probe
+        run: |
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.18)
+          project(native_pth LANGUAGES CXX)
+          find_package(Torch REQUIRED)
+          add_executable(native_pth probe.cpp)
+          target_link_libraries(native_pth PRIVATE "${TORCH_LIBRARIES}")
+          set_property(TARGET native_pth PROPERTY CXX_STANDARD 17)
+          EOF
+          cat > probe.cpp <<'EOF'
+          #include <torch/serialize.h>
+          #include <torch/csrc/jit/serialization/import_read.h>
+          #include <caffe2/serialize/inline_container.h>
+          #include <ATen/ATen.h>
+          #include <fstream>
+          #include <iostream>
+          #include <vector>
+          #include <iterator>
+          #include <chrono>
+          int main(int argc,char** argv) {
+            if(argc!=2) return 2;
+            try {
+              auto start=std::chrono::steady_clock::now();
+              std::ifstream f(argv[1],std::ios::binary);
+              if(!f) throw std::runtime_error("cannot open model");
+              f.close();
+              caffe2::serialize::PyTorchStreamReader reader(argv[1]);
+              auto obj=torch::jit::readArchiveAndTensors("data","","",std::nullopt,std::nullopt,at::Device(at::kCPU),reader);
+              if(!obj.isGenericDict()) throw std::runtime_error("root not dict");
+              auto root=obj.toGenericDict();
+              auto weights=root.at(c10::IValue("weight")).toGenericDict();
+              long count=0, elements=0;
+              for(auto &kv:weights) {
+                auto t=kv.value().toTensor();
+                if(!t.device().is_cpu()) throw std::runtime_error("device mapping failed");
+                if(!at::isfinite(t).all().item<bool>()) throw std::runtime_error("nonfinite weight");
+                ++count; elements+=t.numel();
+              }
+              if(count!=457) throw std::runtime_error("unexpected tensor count");
+              auto ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+              std::cout<<"NATIVE_PTH_PASS "<<argv[1]<<" tensors="<<count<<" elements="<<elements<<" load_and_check_ms="<<ms<<std::endl;
+              return 0;
+            } catch(const std::exception& e) {
+              std::cerr<<"NATIVE_PTH_FAIL "<<argv[1]<<" "<<e.what()<<std::endl;
+              return 1;
+            }
+          }
+          EOF
+          cp CMakeLists.txt probe.cpp stage04-native/
+          cmake -S . -B build -DCMAKE_PREFIX_PATH="$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j2
+      - name: Run without Python interpreter
+        run: |
+          set +e
+          for model in F8 F9; do
+            env -u PYTHONPATH ./build/native_pth "$model.pth" > "stage04-native/$model.log" 2>&1
+            code=$?
+            cat "stage04-native/$model.log"
+            echo "$model exit=$code" | tee -a stage04-native/results.txt
+          done
+          ldd build/native_pth > stage04-native/dependencies.txt
+          cat stage04-native/dependencies.txt
+          test "$(grep -c 'exit=0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: VoiceBank-Stage04-Native-PTH-Probe
+          path: stage04-native/
+          retention-days: 30
+ stage04-native/results.txt)" -eq 2
+          if grep -q 'libpython' stage04-native/dependencies.txt; then exit 1; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: VoiceBank-Stage04-Native-PTH-Probe
+          path: stage04-native/
+          retention-days: 30

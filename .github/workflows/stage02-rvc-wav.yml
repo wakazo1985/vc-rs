@@ -1,0 +1,123 @@
+name: Stage 02 original RVC WAV
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/stage02-rvc-wav.yml'
+  push:
+    branches: [stage01-python-verification]
+    paths:
+      - '.github/workflows/stage02-rvc-wav.yml'
+permissions:
+  contents: read
+jobs:
+  wav:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CUDA_VISIBLE_DEVICES: ''
+      TORCH_FORCE_WEIGHTS_ONLY_LOAD: '1'
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare official RVC CPU environment
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg libsndfile1 libportaudio2 open-jtalk open-jtalk-mecab-naist-jdic hts-voice-nitech-jp-atr503-m001
+          git init rvc
+          cd rvc
+          git remote add origin https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git
+          git fetch --depth 1 origin 81eed5e8f68b6bed1789f682fe78cdd324495afc
+          git checkout --detach FETCH_HEAD
+          git rev-parse HEAD
+          sed -i 's|https://mirrors.pku.edu.cn/pypi/simple|https://pypi.org/simple|;s|https://mirrors.nju.edu.cn/pytorch/whl/cpu|https://download.pytorch.org/whl/cpu|' requirments_cpu_py312.txt
+          python -m pip install -r requirments_cpu_py312.txt
+          python -m pip install 'huggingface_hub>=0.26,<1'
+      - name: Acquire exact verified archives and inference assets
+        working-directory: rvc
+        run: |
+          python -u - <<'PY'
+          import pathlib, hashlib, zipfile, shutil
+          from huggingface_hub import hf_hub_download, snapshot_download
+          snapshot_download("lj1995/VoiceConversionWebUI", allow_patterns=["hubert_base/*"], local_dir="assets")
+          hf_hub_download("lj1995/VoiceConversionWebUI", "rmvpe.pt", local_dir="assets/rmvpe")
+          models = [
+              ("F8", "Rokkonrol/RVC_models", "dataset", "c4bdb3bb7aef5f7d213f79f57decea9e644fd4d5", "Russell Archey [Explore With Us (EWU)].zip", "88ba827fe6023d102d6d84a7bc26e1e181b40bb47977ccae1c378b320b3c1582"),
+              ("F9", "rayzox57/Joyca_High_RVC", "model", "035dff8fce32b4efda3e9c25e045e73ac5819812", "Joyca_High_Voice_v2_600e.zip", "4924376afcc16f3a8c109822239fdc5ce73c0e2459bb9fc71e55564aae0e0c99"),
+          ]
+          for key, repo, kind, revision, filename, expected in models:
+              archive = hf_hub_download(repo, filename, repo_type=kind, revision=revision)
+              with open(archive,"rb") as f:
+                  actual = hashlib.file_digest(f,"sha256").hexdigest()
+              if actual != expected:
+                  raise RuntimeError(f"{key} SHA-256 mismatch {actual}")
+              with zipfile.ZipFile(archive) as z:
+                  for suffix in (".pth",".index"):
+                      members = [m for m in z.infolist() if m.filename.lower().endswith(suffix)]
+                      if suffix == ".index":
+                          members = [m for m in members if pathlib.PurePosixPath(m.filename).name.startswith("added_")]
+                      if len(members) != 1:
+                          raise RuntimeError(f"{key} unexpected {suffix} candidates: {members}")
+                      target = pathlib.Path("assets/weights" if suffix == ".pth" else "assets/indices") / (key+suffix)
+                      target.parent.mkdir(parents=True,exist_ok=True)
+                      with z.open(members[0]) as src,target.open("wb") as dst:
+                          shutil.copyfileobj(src,dst)
+                      print(key, target, actual, flush=True)
+          PY
+      - name: Generate common Japanese male synthetic input
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/stage02"
+          printf '%s\n' 'こんにちは。今日は音声変換のテストを行います。ゆっくり、はっきりと話します。聞こえ方を確認してください。' > "$GITHUB_WORKSPACE/stage02/input.txt"
+          DICT=$(find /var/lib/mecab/dic /usr/share -name sys.dic -path '*open-jtalk*' -print -quit 2>/dev/null || true)
+          if [ -z "$DICT" ]; then DICT=$(dpkg -L open-jtalk-mecab-naist-jdic | grep '/sys.dic$' | head -1); fi
+          VOICE=$(dpkg -L hts-voice-nitech-jp-atr503-m001 | grep '\.htsvoice$' | head -1)
+          test -f "$DICT"
+          test -f "$VOICE"
+          open_jtalk -x "$(dirname "$DICT")" -m "$VOICE" -ow "$GITHUB_WORKSPACE/stage02/Original_synthetic_JP.wav" "$GITHUB_WORKSPACE/stage02/input.txt"
+      - name: Run original RVC CLI comparisons
+        working-directory: rvc
+        run: |
+          export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+          python -m infer.cli --help
+          python -u - <<'PY'
+          import pathlib, subprocess, json, sys, os, time
+          import numpy as np, soundfile as sf, librosa
+          out = pathlib.Path(os.environ["GITHUB_WORKSPACE"])/"stage02"
+          source = out/"Original_synthetic_JP.wav"
+          cases = [("F8", -12, r) for r in (0.0,0.5,0.75)] + [("F9", p, r) for p,r in [(-20,0.0),(-16,0.0),(-12,0.0),(-16,0.5)]]
+          results=[]
+          for key,pitch,rate in cases:
+              target=out/f"{key}_pitch{pitch}_index{rate:.2f}.wav"
+              cmd=[sys.executable,"-m","infer.cli","--model",f"assets/weights/{key}.pth","--index",f"assets/indices/{key}.index","--input",str(source),"--output",str(target),"--pitch",str(pitch),"--f0-method","rmvpe","--index-rate",str(rate),"--protect","0.33","--rms-mix-rate","1.0","--overwrite"]
+              start=time.monotonic()
+              proc=subprocess.run(cmd, capture_output=True,text=True)
+              (out/(target.stem+".log")).write_text(proc.stdout+"\n"+proc.stderr)
+              row={"model":key,"pitch":pitch,"index_rate":rate,"protect":0.33,"rms_mix_rate":1.0,"elapsed_s":time.monotonic()-start,"exit":proc.returncode,"file":target.name}
+              if proc.returncode == 0 and target.exists():
+                  try:
+                      y,sr=sf.read(target)
+                      if y.ndim>1: y=y.mean(axis=1)
+                      row.update(sr=sr,duration=len(y)/sr,peak=float(np.max(np.abs(y))),rms=float(np.sqrt(np.mean(y*y))),finite=bool(np.isfinite(y).all()))
+                      if not row["finite"] or row["rms"]<1e-5: raise ValueError("Silent or invalid audio")
+                      f0,voiced,_=librosa.pyin(y.astype(np.float32),fmin=25,fmax=600,sr=sr,frame_length=4096)
+                      good=f0[np.isfinite(f0)&voiced]
+                      row["median_f0_hz"]=float(np.median(good)) if len(good) else None
+                      row["status"]="pass"
+                  except Exception as e: row.update(status="fail",error=str(e))
+              else: row.update(status="fail",error=proc.stderr[-2000:])
+              print("RESULT",json.dumps(row,ensure_ascii=False),flush=True)
+              results.append(row)
+          (out/"results.json").write_text(json.dumps(results,indent=2))
+          raise SystemExit(int(any(r["status"]!="pass" for r in results)))
+          PY
+      - name: Upload comparison WAV and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoiceBank-Stage02-WAV
+          path: stage02/
+          if-no-files-found: warn
+          retention-days: 7

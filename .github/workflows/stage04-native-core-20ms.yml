@@ -1,0 +1,1391 @@
+name: Stage 04 native core 20ms gate
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/stage04-native-core-20ms.yml'
+  push:
+    branches: [stage01-python-verification]
+    paths:
+      - '.github/workflows/stage04-native-core-20ms.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: VoiceBank-Stage03-Frozen
+          path: frozen
+          github-token: ${{ github.token }}
+          run-id: '46134456010'
+      - name: Acquire exact original checkpoints and indices
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libopenblas-dev libssl-dev
+          curl --fail --location --retry 3 https://raw.githubusercontent.com/pytorch/pytorch/v2.7.1/torch/csrc/jit/serialization/unpickler.cpp -o unpickler.cpp
+          python - <<'PATCH'
+          from pathlib import Path
+          p=Path('unpickler.cpp')
+          s=p.read_text()
+          marker='} else if (module_name == "collections" && class_name == "OrderedDict") {'
+          start=s.index(marker)
+          end=s.index('} else if (module_name == "torch" && class_name == "device") {',start)
+          old=s[start:end]
+          assert 'stack_.back() = IValue();' in old
+          # Preserve actual OrderedDict keys and insertion order in the native dict.
+          s=s[:start]+old.replace('stack_.back() = IValue();','TORCH_CHECK(stack_.back().isTuple() && stack_.back().toTupleRef().elements().empty(), "unsupported OrderedDict constructor");\n      stack_.back() = c10::impl::GenericDict(c10::AnyType::get(), c10::AnyType::get());')+s[end:]
+          # Python state_dict may also include _metadata as object state.
+          old='    case PickleOpCode::BUILD:\n    case PickleOpCode::REDUCE: {'
+          assert old in s
+          s=s.replace(old,'''    case PickleOpCode::BUILD:
+                if (stack_.size() >= 2 && stack_[stack_.size()-2].isGenericDict() && stack_.back().isGenericDict()) {
+                  auto state = stack_.back().toGenericDict();
+                  TORCH_CHECK(state.size() == 1 && state.contains(IValue("_metadata")), "unsupported dictionary BUILD state");
+                  stack_.pop_back();
+                  break;
+                }
+                [[fallthrough]];
+              case PickleOpCode::REDUCE: {''')
+          p.write_text(s)
+          PATCH
+          git clone --depth 1 --branch v1.10.0 https://github.com/facebookresearch/faiss.git faiss-src
+          python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install 'huggingface_hub>=0.26,<1' 'numpy==1.26.4'
+          python -c 'import torch,numpy; assert torch.ones(1).numpy().dtype == numpy.float32'
+          mkdir -p stage04-native
+          python - <<'PY'
+          import hashlib, zipfile, pathlib, shutil, json
+          from huggingface_hub import hf_hub_download
+          frozen=pathlib.Path("frozen/VoiceBank_03_Presets.json")
+          config=json.loads(frozen.read_text())
+          cases=[
+              ("F6","VofVoices/maxwell-young-fantastic-max-RVC-v2","model","main","maxwellyoung(FantasticMax).zip","01805b226446741e8b077d102255bd55c7b85caa976f1fc7030033880649708d","be2f20b934aa3609938342cc594580789353cf5e481b5a4c3f3a153087b7189c"),
+              ("F8","Rokkonrol/RVC_models","dataset","c4bdb3bb7aef5f7d213f79f57decea9e644fd4d5","Russell Archey [Explore With Us (EWU)].zip","88ba827fe6023d102d6d84a7bc26e1e181b40bb47977ccae1c378b320b3c1582","df8f49d094e57b0abe726d8650de5d865546bce4d893ec59841c51ee0777a08b"),
+              ("F9","rayzox57/Joyca_High_RVC","model","035dff8fce32b4efda3e9c25e045e73ac5819812","Joyca_High_Voice_v2_600e.zip","4924376afcc16f3a8c109822239fdc5ce73c0e2459bb9fc71e55564aae0e0c99","d0ea3825eeebaef3531a8eb928ab001908ab7147499f818cfac820bd35074d86")
+          ]
+          for name,repo,kind,rev,filename,archive_hash,pth_hash in cases:
+              p=next(x for x in config["presets"].values() if x["shortcut"]==name)
+              fingerprint=p["rvc"]["stage02_model_fingerprint"]
+              path=hf_hub_download(repo,filename,repo_type=kind,revision=rev)
+              with open(path,"rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()==archive_hash
+              with zipfile.ZipFile(path) as z:
+                  for ext in (".pth",".index"):
+                      members=[n for n in z.namelist() if n.endswith(ext) and (ext==".pth" or name=="F6" or pathlib.PurePosixPath(n).name.startswith("added_"))]
+                      assert len(members)==1
+                      target=pathlib.Path(name+ext)
+                      with z.open(members[0]) as src,target.open("wb") as dst: shutil.copyfileobj(src,dst)
+                      with target.open("rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()==fingerprint[ext[1:]+"_sha256"]
+                      print("ORIGINAL_HASH_PASS",name,ext,flush=True)
+          for ext in (".pth",".index"):
+              src=hf_hub_download("John6666/mikuTTS","weights/D/D"+ext,repo_type="space",revision="28d67856b353a962e4916523ba94154e88c3fad6")
+              target=pathlib.Path("F7"+ext)
+              shutil.copyfile(src,target)
+              fp=next(x for x in config["presets"].values() if x["shortcut"]=="F7")["rvc"]["stage02_model_fingerprint"]
+              with target.open("rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()==fp[ext[1:]+"_sha256"]
+              print("ORIGINAL_HASH_PASS","F7",ext,flush=True)
+          import torch
+          for name in ("F6","F7","F8","F9"):
+              ckpt=torch.load(name+'.pth',map_location='cpu',weights_only=True)
+              with open(name+'.golden.tsv','w') as manifest:
+                  for key,t in ckpt['weight'].items():
+                      raw=t.detach().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+                      print(key,t.numel(),t.element_size(),str(t.dtype).split('.')[-1],','.join(map(str,t.shape)) or '-',hashlib.sha256(raw).hexdigest(),sep='\t',file=manifest)
+          shutil.copyfile(frozen,"stage04-native/VoiceBank_03_Presets.json")
+          rows=[]
+          for p in sorted(config["presets"].values(),key=lambda p:p["shortcut"]):
+              a=p["rvc"]["parameters"]
+              env=a["rms_mix_rate"] if "rms_mix_rate" in a else a["volume_envelope"]
+              fp=p["rvc"]["stage02_model_fingerprint"]
+              rows.append(' {"%s",%d,%.2ff,%.2ff,%.2ff,"%s","%s",%d},' % (p["shortcut"],a["pitch_shift_semitones"],a["index_rate"],a["protect"],env,fp["pth_sha256"],fp["index_sha256"],p["reference"]["sample_rate_hz"]))
+          pathlib.Path("presets.inc").write_text("\n".join(rows)+"\n")
+          PY
+      - name: Generate official TextEncoder reference
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git upstream
+          git -C upstream checkout 81eed5e8f68b6bed1789f682fe78cdd324495afc
+          python -m pip install scipy==1.14.1 librosa==0.10.2.post1 transformers==4.49.0 faiss-cpu==1.10.0
+          PYTHONPATH="$PWD/upstream" python - <<'PY'
+          import torch
+          from infer.module.models import TextEncoder, ResidualCouplingBlock, GeneratorNSF
+          from unittest.mock import patch
+          import math
+          torch.set_num_threads(2)
+          with torch.inference_mode():
+              for name in ("F6","F7","F8","F9"):
+                  ck=torch.load(name+".pth",map_location="cpu",weights_only=True)
+                  cfg=ck["config"]
+                  enc=TextEncoder(768,*cfg[2:8],float(cfg[8]),True).eval()
+                  enc.load_state_dict({k[6:]:v for k,v in ck["weight"].items() if k.startswith("enc_p.")},strict=True)
+                  flow=ResidualCouplingBlock(cfg[2],cfg[3],5,1,3,gin_channels=cfg[16]).eval()
+                  flow.load_state_dict({k[5:]:v for k,v in ck["weight"].items() if k.startswith("flow.")},strict=True)
+                  flow.remove_weight_norm()
+                  sr=cfg[-1] if isinstance(cfg[-1],int) else int(cfg[-1].rstrip("k"))*1000
+                  gen=GeneratorNSF(cfg[2],*cfg[9:15],gin_channels=cfg[16],sr=sr,is_half=False).eval()
+                  gen.load_state_dict({k[4:]:v for k,v in ck["weight"].items() if k.startswith("dec.")},strict=True)
+                  gen.remove_weight_norm()
+                  upp=math.prod(cfg[12])
+                  for t in (8,33):
+                      phone=(torch.arange(t*768,dtype=torch.float32).remainder(97)-48).reshape(1,t,768)/97
+                      pitch=torch.arange(t,dtype=torch.long).remainder(254).reshape(1,t)+1
+                      m,logs,mask=enc(phone,pitch,torch.tensor([t-2]))
+                      torch.cat((m,logs,mask),dim=1).contiguous().numpy().tofile(f"{name}.enc{t}.f32")
+                      print("REFERENCE_ENCODER",name,t,m.shape,flush=True)
+                      z=(torch.arange(t*cfg[2],dtype=torch.float32).remainder(67)-33).reshape(1,cfg[2],t)/67
+                      g=ck["weight"]["emb_g.weight"][0].float().reshape(1,-1,1)
+                      flow(z,mask,g=g,reverse=True).contiguous().numpy().tofile(f"{name}.flow{t}.f32")
+                      print("REFERENCE_FLOW",name,t,flush=True)
+                      z2=flow(z,mask,g=g,reverse=True)*mask
+                      f0=torch.where(torch.arange(t)%4==0,0.,110.+torch.arange(t)*3).reshape(1,t)
+                      noise=(torch.arange(t*upp,dtype=torch.float32).remainder(31)-15).reshape(1,t*upp,1)/15
+                      with patch("torch.randn_like",return_value=noise):
+                          audio=gen(z2,f0,g=g)
+                      audio.contiguous().numpy().tofile(f"{name}.gen{t}.f32")
+                      print("REFERENCE_GENERATOR",name,t,audio.shape,flush=True)
+          PY
+      - name: Generate official RMVPE reference from original checkpoint
+        run: |
+          PYTHONPATH="$PWD/upstream" python - <<'PY'
+          import torch, hashlib, shutil, pathlib
+          from huggingface_hub import hf_hub_download
+          from infer.rmvpe import RMVPE
+          src=hf_hub_download("lj1995/VoiceConversionWebUI","rmvpe.pt",revision="0d7ebae")
+          shutil.copyfile(src,"rmvpe.pt")
+          with open("rmvpe.pt","rb") as f:
+              digest=hashlib.file_digest(f,"sha256").hexdigest()
+              assert digest=="6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193"
+              print("RMVPE_ORIGINAL_SHA256",digest,flush=True)
+          torch.set_num_threads(2)
+          model=RMVPE("rmvpe.pt",False,"cpu")
+          with torch.inference_mode():
+              a=torch.arange(5120,dtype=torch.float32)/16000
+              x=(torch.sin(a*2*3.141592653589793*123)*0.2+torch.sin(a*2*3.141592653589793*246)*0.06).reshape(1,-1)
+              x[:,0:800]=0
+              mel=model.extract_mel(x)
+              hidden=model.mel2hidden(mel)
+              f0=model.decode(hidden.squeeze(0).numpy(),thred=0.03)
+              for key,val in (("input",x),("mel",mel),("hidden",hidden),("f0",torch.from_numpy(f0))):
+                  val.float().contiguous().numpy().tofile("rmvpe."+key+".f32")
+              print("RMVPE_REFERENCE",list(mel.shape),list(hidden.shape),flush=True)
+          PY
+      - name: Generate official HuBERT reference from unchanged distributed checkpoint
+        run: |
+          PYTHONPATH="$PWD/upstream" python - <<'PY'
+          import hashlib, pathlib, torch, shutil
+          from huggingface_hub import snapshot_download
+          from infer.hubert import load_hubert_model,extract_hubert_features
+          dest=pathlib.Path("upstream/assets")
+          snapshot_download("lj1995/VoiceConversionWebUI",revision="1be9d36",allow_patterns=["hubert_base/*"],local_dir=dest)
+          src=dest/"hubert_base/pytorch_model.bin"
+          with src.open("rb") as f:
+              assert hashlib.file_digest(f,"sha256").hexdigest()=="cc8c20f4b90a520757260197a3ff2505705a7adbd20ad9eeaa4e1a9b38442ef5"
+          shutil.copyfile(src,"hubert.bin")
+          torch.set_num_threads(2)
+          model=load_hubert_model("cpu",False)
+          import numpy as np
+          x=torch.from_numpy(np.fromfile("rmvpe.input.f32",dtype=np.float32)).reshape(1,-1)
+          with torch.inference_mode():
+              for v in ("v1","v2"):
+                  y=extract_hubert_features(model,x,v)
+                  y.float().contiguous().numpy().tofile("hubert."+v+".f32")
+                  print("HUBERT_REFERENCE",v,list(y.shape),flush=True)
+          from huggingface_hub import hf_hub_download
+          from infer.hubert import HubertModelWithFinalProj
+          d=pathlib.Path("applio-contentvec");d.mkdir(exist_ok=True)
+          for file in ("config.json","pytorch_model.bin"):
+              p=hf_hub_download("IAHispano/Applio","Resources/embedders/contentvec/"+file,revision="af1e177")
+              shutil.copyfile(p,d/file)
+          with (d/"pytorch_model.bin").open("rb") as f: assert hashlib.file_digest(f,"sha256").hexdigest()=="d8dd400e054ddf4e6be75dab5a2549db748cc99e756a097c496c099f65a4854e"
+          shutil.copyfile(d/"pytorch_model.bin","applio_contentvec.bin")
+          model=HubertModelWithFinalProj.from_pretrained(d,local_files_only=True).eval()
+          with torch.inference_mode():
+              y=model(x).last_hidden_state
+              y.float().contiguous().numpy().tofile("applio.hubert.v2.f32")
+          PY
+      - name: Generate end-to-end neural reference with same unchanged source and model
+        run: |
+          PYTHONPATH="$PWD/upstream" python - <<'PY'
+          import torch,numpy as np,math,faiss,json,librosa
+          from infer.module.models import TextEncoder,ResidualCouplingBlock,GeneratorNSF
+          from unittest.mock import patch
+          from infer.rmvpe import RMVPE
+          torch.set_num_threads(2)
+          feats=torch.from_numpy(np.fromfile("hubert.v2.f32",dtype=np.float32)).reshape(1,-1,768)
+          f0=np.fromfile("rmvpe.f0.f32",dtype=np.float32)
+          voiced=f0>0
+          if voiced.any(): f0[~voiced]=np.interp(np.flatnonzero(~voiced),np.flatnonzero(voiced),f0[voiced])
+          x=np.fromfile("rmvpe.input.f32",dtype=np.float32)
+          original_f0=np.fromfile("rmvpe.f0.f32",dtype=np.float32)
+          scaled=x.copy();q=np.quantile(np.abs(scaled),0.999)
+          if q>0: scaled/=q
+          f6_f0=RMVPE("rmvpe.pt",False,"cpu").infer_from_audio(scaled,thred=0.03)
+          for name in ("F6","F7","F8","F9"):
+              ck=torch.load(name+".pth",map_location="cpu",weights_only=True);cfg=ck["config"]
+              import json
+              params=next(p["rvc"]["parameters"] for p in json.load(open("frozen/VoiceBank_03_Presets.json"))["presets"].values() if p["shortcut"]==name)
+              pitch=params["pitch_shift_semitones"];rate=params["index_rate"]
+              input_feats=torch.from_numpy(np.fromfile("applio.hubert.v2.f32",dtype=np.float32)).reshape(1,-1,768) if name=="F6" else feats
+              orig=input_feats.clone()
+              if rate:
+                  index=faiss.read_index(name+".index")
+                  vec=index.reconstruct_n(0,index.ntotal)
+                  score,ix=index.search(input_feats[0].numpy(),8)
+                  assert (ix>=0).all() and np.isfinite(score).all()
+                  zero=score==0
+                  weight=np.where(zero.any(axis=1,keepdims=True),zero.astype(np.float64),1/np.maximum(score.astype(np.float64),1e-30)**2)
+                  weight/=weight.sum(axis=1,keepdims=True)
+                  retrieved=np.sum(vec[ix]*weight[:,:,None],axis=1).astype(np.float32)
+                  input_feats=torch.from_numpy(retrieved).unsqueeze(0)*rate+input_feats*(1-rate)
+                  input_feats.contiguous().numpy().tofile(name+".retrieved.f32")
+              fine=f6_f0 if name=="F6" else f0
+              t=min(input_feats.shape[1]*2,len(fine),len(x)//160)
+              phone=input_feats.repeat_interleave(2,dim=1)[:,:t]
+              original=orig.repeat_interleave(2,dim=1)[:,:t]
+              pf=torch.from_numpy(fine[:t].copy()).float().reshape(1,t)*2**(pitch/12)
+              if params["protect"]<0.5 and rate:
+                  a=torch.where(pf<1,params["protect"],1.).unsqueeze(-1)
+                  phone=phone*a+original*(1-a)
+              phone.contiguous().numpy().tofile(name+".phone.f32")
+              pf.contiguous().numpy().tofile(name+".pitchf.f32")
+              enc=TextEncoder(768,*cfg[2:8],float(cfg[8]),True).eval()
+              flow=ResidualCouplingBlock(cfg[2],cfg[3],5,1,3,gin_channels=cfg[16]).eval()
+              sr=cfg[-1] if isinstance(cfg[-1],int) else int(cfg[-1].rstrip("k"))*1000
+              gen=GeneratorNSF(cfg[2],*cfg[9:15],gin_channels=cfg[16],sr=sr,is_half=False).eval()
+              for model,prefix in [(enc,"enc_p."),(flow,"flow."),(gen,"dec.")]:
+                  model.load_state_dict({k[len(prefix):]:v for k,v in ck["weight"].items() if k.startswith(prefix)},strict=True)
+              flow.remove_weight_norm();gen.remove_weight_norm()
+              with torch.inference_mode():
+                  m=1127*torch.log1p(pf/700)
+                  a=1127*math.log(1+50/700);b=1127*math.log(1+1100/700)
+                  coarse=torch.where(m>0,(m-a)*254/(b-a)+1,m).clamp(1,255).round().long()
+                  mu,logs,mask=enc(phone,coarse,torch.tensor([t]))
+                  noise=(torch.arange(mu.numel(),dtype=torch.float32).remainder(37)-18).reshape_as(mu)/18
+                  z=flow((mu+logs.exp()*noise*0.66666)*mask,mask,g=ck["weight"]["emb_g.weight"][0].float().reshape(1,-1,1),reverse=True)*mask
+                  upp=math.prod(cfg[12]);exc=(torch.arange(t*upp,dtype=torch.float32).remainder(31)-15).reshape(1,t*upp,1)/15
+                  with patch("torch.randn_like",return_value=exc):
+                      y=gen(z,pf,g=ck["weight"]["emb_g.weight"][0].float().reshape(1,-1,1))
+                  y.contiguous().numpy().tofile(name+".pipeline.f32")
+                  if name=="F7":
+                      a=librosa.feature.rms(y=x,frame_length=16000,hop_length=8000)
+                      b=librosa.feature.rms(y=y.reshape(-1).numpy(),frame_length=sr,hop_length=sr//2)
+                      a=torch.nn.functional.interpolate(torch.from_numpy(a).unsqueeze(0),size=y.numel(),mode="linear",align_corners=False)
+                      b=torch.nn.functional.interpolate(torch.from_numpy(b).unsqueeze(0),size=y.numel(),mode="linear",align_corners=False).clamp_min(1e-6)
+                      (y*a.pow(0.75)*b.pow(-0.75)).contiguous().numpy().tofile(name+".rms.f32")
+                  print("REFERENCE_PIPELINE",name,t,sr,y.shape,flush=True)
+          PY
+      - name: Build and test host real-time transport
+        run: |
+          cat > rt_audio.hpp <<'EOF'
+          #pragma once
+          #include <array>
+          #include <atomic>
+          #include <algorithm>
+          #include <filesystem>
+          #include <thread>
+          #include <openssl/evp.h>
+          #include <cmath>
+          #include <cstdint>
+          #include <cstddef>
+          #include <type_traits>
+          namespace voicebank {
+          constexpr int host_rate=48000,feature_rate=16000;
+          constexpr size_t host_hop=480,feature_hop=160,history_frames=5120;
+          constexpr size_t internal_delay=720; // 15 ms scheduling target, not measured physical latency
+          constexpr float pi=3.14159265358979323846f;
+          static_assert(std::atomic<uint64_t>::is_always_lock_free);
+          static_assert(std::atomic<unsigned>::is_always_lock_free);
+          struct InputFrame {uint64_t first;std::array<float,host_hop> samples;};
+          struct OutputFrame {uint64_t first;std::array<float,host_hop> samples;};
+          template<class T,size_t N> struct Spsc {
+           static_assert((N&(N-1))==0&&N>0);
+           static_assert(std::is_trivially_copyable_v<T>);
+           std::array<T,N> data{};
+           alignas(64) std::atomic<uint64_t> write{0};
+           alignas(64) std::atomic<uint64_t> read{0};
+           bool push(const T& item) noexcept {
+            auto w=write.load(std::memory_order_relaxed);
+            if(w-read.load(std::memory_order_acquire)>=N)return false;
+            data[w&(N-1)]=item;write.store(w+1,std::memory_order_release);return true;
+           }
+           bool pop(T& item) noexcept {
+            auto r=read.load(std::memory_order_relaxed);
+            if(r==write.load(std::memory_order_acquire))return false;
+            item=data[r&(N-1)];read.store(r+1,std::memory_order_release);return true;
+           }
+          };
+          struct Counters {std::atomic<uint64_t> input_overrun{0},output_overrun{0},underrun_samples{0},late_samples{0},worker_failures{0},discontinuities{0};};
+          class AudioBridge {
+           Spsc<InputFrame,32> in_;
+           Spsc<OutputFrame,32> out_;
+           InputFrame building_{};
+           OutputFrame pending_{};
+           size_t input_fill_=0,pending_at_=host_hop;
+           uint64_t cursor_=0;
+           public:
+           Counters counts;
+           std::atomic<uint64_t> published_cursor{0};
+           std::atomic<unsigned> selected{0};
+           void callback(const float* input,float* output,size_t n) noexcept {
+            for(size_t i=0;i<n;++i){
+             auto seq=cursor_++;
+             if(input_fill_==0)building_.first=seq;
+             building_.samples[input_fill_++]=std::isfinite(input[i])?input[i]:0.0f;
+             if(input_fill_==host_hop){if(!in_.push(building_))counts.input_overrun.fetch_add(1,std::memory_order_relaxed);input_fill_=0;}
+             output[i]=0;
+             if(seq<internal_delay)continue;
+             auto wanted=seq-internal_delay;
+             bool emitted=false;
+             while(true){
+              if(pending_at_==host_hop){if(!out_.pop(pending_))break;pending_at_=0;}
+              uint64_t available=pending_.first+pending_at_;
+              if(available<wanted){
+               auto skip=std::min<uint64_t>(host_hop-pending_at_,wanted-available);
+               pending_at_+=size_t(skip);counts.late_samples.fetch_add(skip,std::memory_order_relaxed);continue;
+              }
+              if(available==wanted){output[i]=pending_.samples[pending_at_++];emitted=true;break;}
+              break;
+             }
+             if(!emitted)counts.underrun_samples.fetch_add(1,std::memory_order_relaxed);
+            }
+            published_cursor.store(cursor_,std::memory_order_release);
+           }
+           bool take(InputFrame& frame) noexcept{return in_.pop(frame);}
+           bool submit(const OutputFrame& frame) noexcept {
+            if(!out_.push(frame)){counts.output_overrun.fetch_add(1,std::memory_order_relaxed);return false;}return true;
+           }
+          };
+          class Decimator3 {
+           static constexpr int taps=63;
+           std::array<float,taps> h_{},samples_{};int pos_=0,phase_=0;
+           public:
+           Decimator3(){double sum=0;constexpr double fc=0.145;
+            for(int i=0;i<taps;++i){double x=i-(taps-1)*0.5;
+             double s=x==0?2*fc:std::sin(2*pi*fc*x)/(pi*x);
+             double w=.42-.5*std::cos(2*pi*i/(taps-1))+.08*std::cos(4*pi*i/(taps-1));h_[i]=float(s*w);sum+=h_[i];}
+            for(auto& a:h_)a=float(a/sum);
+           }
+           void reset() noexcept{samples_.fill(0);pos_=phase_=0;}
+           void run(const std::array<float,host_hop>& in,std::array<float,feature_hop>& out) noexcept{
+            size_t j=0;for(float x:in){samples_[pos_]=x;pos_=(pos_+1)%taps;
+             if(++phase_==3){phase_=0;double v=0;int p=pos_;for(int k=0;k<taps;++k){p=(p+taps-1)%taps;v+=h_[k]*samples_[p];}out[j++]=float(v);}}
+           }
+          };
+          class SharedHistory {
+           Decimator3 decimator_;
+           std::array<float,history_frames> buf_{};
+           std::array<float,feature_hop> newest_{};
+           public:
+           void reset() noexcept{buf_.fill(0);decimator_.reset();}
+           const std::array<float,history_frames>& append(const InputFrame& frame) noexcept {
+            decimator_.run(frame.samples,newest_);
+            std::move(buf_.begin()+feature_hop,buf_.end(),buf_.begin());
+            std::copy(newest_.begin(),newest_.end(),buf_.end()-feature_hop);
+            return buf_;
+           }
+          };
+          class TailResampler {
+           static constexpr int half=16;
+           std::array<std::array<float,2*half>,6> coeff_{};
+           public:
+           TailResampler(){for(int phase=0;phase<6;++phase){double s=0;double frac=phase/6.;for(int k=0;k<2*half;++k){double x=k-(half-1)-frac;double a=std::abs(x)/half;double w=a>=1?0:.5+.5*std::cos(pi*a);double sinc=x==0?1:std::sin(pi*x)/(pi*x);coeff_[phase][k]=float(w*sinc);s+=coeff_[phase][k];}for(auto& v:coeff_[phase])v=float(v/s);}}
+           bool run(const float* source,size_t count,int sr,std::array<float,host_hop>& out) const noexcept {
+            if(sr==48000){if(count<host_hop)return false;std::copy_n(source+count-host_hop,host_hop,out.begin());return true;}
+            if(sr!=40000||count<400+2*half)return false;
+            const int64_t begin=int64_t(count)-400-half;
+            for(int i=0;i<int(host_hop);++i){int n=i*5;int64_t center=begin+n/6;int phase=n%6;double y=0;
+             for(int k=0;k<2*half;++k){int64_t at=center+k-(half-1);if(at<0||at>=int64_t(count))return false;y+=source[at]*coeff_[phase][k];}out[i]=float(y);}
+            return true;
+           }
+          };
+          // Experimental causal RMS. It is NOT the centered offline RMS reference.
+          // The comparison and quality gate must pass before release.
+          class CausalEnvelope {
+           static constexpr int blocks=100;
+           std::array<double,blocks> x_{},y_{};
+           double sx_=0,sy_=0;int p_=0;float prev_=1;
+           public:
+           void reset() noexcept{x_.fill(0);y_.fill(0);sx_=sy_=0;p_=0;prev_=1;}
+           void run(const InputFrame& input,OutputFrame& output,float mix) noexcept {
+            if(mix>=1)return;
+            double a=0,b=0;for(size_t i=0;i<host_hop;++i){a+=double(input.samples[i])*input.samples[i];b+=double(output.samples[i])*output.samples[i];}
+            sx_+=a-x_[p_];sy_+=b-y_[p_];x_[p_]=a;y_[p_]=b;p_=(p_+1)%blocks;
+            double rms1=std::sqrt(std::max(0.,sx_)/(blocks*host_hop)),rms2=std::sqrt(std::max(0.,sy_)/(blocks*host_hop));
+            float target=float(std::pow(rms1/std::max(rms2,1e-6),1-mix));
+            for(size_t i=0;i<host_hop;++i)output.samples[i]*=prev_+(target-prev_)*float(i+1)/host_hop;
+            prev_=target;
+           }
+          };
+          class SwitchJoin {
+           bool valid_=false;unsigned previous_=0;float last_=0;
+           public:
+           void reset()noexcept{valid_=false;last_=0;}
+           void run(unsigned voice,std::array<float,host_hop>& out) noexcept {
+            if(valid_&&previous_!=voice){constexpr size_t n=96;float first=out[0];for(size_t i=0;i<n;++i){float t=float(i+1)/n;float fade=.5f-.5f*std::cos(pi*t);out[i]+=(last_-first)*(1-fade);}}
+            last_=out.back();previous_=voice;valid_=true;
+           }
+          };
+          } // namespace voicebank
+          EOF
+          cat > test_rt.cpp <<'EOF'
+          #include "rt_audio.hpp"
+          #include <iostream>
+          #include <cassert>
+          #include <vector>
+          using namespace voicebank;
+          int main(){
+           AudioBridge q;std::vector<float> data(48000),out(48000);for(size_t i=0;i<data.size();++i)data[i]=float(i+1)/data.size();
+           for(size_t i=0;i<data.size();i+=240){q.callback(data.data()+i,out.data()+i,240);InputFrame in;while(q.take(in)){OutputFrame o;o.first=in.first;o.samples=in.samples;assert(q.submit(o));}}
+           for(size_t i=0;i<internal_delay;++i)assert(out[i]==0);
+           for(size_t i=internal_delay;i<data.size();++i)assert(out[i]==data[i-internal_delay]);
+           std::cout<<"IDENTITY_DELAY samples="<<internal_delay<<" ms="<<1000.*internal_delay/host_rate<<" underrun="<<q.counts.underrun_samples<<" late="<<q.counts.late_samples<<"\n";
+           assert(q.counts.underrun_samples==0&&q.counts.late_samples==0);
+           AudioBridge slow;for(size_t i=0;i<4800;i+=240){slow.callback(data.data()+i,out.data()+i,240);InputFrame in;while(slow.take(in)){if(in.first==0)continue;OutputFrame o;o.first=in.first;o.samples=in.samples;slow.submit(o);}}
+           std::cout<<"MISSED_BLOCK underrun="<<slow.counts.underrun_samples<<" expected=480\n";assert(slow.counts.underrun_samples==480);
+           Decimator3 d;std::array<float,480> x;std::array<float,160> y;double pass=0,stop=0;for(int freq:{1000,12000}){d.reset();double sum=0;for(int block=0;block<20;++block){for(int i=0;i<480;++i)x[i]=std::sin(2*pi*freq*(block*480+i)/48000);d.run(x,y);if(block>0)for(auto v:y)sum+=v*v;}double rms=std::sqrt(sum/(19*160));if(freq==1000)pass=rms;else stop=rms;}
+           std::cout<<"DECIMATOR pass_rms="<<pass<<" stop_rms="<<stop<<"\n";assert(pass>.68&&pass<.73&&stop<.002);
+           TailResampler r;std::array<float,1200> w;std::array<float,480> v;for(size_t i=0;i<w.size();++i)w[i]=std::sin(2*pi*1000*i/40000);assert(r.run(w.data(),w.size(),40000,v));double err=0;for(size_t i=0;i<v.size();++i){double ref=std::sin(2*pi*1000*(784+i*5./6)/40000);err+=(v[i]-ref)*(v[i]-ref);}err=std::sqrt(err/v.size());std::cout<<"RESAMPLE_40_TO_48 rms_error="<<err<<"\n";assert(err<.002);
+           SharedHistory hist;InputFrame a{};a.samples.fill(.25);auto& h=hist.append(a);assert(h.back()>.24&&h.back()<.26);
+           std::cout<<"RT_INFRA_PASS (identity scheduling and resampling only; no neural or device latency measured)\n";
+          }
+          EOF
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror test_rt.cpp -o test_rt
+          set -o pipefail
+          ./test_rt | tee stage04-native/rt-infra.log
+          cp rt_audio.hpp test_rt.cpp stage04-native/
+      - name: Build native model bank and index path
+        run: |
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.18)
+          project(voicebank_native LANGUAGES CXX)
+          find_package(Torch REQUIRED)
+          find_package(OpenSSL REQUIRED)
+          find_package(OpenMP REQUIRED)
+          find_package(BLAS REQUIRED)
+          find_package(LAPACK REQUIRED)
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+          set(FAISS_ENABLE_GPU OFF CACHE BOOL "" FORCE)
+          set(FAISS_ENABLE_PYTHON OFF CACHE BOOL "" FORCE)
+          set(FAISS_ENABLE_C_API OFF CACHE BOOL "" FORCE)
+          set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+          add_subdirectory(faiss-src faiss-build EXCLUDE_FROM_ALL)
+          add_executable(voicebank_native core.cpp unpickler.cpp)
+          target_link_libraries(voicebank_native PRIVATE OpenSSL::Crypto)
+          target_link_libraries(voicebank_native PRIVATE "${TORCH_LIBRARIES}" faiss LAPACK::LAPACK BLAS::BLAS OpenMP::OpenMP_CXX)
+          set_property(TARGET voicebank_native PROPERTY CXX_STANDARD 17)
+          option(VOICEBANK_CUDA "Enable native CUDA benchmark (requires CUDA LibTorch)" OFF)
+          if(VOICEBANK_CUDA)
+            find_package(CUDAToolkit REQUIRED)
+            target_compile_definitions(voicebank_native PRIVATE VOICEBANK_CUDA=1)
+            target_link_libraries(voicebank_native PRIVATE CUDA::cudart)
+            find_package(Threads REQUIRED)
+            add_library(voicebank_core SHARED core.cpp unpickler.cpp)
+            set_property(TARGET voicebank_core PROPERTY CXX_STANDARD 17)
+            target_compile_definitions(voicebank_core PRIVATE VOICEBANK_CUDA=1 VOICEBANK_RUNTIME=1)
+            target_link_libraries(voicebank_core PRIVATE "${TORCH_LIBRARIES}" faiss OpenSSL::Crypto LAPACK::LAPACK BLAS::BLAS OpenMP::OpenMP_CXX CUDA::cudart Threads::Threads)
+          endif()
+          EOF
+          cat > core.cpp <<'EOF'
+          #include <torch/csrc/jit/serialization/import_read.h>
+          #include <caffe2/serialize/inline_container.h>
+          #include "rt_audio.hpp"
+          #include <ATen/ATen.h>
+          #include <ATen/core/grad_mode.h>
+          #include <algorithm>
+          #ifdef VOICEBANK_CUDA
+          #include <ATen/cuda/CUDAGraph.h>
+          #include <c10/cuda/CUDAGuard.h>
+          #include <c10/cuda/CUDAStream.h>
+          #include <cuda_runtime_api.h>
+          #endif
+          #include <torch/csrc/jit/serialization/unpickler.h>
+          #include <openssl/sha.h>
+          #include <fstream>
+          #include <iomanip>
+          #include <sstream>
+          #include <unordered_map>
+          #include <cstring>
+          #include <faiss/Index.h>
+          #include <faiss/index_io.h>
+          #include <array>
+          #include <atomic>
+          #include <chrono>
+          #include <cmath>
+          #include <iostream>
+          #include <memory>
+          #include <stdexcept>
+          #include <vector>
+          using Clock=std::chrono::steady_clock;
+          double ms(Clock::time_point t){return std::chrono::duration<double,std::milli>(Clock::now()-t).count();}
+          void require(bool v,const char* msg){if(!v) throw std::runtime_error(msg);}
+          struct Preset{const char* name;int pitch;float index,protect,rms;const char* pth_sha;const char* index_sha;int sr;};
+          constexpr std::array<Preset,4> presets{{
+          #include "presets.inc"
+          }};
+          constexpr int sample_rate=48000;
+          constexpr int target_samples=960;
+          static_assert(target_samples*1000/sample_rate==20);
+          c10::IValue load_original(caffe2::serialize::PyTorchStreamReader& archive){
+           auto record=archive.getRecord("data.pkl");
+           auto& ptr=std::get<0>(record);
+           auto size=std::get<1>(record);
+           size_t pos=0;
+           auto input=[&](char* dst,size_t n){n=std::min(n,size-pos);std::memcpy(dst,static_cast<const char*>(ptr.get())+pos,n);pos+=n;return n;};
+           auto storage=[&](const std::string& key){return std::get<0>(archive.getRecord("data/"+key));};
+           torch::jit::Unpickler u(input,nullptr,nullptr,storage,at::Device(at::kCPU),false,torch::jit::Unpickler::defaultTypeParser,nullptr);
+           u.set_version(archive.version());
+           return u.parse_ivalue();
+          }
+          std::string digest_tensor(const at::Tensor& t){
+           auto b=t.contiguous();
+           unsigned char digest[SHA256_DIGEST_LENGTH];
+           SHA256(static_cast<const unsigned char*>(b.data_ptr()),b.nbytes(),digest);
+           std::ostringstream out;
+           for(auto x:digest)out<<std::hex<<std::setw(2)<<std::setfill('0')<<int(x);
+           return out.str();
+          }
+          struct TextEncoder {
+           std::unordered_map<std::string,at::Tensor> w;
+           int64_t hidden,heads,layers,inter;
+           explicit TextEncoder(const c10::impl::GenericDict& root){
+            auto config=root.at(c10::IValue("config"));auto cfg=config.toListRef();
+            inter=cfg[2].toInt();hidden=cfg[3].toInt();heads=cfg[5].toInt();layers=cfg[6].toInt();
+            auto weights=root.at(c10::IValue("weight")).toGenericDict();
+            for(auto& kv:weights){auto key=kv.key().toStringRef();if(key.rfind("enc_p.",0)==0)w.emplace(key.substr(6),kv.value().toTensor().to(at::kFloat));}
+            require(hidden%heads==0,"encoder head geometry");
+           }
+           const at::Tensor& W(const std::string& k)const{return w.at(k);}
+           at::Tensor conv(const at::Tensor& x,const std::string& k,bool pad=false)const{
+            auto a=W(k+".weight");auto n=a.size(2);
+            return at::conv1d(pad?at::constant_pad_nd(x,{(n-1)/2,n/2},0):x,a,W(k+".bias"),at::IntArrayRef{1},at::IntArrayRef{0},at::IntArrayRef{1},1);
+           }
+           at::Tensor norm(const at::Tensor& x,const std::string& k)const{
+            return at::layer_norm(x.transpose(1,2),{hidden},W(k+".gamma"),W(k+".beta"),1e-5,true).transpose(1,2);
+           }
+           at::Tensor relative(const at::Tensor& x,int64_t t)const{
+            auto win=(x.size(1)-1)/2;auto pad=std::max<int64_t>(t-win-1,0);auto start=std::max<int64_t>(win+1-t,0);
+            return at::constant_pad_nd(x,{0,0,pad,pad},0).slice(1,start,start+2*t-1);
+           }
+           at::Tensor attention(const at::Tensor& x,const at::Tensor& mask,const std::string& k)const{
+            auto b=x.size(0),t=x.size(2),d=hidden/heads;
+            auto q=conv(x,k+".conv_q").reshape({b,heads,d,t}).transpose(2,3)/std::sqrt(double(d));
+            auto key=conv(x,k+".conv_k").reshape({b,heads,d,t}).transpose(2,3);
+            auto v=conv(x,k+".conv_v").reshape({b,heads,d,t}).transpose(2,3);
+            auto score=at::matmul(q,key.transpose(-2,-1));
+            auto r=at::matmul(q,relative(W(k+".emb_rel_k"),t).unsqueeze(0).transpose(-2,-1));
+            r=at::constant_pad_nd(r,{0,1},0).reshape({b,heads,2*t*t});
+            r=at::constant_pad_nd(r,{0,t-1},0).reshape({b,heads,t+1,2*t-1}).slice(2,0,t).slice(3,t-1,2*t-1);
+            auto p=at::softmax((score+r).masked_fill((mask.unsqueeze(2)*mask.unsqueeze(-1)).eq(0),-1e4),-1);
+            auto out=at::matmul(p,v);
+            r=at::constant_pad_nd(p,{0,t-1},0).reshape({b,heads,2*t*t-t});
+            r=at::constant_pad_nd(r,{t,0},0).reshape({b,heads,t,2*t}).slice(3,1,2*t);
+            out=out+at::matmul(r,relative(W(k+".emb_rel_v"),t).unsqueeze(0));
+            return conv(out.transpose(2,3).contiguous().reshape({b,hidden,t}),k+".conv_o");
+           }
+           at::Tensor forward(const at::Tensor& phone,const at::Tensor& pitch,const at::Tensor& lengths)const{
+            auto t=phone.size(1);
+            auto x=at::linear(phone,W("emb_phone.weight"),W("emb_phone.bias"))+at::embedding(W("emb_pitch.weight"),pitch,-1,false,false);
+            x=at::leaky_relu(x*std::sqrt(double(hidden)),0.1).transpose(1,2);
+            auto mask=at::arange(t,lengths.options()).unsqueeze(0).lt(lengths.unsqueeze(1)).unsqueeze(1).to(x.scalar_type());
+            x=x*mask;
+            for(int i=0;i<layers;++i){
+             auto n=std::to_string(i);
+             x=norm(x+attention(x,mask,"encoder.attn_layers."+n),"encoder.norm_layers_1."+n);
+             auto y=at::relu(conv(x*mask,"encoder.ffn_layers."+n+".conv_1",true));
+             y=conv(y*mask,"encoder.ffn_layers."+n+".conv_2",true)*mask;
+             x=norm(x+y,"encoder.norm_layers_2."+n);
+            }
+            auto stats=conv(x*mask,"proj")*mask;require(stats.size(1)==2*inter,"encoder projection");
+            return at::cat({stats,mask},1).contiguous();
+           }
+          };
+          void verify_encoder(const c10::impl::GenericDict& root,const std::string& name){
+           at::NoGradGuard guard;
+           TextEncoder enc(root);
+           for(int64_t t:{8,33}){
+            auto phone=(at::arange(t*768,at::TensorOptions().dtype(at::kFloat)).remainder(97)-48).reshape({1,t,768})/97;
+            auto pitch=at::arange(t,at::TensorOptions().dtype(at::kLong)).remainder(254).reshape({1,t})+1;
+            auto lengths=at::full({1},t-2,at::TensorOptions().dtype(at::kLong));
+            auto start=Clock::now();auto out=enc.forward(phone,pitch,lengths);auto elapsed=ms(start);
+            auto ref=at::empty_like(out);std::ifstream in(name+".enc"+std::to_string(t)+".f32",std::ios::binary);
+            in.read(static_cast<char*>(ref.data_ptr()),ref.nbytes());
+            require(in.gcount()==static_cast<std::streamsize>(ref.nbytes()),"missing encoder reference");
+            std::cout<<"TEXT_ENCODER "<<name<<" frames="<<t<<" max_abs_error="<<(out-ref).abs().max().item<float>()<<" cpu_ms="<<elapsed<<std::endl;
+            require(at::allclose(out,ref,1e-4,1e-4),"official TextEncoder mismatch");
+           }
+          }
+          // RVC reverse residual coupling: weight-normalized WN, flip, mean-only coupling.
+          struct ReverseFlow {
+           std::unordered_map<std::string,at::Tensor> w;
+           int64_t hidden,inter;
+           explicit ReverseFlow(const c10::impl::GenericDict& root){
+            auto config=root.at(c10::IValue("config"));auto cfg=config.toListRef();
+            inter=cfg[2].toInt();hidden=cfg[3].toInt();
+            auto weights=root.at(c10::IValue("weight")).toGenericDict();
+            for(auto& kv:weights){
+             auto k=kv.key().toStringRef();
+             if(k.rfind("flow.",0)==0||k=="emb_g.weight")w.emplace(k,kv.value().toTensor().to(at::kFloat));
+            }
+            std::vector<std::string> keys;
+            for(auto& kv:w)if(kv.first.size()>9&&kv.first.substr(kv.first.size()-9)==".weight_v")keys.push_back(kv.first);
+            for(auto& k:keys){
+             auto base=k.substr(0,k.size()-9);
+             auto v=w.at(k);
+             w.emplace(base+".weight",at::_weight_norm(v,w.at(base+".weight_g"),0));
+            }
+           }
+           at::Tensor conv(const at::Tensor& x,const std::string& k)const{
+            auto a=w.at(k+".weight");int64_t padding=(a.size(2)-1)/2;
+            return at::conv1d(x,a,w.at(k+".bias"),at::IntArrayRef{1},at::IntArrayRef{padding},at::IntArrayRef{1},1);
+           }
+           at::Tensor forward(at::Tensor x,const at::Tensor& mask,int64_t sid)const{
+            auto g=w.at("emb_g.weight").select(0,sid).reshape({1,-1,1});
+            for(int f=6;f>=0;f-=2){
+             x=at::flip(x,{1});
+             auto k="flow.flows."+std::to_string(f);
+             auto x0=x.slice(1,0,inter/2),x1=x.slice(1,inter/2,inter);
+             auto h=conv(x0,k+".pre")*mask;
+             auto cond=conv(g,k+".enc.cond_layer"),out=at::zeros_like(h);
+             for(int i=0;i<3;++i){
+              auto s=std::to_string(i);
+              auto a=conv(h,k+".enc.in_layers."+s)+cond.slice(1,i*2*hidden,(i+1)*2*hidden);
+              auto acts=at::tanh(a.slice(1,0,hidden))*at::sigmoid(a.slice(1,hidden,2*hidden));
+              auto res=conv(acts,k+".enc.res_skip_layers."+s);
+              if(i<2){h=(h+res.slice(1,0,hidden))*mask;out=out+res.slice(1,hidden,2*hidden);}
+              else out=out+res;
+             }
+             auto m=conv(out*mask,k+".post")*mask;
+             x=at::cat({x0,(x1-m)*mask},1);
+            }
+            return x.contiguous();
+           }
+          };
+          void verify_flow(const c10::impl::GenericDict& root,const std::string& name){
+           at::NoGradGuard guard;ReverseFlow flow(root);
+           for(int64_t t:{8,33}){
+            auto z=(at::arange(t*flow.inter,at::TensorOptions().dtype(at::kFloat)).remainder(67)-33).reshape({1,flow.inter,t})/67;
+            auto mask=at::arange(t,at::TensorOptions().dtype(at::kLong)).lt(t-2).reshape({1,1,t}).to(at::kFloat);
+            auto start=Clock::now();auto out=flow.forward(z,mask,0);auto elapsed=ms(start);
+            auto ref=at::empty_like(out);std::ifstream in(name+".flow"+std::to_string(t)+".f32",std::ios::binary);
+            in.read(static_cast<char*>(ref.data_ptr()),ref.nbytes());require(in.gcount()==static_cast<std::streamsize>(ref.nbytes()),"missing flow reference");
+            std::cout<<"REVERSE_FLOW "<<name<<" frames="<<t<<" max_abs_error="<<(out-ref).abs().max().item<float>()<<" cpu_ms="<<elapsed<<std::endl;
+            require(at::allclose(out,ref,1e-4,1e-4),"official reverse flow mismatch");
+           }
+          }
+          // RVC neural source-filter decoder; deterministic injected excitation noise for parity tests.
+          struct Generator {
+           std::unordered_map<std::string,at::Tensor> w;
+           std::vector<int64_t> rates,kernels;
+           std::vector<std::vector<int64_t>> dilations;
+           int64_t sr,upp=1;bool block1;
+           explicit Generator(const c10::impl::GenericDict& root){
+            auto config=root.at(c10::IValue("config"));auto cfg=config.toListRef();
+            block1=cfg[9].toStringRef()=="1";
+            auto ds=cfg[11].toListRef();
+            for(auto& d:ds){std::vector<int64_t> a;for(auto& v:d.toListRef())a.push_back(v.toInt());dilations.push_back(a);}
+            for(auto& v:cfg[12].toListRef()){rates.push_back(v.toInt());upp*=v.toInt();}
+            for(auto& v:cfg[14].toListRef())kernels.push_back(v.toInt());
+            sr=cfg[17].isInt()?cfg[17].toInt():std::stoll(cfg[17].toStringRef())*1000;
+            auto weights=root.at(c10::IValue("weight")).toGenericDict();
+            for(auto& kv:weights){auto k=kv.key().toStringRef();if(k.rfind("dec.",0)==0||k=="emb_g.weight")w.emplace(k,kv.value().toTensor().to(at::kFloat));}
+            std::vector<std::string> keys;
+            for(auto& kv:w)if(kv.first.size()>9&&kv.first.substr(kv.first.size()-9)==".weight_v")keys.push_back(kv.first);
+            for(auto& k:keys){auto base=k.substr(0,k.size()-9);w.emplace(base+".weight",at::_weight_norm(w.at(k),w.at(base+".weight_g"),0));}
+           }
+           at::Tensor conv(const at::Tensor& x,const std::string& k,int64_t stride=1,int64_t pad=-1,int64_t dil=1)const{
+            auto a=w.at(k+".weight");if(pad<0)pad=(a.size(2)-1)*dil/2;
+            std::optional<at::Tensor> bias;if(w.count(k+".bias"))bias=w.at(k+".bias");
+            return at::conv1d(x,a,bias,at::IntArrayRef{stride},at::IntArrayRef{pad},at::IntArrayRef{dil},1);
+           }
+           at::Tensor source(const at::Tensor& f0,const at::Tensor& noise)const{
+            auto f=f0.unsqueeze(-1);
+            auto rad=f/double(sr)*at::arange(1,upp+1,f.options());
+            auto last=at::fmod(rad.slice(-1,upp-1,upp).to(at::kFloat)+0.5,1.0)-0.5;
+            auto acc=at::fmod(last.cumsum(1),1.0).to(f.scalar_type());
+            rad=rad+at::constant_pad_nd(acc,{0,0,1,-1},0);
+            auto sine=at::sin(rad.reshape({f.size(0),-1,1})*(2.0*3.14159265358979323846))*0.1;
+            auto uv=f.gt(0).to(f.scalar_type()).repeat_interleave(upp,1);
+            auto waves=sine*uv+(uv*0.003+(1-uv)*0.1/3.0)*noise;
+            return at::tanh(at::linear(waves,w.at("dec.m_source.l_linear.weight"),w.at("dec.m_source.l_linear.bias"))).transpose(1,2);
+           }
+           at::Tensor residual(at::Tensor x,const std::string& k,const std::vector<int64_t>& ds)const{
+            for(size_t i=0;i<ds.size();++i){auto n=std::to_string(i);
+             auto y=conv(at::leaky_relu(x,0.1),k+(block1?".convs1.":".convs.")+n,1,-1,ds[i]);
+             if(block1)y=conv(at::leaky_relu(y,0.1),k+".convs2."+n);
+             x=x+y;
+            }return x;
+           }
+           at::Tensor forward(at::Tensor x,const at::Tensor& f0,const at::Tensor& noise,int64_t sid)const{
+            auto har=source(f0,noise);auto g=w.at("emb_g.weight").select(0,sid).reshape({1,-1,1});
+            x=conv(x,"dec.conv_pre");if(w.count("dec.cond.weight"))x=x+conv(g,"dec.cond");
+            int64_t rest=upp;
+            for(size_t i=0;i<rates.size();++i){auto k="dec.ups."+std::to_string(i);auto u=rates[i];rest/=u;
+             x=at::conv_transpose1d(at::leaky_relu(x,0.1),w.at(k+".weight"),w.at(k+".bias"),{u},{(kernels[i]-u)/2},{0},1,{1});
+             x=x+conv(har,"dec.noise_convs."+std::to_string(i),rest,rest==1?0:rest/2);
+             at::Tensor sum;
+             for(size_t j=0;j<dilations.size();++j){auto y=residual(x,"dec.resblocks."+std::to_string(i*dilations.size()+j),dilations[j]);sum=sum.defined()?sum+y:y;}
+             x=sum/double(dilations.size());
+            }
+            return at::tanh(conv(at::leaky_relu(x,0.01),"dec.conv_post")).contiguous();
+           }
+          };
+          void verify_generator(const c10::impl::GenericDict& root,const std::string& name){
+           at::NoGradGuard guard;Generator gen(root);ReverseFlow flow(root);
+           for(int64_t t:{8,33}){
+            auto opts=at::TensorOptions().dtype(at::kFloat);
+            auto z=(at::arange(t*flow.inter,opts).remainder(67)-33).reshape({1,flow.inter,t})/67;
+            auto mask=at::arange(t,at::TensorOptions().dtype(at::kLong)).lt(t-2).reshape({1,1,t}).to(at::kFloat);
+            z=flow.forward(z,mask,0)*mask;
+            auto a=at::arange(t,opts);auto f0=at::where(a.remainder(4).eq(0),at::zeros_like(a),110+a*3).reshape({1,t});
+            auto noise=(at::arange(t*gen.upp,opts).remainder(31)-15).reshape({1,t*gen.upp,1})/15;
+            auto start=Clock::now();auto out=gen.forward(z,f0,noise,0);auto elapsed=ms(start);
+            auto ref=at::empty_like(out);std::ifstream in(name+".gen"+std::to_string(t)+".f32",std::ios::binary);
+            in.read(static_cast<char*>(ref.data_ptr()),ref.nbytes());require(in.gcount()==static_cast<std::streamsize>(ref.nbytes()),"missing generator reference");
+            std::cout<<"GENERATOR "<<name<<" frames="<<t<<" max_abs_error="<<(out-ref).abs().max().item<float>()<<" cpu_ms="<<elapsed<<std::endl;
+            require(at::allclose(out,ref,1e-3,1e-3),"official GeneratorNSF mismatch");
+           }
+          }
+          // Native RMVPE: original E2E state_dict, Slaney-normalized HTK mel, U-Net, bidirectional GRU.
+          struct NativeRMVPE {
+           std::unordered_map<std::string,at::Tensor> w;
+           at::Tensor basis,window;
+           explicit NativeRMVPE(const std::string& path){
+            caffe2::serialize::PyTorchStreamReader reader(path);
+            auto root=load_original(reader).toGenericDict();
+            for(auto& kv:root)if(kv.value().isTensor())w.emplace(kv.key().toStringRef(),kv.value().toTensor().to(at::kFloat));
+            require(w.count("fc.0.gru.weight_ih_l0")&&w.count("unet.encoder.bn.weight"),"RMVPE state dictionary");
+            auto opts=at::TensorOptions().dtype(at::kFloat);
+            basis=at::empty({128,513},opts);auto ptr=basis.data_ptr<float>();
+            std::array<double,130> hz{};
+            const double m0=2595*std::log10(1+30.0/700),m1=2595*std::log10(1+8000.0/700);
+            for(int i=0;i<130;++i)hz[i]=700*(std::pow(10,(m0+(m1-m0)*i/129)/2595)-1);
+            for(int i=0;i<128;++i)for(int j=0;j<513;++j){
+             double f=j*16000.0/1024;
+             double lo=(f-hz[i])/(hz[i+1]-hz[i]),hi=(hz[i+2]-f)/(hz[i+2]-hz[i+1]);
+             ptr[i*513+j]=float(std::max(0.0,std::min(lo,hi))*2/(hz[i+2]-hz[i]));
+            }
+            window=at::hann_window(1024,true,opts);
+           }
+           const at::Tensor& W(const std::string& k)const{return w.at(k);}
+           at::Tensor conv(const at::Tensor& x,const std::string& k,int64_t pad=1)const{
+            std::optional<at::Tensor> b;if(w.count(k+".bias"))b=W(k+".bias");
+            return at::conv2d(x,W(k+".weight"),b,at::IntArrayRef{1,1},at::IntArrayRef{pad,pad},at::IntArrayRef{1,1},1);
+           }
+           at::Tensor bn(const at::Tensor& x,const std::string& k)const{
+            return at::batch_norm(x,W(k+".weight"),W(k+".bias"),W(k+".running_mean"),W(k+".running_var"),false,0.01,1e-5,true);
+           }
+           at::Tensor block(const at::Tensor& x,const std::string& k)const{
+            auto h=at::relu(bn(conv(x,k+".conv.0"),k+".conv.1"));
+            h=at::relu(bn(conv(h,k+".conv.3"),k+".conv.4"));
+            return h+(w.count(k+".shortcut.weight")?conv(x,k+".shortcut",0):x);
+           }
+           at::Tensor blocks(at::Tensor x,const std::string& k)const{
+            for(int i=0;i<4;++i)x=block(x,k+"."+std::to_string(i));return x;
+           }
+           at::Tensor mel(const at::Tensor& input)const{
+            auto framed=at::reflection_pad1d(input.unsqueeze(1),{512,512}).squeeze(1).unfold(-1,1024,160)*window;
+            auto fft=at::fft_rfft(framed,1024,-1,std::nullopt);
+            auto mag=at::abs(fft).transpose(1,2);
+            return at::log(at::matmul(basis,mag).clamp_min(1e-5));
+           }
+           at::Tensor hidden(const at::Tensor& m)const{
+            auto t=m.size(2);auto n=(32-t%32)%32;
+            auto x=at::constant_pad_nd(m,{0,n},0).transpose(1,2).unsqueeze(1);
+            x=bn(x,"unet.encoder.bn");std::vector<at::Tensor> skip;
+            for(int i=0;i<5;++i){x=blocks(x,"unet.encoder.layers."+std::to_string(i)+".conv");skip.push_back(x);x=at::avg_pool2d(x,{2,2},{2,2},{0,0},false,true,std::nullopt);}
+            for(int i=0;i<4;++i)x=blocks(x,"unet.intermediate.layers."+std::to_string(i)+".conv");
+            for(int i=0;i<5;++i){
+             auto k="unet.decoder.layers."+std::to_string(i);
+             x=at::conv_transpose2d(x,W(k+".conv1.0.weight"),std::nullopt,{2,2},{1,1},{1,1},1,{1,1});
+             x=at::relu(bn(x,k+".conv1.1"));
+             x=blocks(at::cat({x,skip[4-i]},1),k+".conv2");
+            }
+            x=conv(x,"cnn").transpose(1,2).flatten(2);
+            std::vector<at::Tensor> p;
+            for(auto suffix:{"","_reverse"})for(auto key:{"weight_ih_l0","weight_hh_l0","bias_ih_l0","bias_hh_l0"})p.push_back(W(std::string("fc.0.gru.")+key+suffix));
+            auto hx=at::zeros({2,x.size(0),256},x.options());
+            x=std::get<0>(at::gru(x,hx,p,true,1,0.0,false,true,true));
+            return at::sigmoid(at::linear(x,W("fc.1.weight"),W("fc.1.bias"))).slice(1,0,t).contiguous();
+           }
+           at::Tensor decode(const at::Tensor& h)const{
+            auto sal=h.squeeze(0);auto centers=sal.argmax(1,true);
+            auto offsets=at::arange(9,centers.options()).reshape({1,9});
+            auto ids=centers+offsets;
+            auto probs=at::constant_pad_nd(sal,{4,4},0).gather(1,ids);
+            auto cents=at::constant_pad_nd(at::arange(360,sal.options().dtype(at::kDouble))*20+1997.3794084376191,{4,4},0);
+            auto values=cents.index_select(0,ids.reshape({-1})).reshape(ids.sizes());
+            auto avg=(probs.to(at::kDouble)*values).sum(1)/probs.sum(1).to(at::kDouble);
+            auto f=10*at::pow(2,avg/1200);
+            return at::where(std::get<0>(sal.max(1)).le(0.03),at::zeros_like(f),f).to(at::kFloat);
+           }
+          };
+          at::Tensor fixture(const std::string& path,at::IntArrayRef sizes){
+           auto x=at::empty(sizes,at::TensorOptions().dtype(at::kFloat));
+           std::ifstream in(path,std::ios::binary);in.read(static_cast<char*>(x.data_ptr()),x.nbytes());
+           require(in.gcount()==static_cast<std::streamsize>(x.nbytes()),"missing RMVPE fixture");
+           return x;
+          }
+          void verify_rmvpe(){
+           at::NoGradGuard guard;NativeRMVPE model("rmvpe.pt");
+           auto x=fixture("rmvpe.input.f32",{1,5120});
+           auto t=Clock::now();auto mel=model.mel(x);auto h=model.hidden(mel);auto f0=model.decode(h);auto elapsed=ms(t);
+           auto mref=fixture("rmvpe.mel.f32",mel.sizes()),href=fixture("rmvpe.hidden.f32",h.sizes()),fref=fixture("rmvpe.f0.f32",f0.sizes());
+           std::cout<<"RMVPE mel_max_error="<<(mel-mref).abs().max().item<float>()<<" hidden_max_error="<<(h-href).abs().max().item<float>()<<" f0_max_hz="<<(f0-fref).abs().max().item<float>()<<" cpu_ms="<<elapsed<<std::endl;
+           require(at::allclose(mel,mref,1e-4,1e-4),"mel mismatch");
+           require(at::allclose(h,href,1e-4,1e-4),"RMVPE salience mismatch");
+           require(at::allclose(f0,fref,1e-4,0.05),"RMVPE F0 mismatch");
+          }
+          // The distributed RVC HuBERT config is group-norm CNN, post-norm 12-layer encoder, 768 channels.
+          struct NativeHubert {
+           std::unordered_map<std::string,at::Tensor> w;
+           at::Tensor pos_weight;
+           explicit NativeHubert(const std::string& path){
+            caffe2::serialize::PyTorchStreamReader reader(path);
+            auto root=load_original(reader).toGenericDict();
+            for(auto& kv:root)if(kv.value().isTensor())w.emplace(kv.key().toStringRef(),kv.value().toTensor().to(at::kFloat));
+            const std::string k="encoder.pos_conv_embed.conv";
+            if(w.count(k+".weight"))pos_weight=W(k+".weight");
+            else if(w.count(k+".parametrizations.weight.original0"))pos_weight=at::_weight_norm(W(k+".parametrizations.weight.original1"),W(k+".parametrizations.weight.original0"),2);
+            else pos_weight=at::_weight_norm(W(k+".weight_v"),W(k+".weight_g"),2);
+           }
+           const at::Tensor& W(const std::string& k)const{return w.at(k);}
+           at::Tensor norm(const at::Tensor& x,const std::string& k)const{return at::layer_norm(x,{x.size(-1)},W(k+".weight"),W(k+".bias"),1e-5,true);}
+           at::Tensor linear(const at::Tensor& x,const std::string& k)const{return at::linear(x,W(k+".weight"),W(k+".bias"));}
+           at::Tensor forward(const at::Tensor& input,bool v1=false)const{
+            auto x=input.unsqueeze(1);
+            for(int i=0;i<7;++i){
+             auto k="feature_extractor.conv_layers."+std::to_string(i);
+             x=at::conv1d(x,W(k+".conv.weight"),std::nullopt,at::IntArrayRef{i==0?5:2},at::IntArrayRef{0},at::IntArrayRef{1},1);
+             if(i==0)x=at::group_norm(x,512,W(k+".layer_norm.weight"),W(k+".layer_norm.bias"),1e-5,true);
+             x=at::gelu(x,"none");
+            }
+            x=linear(norm(x.transpose(1,2),"feature_projection.layer_norm"),"feature_projection.projection");
+            auto pos=at::conv1d(x.transpose(1,2),pos_weight,W("encoder.pos_conv_embed.conv.bias"),at::IntArrayRef{1},at::IntArrayRef{64},at::IntArrayRef{1},16).slice(-1,0,x.size(1));
+            x=norm(x+at::gelu(pos,"none").transpose(1,2),"encoder.layer_norm");
+            for(int i=0;i<(v1?9:12);++i){
+             auto k="encoder.layers."+std::to_string(i),a=k+".attention";
+             auto b=x.size(0),t=x.size(1);
+             auto q=linear(x,a+".q_proj").reshape({b,t,12,64}).transpose(1,2)*0.125;
+             auto key=linear(x,a+".k_proj").reshape({b,t,12,64}).transpose(1,2);
+             auto v=linear(x,a+".v_proj").reshape({b,t,12,64}).transpose(1,2);
+             auto att=at::matmul(at::softmax(at::matmul(q,key.transpose(-1,-2)),-1),v).transpose(1,2).contiguous().reshape({b,t,768});
+             x=norm(x+linear(att,a+".out_proj"),k+".layer_norm");
+             auto ff=linear(at::gelu(linear(x,k+".feed_forward.intermediate_dense"),"none"),k+".feed_forward.output_dense");
+             x=norm(x+ff,k+".final_layer_norm");
+            }
+            return (v1?linear(x,"final_proj"):x).contiguous();
+           }
+          };
+          void verify_hubert(){
+           at::NoGradGuard guard;NativeHubert model("hubert.bin");
+           auto x=fixture("rmvpe.input.f32",{1,5120});
+           for(bool v1:{true,false}){
+            auto t=Clock::now();auto y=model.forward(x,v1);auto elapsed=ms(t);
+            auto ref=fixture(v1?"hubert.v1.f32":"hubert.v2.f32",y.sizes());
+            std::cout<<"HUBERT "<<(v1?"v1":"v2")<<" max_abs_error="<<(y-ref).abs().max().item<float>()<<" cpu_ms="<<elapsed<<std::endl;
+            require(at::allclose(y,ref,1e-3,1e-3),"HuBERT mismatch");
+           }
+          }
+          // Shared feature and pitch engines, per-model preloaded synthesizer; no file I/O in forward.
+          struct NeuralPipeline {
+           TextEncoder enc;ReverseFlow flow;Generator gen;
+           const Preset& preset;
+           NeuralPipeline(const c10::impl::GenericDict& root,const Preset& p):enc(root),flow(root),gen(root),preset(p){}
+           static at::Tensor interpolate_f0(const at::Tensor& f){
+            auto idx=at::arange(f.numel(),f.options().dtype(at::kLong));
+            auto voiced=f.gt(0);
+            auto left=std::get<0>(at::cummax(at::where(voiced,idx,at::full_like(idx,-1)),0));
+            auto right=at::flip(std::get<0>(at::cummin(at::flip(at::where(voiced,idx,at::full_like(idx,f.numel())),{0}),0)),{0});
+            auto l=at::where(left.ge(0),left,right).clamp(0,f.numel()-1);
+            auto r=at::where(right.lt(f.numel()),right,left).clamp(0,f.numel()-1);
+            auto frac=(idx-l).to(f.scalar_type())/(r-l).clamp_min(1).to(f.scalar_type());
+            auto interp=f.index_select(0,l)+(f.index_select(0,r)-f.index_select(0,l))*frac;
+            return at::where(voiced,f,interp);
+           }
+           void move_to(const at::Device& dev){for(auto* p:{&enc.w,&flow.w,&gen.w})for(auto& kv:*p)kv.second=kv.second.to(dev);}
+           at::Tensor synthesize(const at::Tensor& features,const at::Tensor& f0,int64_t input_len,bool deterministic,int64_t tail_frames=0,at::Tensor retrieved={})const{
+            require(preset.index==0.f||retrieved.defined(),"nonzero index needs retrieved features");
+            auto base=tail_frames>0?at::cat({features,features.slice(1,features.size(1)-1,features.size(1))},1):features;
+            auto phone=base.repeat_interleave(2,1);
+            auto t=std::min({phone.size(1),f0.numel(),input_len/160});
+            require(t>0,"insufficient frames");
+            phone=phone.slice(1,0,t);
+            auto pf=(std::string(preset.name)=="F6"?f0:interpolate_f0(f0)).slice(0,0,t).reshape({1,t})*std::pow(2.,preset.pitch/12.);
+            if(retrieved.defined()){
+             auto r=tail_frames>0?at::cat({retrieved,retrieved.slice(1,retrieved.size(1)-1,retrieved.size(1))},1):retrieved;
+             r=r.repeat_interleave(2,1).slice(1,0,t);
+             if(preset.protect<0.5f){
+              auto a=at::where(pf.lt(1),at::full_like(pf,preset.protect),at::ones_like(pf)).unsqueeze(-1);
+              phone=r*a+phone*(1-a);
+             }else phone=r;
+            }
+            auto m=1127*at::log1p(pf/700);
+            double lo=1127*std::log(1+50./700),hi=1127*std::log(1+1100./700);
+            auto coarse=at::where(m.gt(0),(m-lo)*254/(hi-lo)+1,m).clamp(1,255).round().to(at::kLong);
+            auto stats=enc.forward(phone,coarse,at::full({1},t,coarse.options()));
+            auto mu=stats.slice(1,0,enc.inter),logs=stats.slice(1,enc.inter,2*enc.inter),mask=stats.slice(1,2*enc.inter,2*enc.inter+1);
+            const auto head=tail_frames>0?std::max<int64_t>(t-tail_frames,0):0;
+            const auto flow_head=std::max<int64_t>(head-24,0);
+            mu=mu.slice(2,flow_head,t);logs=logs.slice(2,flow_head,t);mask=mask.slice(2,flow_head,t);
+            auto latent=deterministic?(at::arange(mu.numel(),mu.options()).remainder(37)-18).reshape(mu.sizes())/18:at::randn_like(mu);
+            auto z=flow.forward((mu+logs.exp()*latent*0.66666)*mask,mask,0)*mask;
+            z=z.slice(2,head-flow_head,t-flow_head);pf=pf.slice(1,head,t);
+            const auto samples=(t-head)*gen.upp;
+            auto noise=deterministic?(at::arange(samples,pf.options()).remainder(31)-15).reshape({1,samples,1})/15:at::randn({1,samples,1},pf.options());
+            return gen.forward(z,pf,noise,0);
+           }
+          };
+          void verify_pipeline(const c10::impl::GenericDict& f8,const c10::impl::GenericDict& f9){
+           at::NoGradGuard guard;NativeHubert hubert("hubert.bin");NativeRMVPE rmvpe("rmvpe.pt");
+           NeuralPipeline a(f8,presets[2]),b(f9,presets[3]);
+           auto x=fixture("rmvpe.input.f32",{1,5120});
+           auto start=Clock::now();auto h=hubert.forward(x);auto hu=ms(start);
+           start=Clock::now();auto f=rmvpe.decode(rmvpe.hidden(rmvpe.mel(x)));auto rm=ms(start);
+           for(auto* p:{&a,&b}){
+            start=Clock::now();auto y=p->synthesize(h,f,x.size(-1),true);auto synth=ms(start);
+            auto ref=fixture(std::string(p->preset.name)+".pipeline.f32",y.sizes());
+            auto err=(y-ref).abs();
+            std::cout<<"PIPELINE "<<p->preset.name<<" samples="<<y.numel()<<" max_abs_error="<<err.max().item<float>()<<" rms_error="<<err.square().mean().sqrt().item<float>()<<" hubert_ms="<<hu<<" rmvpe_ms="<<rm<<" synth_ms="<<synth<<" total_compute_ms="<<hu+rm+synth<<" total_audio_latency=NOT_MEASURED"<<std::endl;
+            require(at::isfinite(y).all().item<bool>() && y.abs().max().item<float>()>1e-5,"invalid pipeline waveform");
+            require(at::allclose(y,ref,2e-3,2e-3),"end-to-end fixture mismatch");
+           }
+          }
+          std::string file_sha256(const std::string& name){
+           std::ifstream in(std::filesystem::u8path(name),std::ios::binary);require(bool(in),"original file missing");
+           std::unique_ptr<EVP_MD_CTX,decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(),EVP_MD_CTX_free);
+           require(bool(ctx)&&EVP_DigestInit_ex(ctx.get(),EVP_sha256(),nullptr)==1,"SHA-256 init");
+           std::array<char,65536> buffer{};
+           while(in){in.read(buffer.data(),buffer.size());auto n=in.gcount();if(n>0)require(EVP_DigestUpdate(ctx.get(),buffer.data(),size_t(n))==1,"SHA-256 update");}
+           require(in.eof(),"file read error");
+           unsigned char digest[EVP_MAX_MD_SIZE];unsigned n=0;
+           require(EVP_DigestFinal_ex(ctx.get(),digest,&n)==1&&n==32,"SHA-256 finish");
+           std::ostringstream out;for(unsigned i=0;i<n;++i)out<<std::hex<<std::setw(2)<<std::setfill('0')<<int(digest[i]);return out.str();
+          }
+          std::string checked_asset(const std::filesystem::path& root,const std::string& name,const char* expected){
+           auto p=(root/name).u8string();require(file_sha256(p)==expected,"original SHA-256 mismatch");return p;
+          }
+          struct Model {
+           c10::IValue checkpoint;
+           std::unique_ptr<faiss::Index> index;
+           const Preset* preset;
+           std::vector<float> index_vectors;
+           Model(const Preset& p,const std::filesystem::path& dir=".",bool verify_reference=true):preset(&p){
+            auto start=Clock::now();
+            auto pth=checked_asset(dir,std::string(p.name)+".pth",p.pth_sha);
+            auto idx=checked_asset(dir,std::string(p.name)+".index",p.index_sha);
+            caffe2::serialize::PyTorchStreamReader reader(pth);
+            checkpoint=load_original(reader);
+            auto root=checkpoint.toGenericDict();
+            auto weights=root.at(c10::IValue("weight")).toGenericDict();
+            std::ifstream golden;
+            if(verify_reference){golden.open(dir/(std::string(p.name)+".golden.tsv"));require(bool(golden),"missing golden manifest");}
+            struct TensorMeta{long long n,b;std::string dtype,shape,hash;};
+            std::unordered_map<std::string,TensorMeta> hashes;
+            std::string key;TensorMeta meta;
+            while(verify_reference && golden>>key>>meta.n>>meta.b>>meta.dtype>>meta.shape>>meta.hash) require(hashes.emplace(key,meta).second,"duplicate tensor");
+            const auto expected_count=hashes.size();
+            long count=0; long long elements=0;
+            for(auto& kv:weights){
+             auto t=kv.value().toTensor();
+             require(t.device().is_cpu(),"device mapping");
+             require(at::isfinite(t).all().item<bool>(),"nonfinite");
+             auto key=kv.key().toStringRef();
+             if(verify_reference){
+             const auto& m=hashes.at(key);
+             std::ostringstream shape;
+             for(int64_t i=0;i<t.dim();++i){if(i)shape<<",";shape<<t.size(i);}
+             auto dtype=t.scalar_type()==at::kHalf?"float16":t.scalar_type()==at::kFloat?"float32":t.scalar_type()==at::kLong?"int64":t.scalar_type()==at::kDouble?"float64":t.scalar_type()==at::kInt?"int32":"unsupported";
+             require(m.n==t.numel() && m.b==t.element_size() && m.dtype==dtype && m.shape==(t.dim()?shape.str():"-") && m.hash==digest_tensor(t),"tensor metadata or bytes mismatch");
+             hashes.erase(key);
+             }
+             ++count;elements+=t.numel();
+            }
+            require(count>0&&(!verify_reference||(size_t(count)==expected_count&&hashes.empty())),"unexpected tensor count");
+            index.reset(faiss::read_index(idx.c_str()));
+            require(index && index->d==768 && index->ntotal>=8,"invalid original index");
+            if(p.index!=0.f){
+             index_vectors.resize(size_t(index->ntotal)*index->d);
+             index->reconstruct_n(0,index->ntotal,index_vectors.data());
+            }
+            std::cout<<"MODEL "<<p.name<<" exact_tensor_hashes="<<(verify_reference?count:0)<<" tensors="<<count<<" elements="<<elements<<" index_count="<<index->ntotal<<" preload_ms="<<ms(start)<<std::endl;
+           }
+           // Caller supplies preallocated output. Retrieval at 50 Hz, then Protect at 100 Hz.
+           void mix(const float* x,float* out,float rate)const{
+            if(rate==0.f){std::copy_n(x,768,out);return;}
+            require(!index_vectors.empty(),"index vectors not preloaded");
+            std::array<float,8> d{};std::array<faiss::idx_t,8> ids{};
+            index->search(1,x,8,d.data(),ids.data());
+            int zeros=0;
+            for(int i=0;i<8;++i){require(ids[i]>=0 && ids[i]<index->ntotal && std::isfinite(d[i]) && d[i]>=0,"invalid index distance");if(d[i]==0)++zeros;}
+            double total=0;std::array<double,8> w{};
+            for(int i=0;i<8;++i){w[i]=zeros?(d[i]==0?1.0:0.0):1.0/(double(d[i])*d[i]);total+=w[i];}
+            for(int j=0;j<768;++j){
+             double sum=0;for(int i=0;i<8;++i)sum+=(w[i]/total)*index_vectors[size_t(ids[i])*768+j];
+             out[j]=float(sum)*rate+x[j]*(1-rate);
+            }
+           }
+           void protect_upsampled(const float* original,const float* retrieved,const float* pitchf,size_t frames,float* out)const{
+            for(size_t t=0;t<frames;++t){
+             const float a=preset->protect<0.5f && pitchf[t]<1.f?preset->protect:1.f;
+             for(int j=0;j<768;++j){size_t k=(t/2)*768+j;out[t*768+j]=retrieved[k]*a+original[k]*(1-a);}
+            }
+           }
+          };
+          // Batch retrieval scratch is allocated at initialization. CPU search is outside CUDA Graph.
+          struct RetrievalScratch {
+           std::vector<float> distances;
+           std::vector<faiss::idx_t> ids;
+           explicit RetrievalScratch(int64_t frames):distances(frames*8),ids(frames*8){}
+           void run(const Model& m,const at::Tensor& h,at::Tensor& result){
+            require(h.device().is_cpu()&&result.device().is_cpu()&&h.is_contiguous()&&result.is_contiguous(),"retrieval needs contiguous CPU tensors");
+            require(h.sizes()==result.sizes()&&h.size(0)==1&&h.size(2)==768,"retrieval shape");
+            if(m.preset->index==0.f){result.copy_(h);return;}
+            int64_t n=h.size(1);
+            require(size_t(n*8)<=distances.size(),"retrieval scratch too small");
+            const float* x=h.data_ptr<float>();float* out=result.data_ptr<float>();
+            m.index->search(n,x,8,distances.data(),ids.data());
+            for(int64_t t=0;t<n;++t){
+             auto d=distances.data()+t*8;auto ix=ids.data()+t*8;
+             std::array<double,8> w{};int zeros=0;double total=0;
+             for(int k=0;k<8;++k){require(ix[k]>=0&&ix[k]<m.index->ntotal&&std::isfinite(d[k])&&d[k]>=0,"invalid retrieval neighbor");zeros+=(d[k]==0);}
+             for(int k=0;k<8;++k){w[k]=zeros?(d[k]==0?1.:0.):1./(double(d[k])*d[k]);total+=w[k];}
+             for(int j=0;j<768;++j){
+              double sum=0;for(int k=0;k<8;++k)sum+=w[k]/total*m.index_vectors[size_t(ix[k])*768+j];
+              out[t*768+j]=float(sum)*m.preset->index+x[t*768+j]*(1-m.preset->index);
+             }
+            }
+           }
+          };
+          at::Tensor retrieve_features(const Model& m,const at::Tensor& h){
+           if(m.preset->index==0.f)return h;
+           auto cpu=h.to(at::kCPU).contiguous();auto result=at::empty_like(cpu);
+           RetrievalScratch scratch(cpu.size(1));scratch.run(m,cpu,result);
+           return result.to(h.device());
+          }
+          at::Tensor rms_adjust(const at::Tensor& x,const at::Tensor& y,int64_t sr,float rate){
+           if(rate==1.f)return y;
+           auto rms=[](const at::Tensor& x,int64_t sr){
+            return at::constant_pad_nd(x.reshape({1,1,-1}),{sr/2,sr/2},0).unfold(-1,sr,sr/2).square().mean(-1).sqrt();
+           };
+           auto a=at::upsample_linear1d(rms(x,16000),at::IntArrayRef{y.numel()},false,std::optional<double>{});
+           auto b=at::upsample_linear1d(rms(y,sr),at::IntArrayRef{y.numel()},false,std::optional<double>{}).clamp_min(1e-6);
+           return y*a.pow(1-rate)*b.pow(rate-1);
+          }
+          void verify_indexed_pipeline(const Model& f6,const Model& f7){
+           at::NoGradGuard guard;NativeHubert hubert("hubert.bin"),applio("applio_contentvec.bin");NativeRMVPE rmvpe("rmvpe.pt");
+           auto x=fixture("rmvpe.input.f32",{1,5120});
+           for(auto* m:{&f6,&f7}){
+            auto h=std::string(m->preset->name)=="F6"?applio.forward(x):hubert.forward(x);
+            auto a=x.abs().flatten().sort();auto sorted=std::get<0>(a);double qpos=(sorted.numel()-1)*0.999;auto lo=int64_t(std::floor(qpos));auto frac=qpos-lo;
+            auto q=sorted[lo]*(1-frac)+sorted[std::min(lo+1,sorted.numel()-1)]*frac;
+            auto px=std::string(m->preset->name)=="F6"?x/q.clamp_min(1e-12):x;
+            auto f=rmvpe.decode(rmvpe.hidden(rmvpe.mel(px)));
+            auto retrieved=retrieve_features(*m,h);
+            auto name=std::string(m->preset->name);
+            auto ref=fixture(name+".retrieved.f32",retrieved.sizes());
+            auto err=(retrieved-ref).abs().max().item<float>();
+            require(at::allclose(retrieved,ref,2e-3,2e-3),"original INDEX output mismatch");
+            std::cout<<"INDEX_PARITY "<<name<<" max_abs_error="<<err<<std::endl;
+            NeuralPipeline p(m->checkpoint.toGenericDict(),*m->preset);
+            auto start=Clock::now();auto y=p.synthesize(h,f,x.size(-1),true,0,retrieved);auto elapsed=ms(start);
+            auto expected=fixture(name+".pipeline.f32",y.sizes());
+            auto e=(y-expected).abs().max().item<float>();
+            std::cout<<"INDEXED_PIPELINE "<<name<<" sr="<<p.gen.sr<<" max_abs_error="<<e<<" cpu_synth_ms="<<elapsed<<std::endl;
+            require(at::allclose(y,expected,2e-3,2e-3),"indexed neural fixture mismatch");
+            if(m->preset->rms!=1.f){
+             auto out=rms_adjust(x,y,p.gen.sr,m->preset->rms);
+             auto expected_rms=fixture(name+".rms.f32",out.sizes());
+             std::cout<<"RMS_PARITY "<<name<<" max_abs_error="<<(out-expected_rms).abs().max().item<float>()<<std::endl;
+             require(at::allclose(out,expected_rms,2e-3,2e-3),"RMS reference mismatch");
+            }
+           }
+          }
+          #ifdef VOICEBANK_CUDA
+          // Actual four-model GPU compute harness, not a host/audio end-to-end latency test.
+          struct GpuVoice {
+           const Model& model;
+           NeuralPipeline neural;
+           NativeHubert& hubert;
+           NativeRMVPE& rmvpe;
+           c10::cuda::CUDAStream stream;
+           at::Tensor history_host,input,features,f0,retrieved,features_host,retrieved_host,output,output_host;
+           std::unique_ptr<RetrievalScratch> scratch;
+           std::unique_ptr<at::cuda::CUDAGraph> front,back,combined;
+           bool indexed;
+           static constexpr int64_t window=5120,hop=160,tail=3;
+           GpuVoice(const Model& m,NativeHubert& h,NativeRMVPE& r,const at::Device& dev,c10::cuda::CUDAStream s):model(m),neural(m.checkpoint.toGenericDict(),*m.preset),hubert(h),rmvpe(r),stream(s),indexed(m.preset->index!=0.f){
+            c10::cuda::CUDAStreamGuard sg(stream);
+            neural.move_to(dev);
+            history_host=at::zeros({1,window},at::TensorOptions().dtype(at::kFloat).pinned_memory(true));
+            input=history_host.to(dev);
+            auto make_front=[&](){
+             auto pitch_input=input;
+             if(std::string(model.preset->name)=="F6"){
+              auto values=std::get<0>(input.abs().flatten().sort());
+              double pos=(window-1)*0.999;auto lo=int64_t(pos);
+              auto q=values[lo]*(1-(pos-lo))+values[lo+1]*(pos-lo);
+              pitch_input=input/q.clamp_min(1e-12);
+             }
+             features=hubert.forward(input);
+             f0=rmvpe.decode(rmvpe.hidden(rmvpe.mel(pitch_input)));
+            };
+            auto phase=at::arange(window,at::TensorOptions().dtype(at::kFloat))/16000.;
+            auto fixture_input=(at::sin(phase*772.8318)*0.2+at::sin(phase*1545.6636)*0.06).reshape({1,window});
+            history_host.copy_(fixture_input);input.copy_(history_host,true);stream.synchronize();
+            make_front();stream.synchronize();
+            if(indexed){
+             features_host=at::empty(features.sizes(),at::TensorOptions().dtype(at::kFloat).pinned_memory(true));
+             retrieved_host=at::empty(features.sizes(),at::TensorOptions().dtype(at::kFloat).pinned_memory(true));
+             scratch=std::make_unique<RetrievalScratch>(features.size(1));
+             retrieved=at::empty_like(features);
+             features_host.copy_(features,true);stream.synchronize();
+             scratch->run(model,features_host,retrieved_host);retrieved.copy_(retrieved_host,true);
+            }
+            auto synth=[&](){output=neural.synthesize(features,f0,window,false,tail,indexed?retrieved:at::Tensor{});};
+            for(int i=0;i<4;++i){make_front();synth();stream.synchronize();}
+            if(indexed){
+             front=std::make_unique<at::cuda::CUDAGraph>();
+             front->capture_begin();make_front();front->capture_end();stream.synchronize();
+             back=std::make_unique<at::cuda::CUDAGraph>();
+             back->capture_begin();synth();back->capture_end();stream.synchronize();
+            }else{
+             combined=std::make_unique<at::cuda::CUDAGraph>();
+             combined->capture_begin();make_front();synth();combined->capture_end();stream.synchronize();
+            }
+            output_host=at::empty(output.sizes(),at::TensorOptions().dtype(at::kFloat).pinned_memory(true));
+            history_host.zero_();
+           }
+           const at::Tensor& run_window(const float* shared){
+            c10::cuda::CUDAStreamGuard sg(stream);
+            auto ptr=history_host.data_ptr<float>();
+            std::memcpy(ptr,shared,window*sizeof(float));
+            input.copy_(history_host,true);
+            if(indexed){
+             front->replay();features_host.copy_(features,true);stream.synchronize();
+             scratch->run(model,features_host,retrieved_host);
+             retrieved.copy_(retrieved_host,true);back->replay();
+            }else combined->replay();
+            output_host.copy_(output,true);stream.synchronize();return output_host;
+           }
+          };
+          void benchmark_gpu(const std::array<const Model*,4>& bank){
+           at::NoGradGuard guard;at::Device dev(at::kCUDA,0);c10::cuda::CUDAGuard dg(dev);
+           NativeHubert hubert("hubert.bin"),applio("applio_contentvec.bin");NativeRMVPE rmvpe("rmvpe.pt");
+           for(auto* w:{&hubert.w,&applio.w,&rmvpe.w})for(auto& kv:*w)kv.second=kv.second.to(dev);
+           hubert.pos_weight=hubert.pos_weight.to(dev);applio.pos_weight=applio.pos_weight.to(dev);rmvpe.basis=rmvpe.basis.to(dev);rmvpe.window=rmvpe.window.to(dev);
+           require(cudaDeviceSynchronize()==cudaSuccess,"GPU preload");
+           auto stream=c10::cuda::getStreamFromPool(false,0);
+           std::array<std::unique_ptr<GpuVoice>,4> voices;
+           for(size_t i=0;i<4;++i)voices[i]=std::make_unique<GpuVoice>(*bank[i],i==0?applio:hubert,rmvpe,dev,stream);
+           auto source=fixture("rmvpe.input.f32",{1,5120});auto src=source.data_ptr<float>();
+           std::array<float,5120> shared{};
+           auto append=[&](const float* next){std::move(shared.begin()+160,shared.end(),shared.begin());std::copy_n(next,160,shared.end()-160);};
+           std::array<std::vector<double>,4> times;for(auto& v:times)v.reserve(300);
+           std::array<int,4> misses{};
+           // Cycle all voices through the same input. No model load or graph capture in loop.
+           for(int n=0;n<1200;++n){
+            int i=(n/300)%4;
+            append(src+(n%32)*160);auto t=Clock::now();auto& out=voices[i]->run_window(shared.data());double d=ms(t);
+            times[i].push_back(d);misses[i]+=(d>10.);
+            require(at::isfinite(out).all().item<bool>(),"GPU waveform nonfinite");
+           }
+           for(int i=0;i<4;++i){
+            auto& ts=times[i];std::sort(ts.begin(),ts.end());
+            std::cout<<"CUDA_FIXED_WINDOW "<<bank[i]->preset->name<<" hop_ms=10 p50_ms="<<ts[149]<<" p99_ms="<<ts[296]<<" max_ms="<<ts.back()<<" deadline_misses="<<misses[i]<<" total_audio_latency=NOT_MEASURED"<<std::endl;
+           }
+           // Random access switches over preloaded models and a shared input history.
+           // Treat this as switch compute time, not audio continuity or device latency.
+           for(int i=0;i<32;++i){append(src+(i%32)*160);auto t=Clock::now();auto& out=voices[i%4]->run_window(shared.data());require(at::isfinite(out).all().item<bool>(),"switch waveform");std::cout<<"CUDA_SWITCH "<<bank[i%4]->preset->name<<" compute_ms="<<ms(t)<<std::endl;}
+          }
+          // Integration point for the host's worker thread. The callback uses only
+          // AudioBridge; this method must never run on the audio thread.
+          struct NativeAudioWorker {
+           voicebank::AudioBridge& bridge;
+           std::array<std::unique_ptr<GpuVoice>,4>& voices;
+           voicebank::SharedHistory history;
+           voicebank::TailResampler resampler;
+           voicebank::CausalEnvelope envelope;
+           voicebank::SwitchJoin join;
+           uint64_t next=0;bool started=false;unsigned previous=4;
+           NativeAudioWorker(voicebank::AudioBridge& b,std::array<std::unique_ptr<GpuVoice>,4>& v):bridge(b),voices(v){}
+           bool step(){
+            voicebank::InputFrame input;
+            if(!bridge.take(input))return false;
+            if(started&&input.first!=next){history.reset();envelope.reset();join.reset();bridge.counts.discontinuities.fetch_add(1,std::memory_order_relaxed);}
+            started=true;next=input.first+voicebank::host_hop;
+            auto& window=history.append(input);
+            if(bridge.published_cursor.load(std::memory_order_acquire)>input.first+voicebank::internal_delay){bridge.counts.worker_failures.fetch_add(1,std::memory_order_relaxed);return true;}
+            unsigned id=bridge.selected.load(std::memory_order_acquire);
+            if(id>=voices.size()){bridge.counts.worker_failures.fetch_add(1,std::memory_order_relaxed);return true;}
+            try{
+             at::NoGradGuard guard;
+             auto& audio=voices[id]->run_window(window.data());
+             voicebank::OutputFrame out{};out.first=input.first;
+             require(resampler.run(audio.data_ptr<float>(),audio.numel(),voices[id]->neural.gen.sr,out.samples),"tail resample");
+             if(previous!=id)envelope.reset();
+             envelope.run(input,out,voices[id]->model.preset->rms);
+             join.run(id,out.samples);previous=id;
+             for(float v:out.samples)require(std::isfinite(v),"invalid output");
+             if(bridge.published_cursor.load(std::memory_order_acquire)>out.first+voicebank::internal_delay)bridge.counts.worker_failures.fetch_add(1,std::memory_order_relaxed);
+             else bridge.submit(out);
+            }catch(const std::exception& e){
+             bridge.counts.worker_failures.fetch_add(1,std::memory_order_relaxed);
+             std::cerr<<"AUDIO_WORKER_FAIL "<<e.what()<<std::endl;
+            }
+            return true;
+           }
+          };
+          #ifdef VOICEBANK_RUNTIME
+          // Shared library entry points for the existing VST3 host.
+          // Init/destroy must execute outside the realtime callback.
+          struct VoicebankEngine {
+           at::Device dev{at::kCUDA,0};
+           std::array<std::unique_ptr<Model>,4> models;
+           std::unique_ptr<NativeHubert> hubert,applio;
+           std::unique_ptr<NativeRMVPE> rmvpe;
+           std::array<std::unique_ptr<GpuVoice>,4> voices;
+           voicebank::AudioBridge bridge;
+           std::unique_ptr<NativeAudioWorker> worker;
+           std::atomic<bool> running{false};
+           std::thread thread;
+           explicit VoicebankEngine(const std::filesystem::path& root){
+            at::NoGradGuard guard;c10::cuda::CUDAGuard dg(dev);
+            for(size_t i=0;i<4;++i)models[i]=std::make_unique<Model>(presets[i],root,false);
+            hubert=std::make_unique<NativeHubert>(checked_asset(root,"hubert.bin","cc8c20f4b90a520757260197a3ff2505705a7adbd20ad9eeaa4e1a9b38442ef5"));
+            applio=std::make_unique<NativeHubert>(checked_asset(root,"applio_contentvec.bin","d8dd400e054ddf4e6be75dab5a2549db748cc99e756a097c496c099f65a4854e"));
+            rmvpe=std::make_unique<NativeRMVPE>(checked_asset(root,"rmvpe.pt","6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193"));
+            for(auto* w:{&hubert->w,&applio->w,&rmvpe->w})for(auto& kv:*w)kv.second=kv.second.to(dev);
+            hubert->pos_weight=hubert->pos_weight.to(dev);applio->pos_weight=applio->pos_weight.to(dev);rmvpe->basis=rmvpe->basis.to(dev);rmvpe->window=rmvpe->window.to(dev);
+            require(cudaDeviceSynchronize()==cudaSuccess,"CUDA preload");
+            auto stream=c10::cuda::getStreamFromPool(false,0);
+            for(size_t i=0;i<4;++i){
+             voices[i]=std::make_unique<GpuVoice>(*models[i],i==0?*applio:*hubert,*rmvpe,dev,stream);
+             require(voices[i]->neural.gen.sr==presets[i].sr,"model sample rate mismatch");
+            }
+            worker=std::make_unique<NativeAudioWorker>(bridge,voices);
+            running.store(true,std::memory_order_release);
+            thread=std::thread([this]{
+             c10::cuda::CUDAGuard dg(dev);at::NoGradGuard guard;
+             while(running.load(std::memory_order_acquire)){
+              if(!worker->step())std::this_thread::sleep_for(std::chrono::microseconds(100));
+             }
+            });
+           }
+           ~VoicebankEngine(){running.store(false,std::memory_order_release);if(thread.joinable())thread.join();}
+          };
+          #ifdef _WIN32
+          #define VB_EXPORT extern "C" __declspec(dllexport)
+          #else
+          #define VB_EXPORT extern "C" __attribute__((visibility("default")))
+          #endif
+          VB_EXPORT void* voicebank_create(const char* path,char* err,size_t cap) noexcept {
+           try{return path?new VoicebankEngine(std::filesystem::u8path(path)):nullptr;}
+           catch(const std::exception& e){if(err&&cap){std::strncpy(err,e.what(),cap-1);err[cap-1]=0;}return nullptr;}
+          }
+          VB_EXPORT void voicebank_destroy(void* p) noexcept{delete static_cast<VoicebankEngine*>(p);}
+          VB_EXPORT bool voicebank_select(void* p,unsigned slot) noexcept{
+           if(!p||slot>=4)return false;static_cast<VoicebankEngine*>(p)->bridge.selected.store(slot,std::memory_order_release);return true;
+          }
+          VB_EXPORT void voicebank_process(void* p,const float* in,float* out,size_t n) noexcept {
+           if(!out)return;
+           if(!p||!in){std::fill_n(out,n,0.f);return;}
+           static_cast<VoicebankEngine*>(p)->bridge.callback(in,out,n);
+          }
+          // counters: input overrun, output overrun, underrun samples, late samples, worker failures, discontinuities
+          VB_EXPORT bool voicebank_get_counters(void* p,uint64_t* out,size_t n) noexcept {
+           if(!p||!out||n<6)return false;auto& c=static_cast<VoicebankEngine*>(p)->bridge.counts;
+           out[0]=c.input_overrun;out[1]=c.output_overrun;out[2]=c.underrun_samples;out[3]=c.late_samples;out[4]=c.worker_failures;out[5]=c.discontinuities;return true;
+          }
+          VB_EXPORT unsigned voicebank_scheduled_delay_samples() noexcept{return voicebank::internal_delay;}
+          #endif
+          #endif
+          #ifndef VOICEBANK_RUNTIME
+          int main(int argc,char** argv){
+           try{
+            // Load both public original checkpoints once; no reloading on selection.
+            Model f6(presets[0]),f7(presets[1]),f8(presets[2]),f9(presets[3]);
+            verify_encoder(f6.checkpoint.toGenericDict(),"F6");verify_encoder(f7.checkpoint.toGenericDict(),"F7");
+            verify_flow(f6.checkpoint.toGenericDict(),"F6");verify_flow(f7.checkpoint.toGenericDict(),"F7");
+            verify_generator(f6.checkpoint.toGenericDict(),"F6");verify_generator(f7.checkpoint.toGenericDict(),"F7");
+            verify_encoder(f8.checkpoint.toGenericDict(),"F8");
+            verify_encoder(f9.checkpoint.toGenericDict(),"F9");
+            verify_flow(f8.checkpoint.toGenericDict(),"F8");
+            verify_flow(f9.checkpoint.toGenericDict(),"F9");
+            verify_generator(f8.checkpoint.toGenericDict(),"F8");
+            verify_generator(f9.checkpoint.toGenericDict(),"F9");
+            verify_rmvpe();
+            verify_hubert();
+            verify_pipeline(f8.checkpoint.toGenericDict(),f9.checkpoint.toGenericDict());
+            verify_indexed_pipeline(f6,f7);
+            std::array<const Model*,4> bank{&f6,&f7,&f8,&f9};
+            if(argc>1 && std::string(argv[1])=="--gpu-test"){
+          #ifdef VOICEBANK_CUDA
+             benchmark_gpu(bank);
+          #else
+             throw std::runtime_error("CUDA build required");
+          #endif
+            }
+            std::atomic<const Model*> selected{&f6};
+            require(selected.is_lock_free(),"pointer atomics not lock free");
+            double worst=0;
+            for(int i=0;i<10000;++i){auto t=Clock::now();selected.store(bank[i%4],std::memory_order_release);auto p=selected.load(std::memory_order_acquire);require(p!=nullptr,"selection");worst=std::max(worst,ms(t));}
+            std::cout<<"SELECTION_ONLY max_ms="<<worst<<" not_audio_latency=1"<<std::endl;
+            for(auto* m:{&f8,&f9}){
+             std::vector<float> q(768,0.013f);
+             std::vector<float> out(768);
+             m->mix(q.data(),out.data(),0);
+             require(out==q,"index bypass failed");
+             // Nonzero-index algorithm is NOT adopted for F8/F9. Actual F6/F7 indexes not available to this public runner.
+             std::cout<<"INDEX_BYPASS "<<m->preset->name<<" pass"<<std::endl;
+            }
+            std::cout<<"NATIVE_CORE_PASS preload_selection_text_encoder_reverse_flow_generator_rmvpe_hubert; fixed_input_pipeline_test; realtime_pipeline=not_implemented; audio_latency=not_measured"<<std::endl;
+            return 0;
+           }catch(const std::exception& e){std::cerr<<"NATIVE_CORE_FAIL "<<e.what()<<std::endl;return 1;}
+          }
+          #endif
+          EOF
+          cp CMakeLists.txt core.cpp unpickler.cpp presets.inc rt_audio.hpp test_rt.cpp stage04-native/
+          cmake -S . -B build -DCMAKE_PREFIX_PATH="$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target voicebank_native -j2
+      - name: Run native code with no Python interpreter
+        run: |
+          set -o pipefail
+          env -u PYTHONPATH ./build/voicebank_native | tee stage04-native/native.log
+          ldd build/voicebank_native > stage04-native/dependencies.txt
+          if grep -q libpython stage04-native/dependencies.txt; then exit 1; fi
+      - name: Establish strict 20ms acceptance gate
+        if: always()
+        run: |
+          mkdir -p stage04-native
+          cat > stage04-native/acceptance.json <<'EOF'
+          {
+            "total_latency_limit_ms":20,
+            "measurement_scope":"microphone input to audible output including host, queue, GPU and device buffering",
+            "sample_rate_hz":48000,
+            "max_total_latency_samples_at_48k":960,
+            "processing_hop_candidates_ms":[5,10],
+            "note":"Official RVC feature/pitch geometry must be preserved or independently validated; 5ms is host callback candidate, not proven neural hop.",
+            "original_files_only":true,
+            "model_conversion":false,
+            "python_resident":false,
+            "acceptance":{"all_four_presets":true,"no_underruns":true,"no_dropped_blocks":true,"max_measured_total_latency_ms":20,"audio_quality_reference_check":true},
+            "native_scope":"Four originals, indexed F6/F7 fixed-input parity, F8/F9 fixed-input neural parity; F6 Applio source waveform parity separate; GPU benchmark plus experimental worker and tested host transport; physical audio latency not measured",
+            "gpu_measured":false,
+            "audio_latency_measured":false,
+            "overall":"NOT_PASSED"
+          }
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: VoiceBank-Stage04-Native-Core-20ms
+          path: stage04-native/
+          retention-days: 30
