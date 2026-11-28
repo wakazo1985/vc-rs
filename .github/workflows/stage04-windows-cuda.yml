@@ -68,7 +68,19 @@ jobs:
           cm=p/"CMakeLists.txt"
           s=cm.read_text().replace("find_package(Torch REQUIRED)",'add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)\nfind_package(Torch REQUIRED)')
           s=s.replace('set(FAISS_ENABLE_GPU OFF CACHE BOOL "" FORCE)','set(FAISS_ENABLE_MKL OFF CACHE BOOL "" FORCE)\nset(FAISS_ENABLE_GPU OFF CACHE BOOL "" FORCE)')
+          s=s.replace("find_package(OpenMP REQUIRED)","find_package(OpenMP REQUIRED COMPONENTS CXX)")
           cm.write_text(s)
+          # LibTorch enables CUDA in CMake even though FAISS is CPU-only. Restrict
+          # every FAISS OpenMP discovery to CXX rather than asking MSVC for OpenMP_CUDA.
+          patched=0
+          for cm in (p/"faiss-src").rglob("CMakeLists.txt"):
+              s=cm.read_text(encoding="utf-8")
+              out=s.replace("find_package(OpenMP REQUIRED)","find_package(OpenMP REQUIRED COMPONENTS CXX)")
+              if out!=s:
+                  cm.write_text(out,encoding="utf-8")
+                  patched+=1
+          assert patched>0
+          print("FAISS_OPENMP_CXX_PATCHED",patched)
           '@ | Set-Content -Encoding utf8 prepare_windows.py
           python prepare_windows.py
           if ($LASTEXITCODE) { throw "Windows compatibility patch failed" }
@@ -79,7 +91,7 @@ jobs:
           $env:TORCH_CUDA_ARCH_LIST = '12.0'
           $prefix = (Resolve-Path libtorch).Path
           $vcpkg = "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-          cmake -S native -B build -G "Visual Studio 17 2022" -A x64 "-DCMAKE_TOOLCHAIN_FILE=$vcpkg" "-DCMAKE_PREFIX_PATH=$prefix" -DVCPKG_TARGET_TRIPLET=x64-windows -DBLA_VENDOR=OpenBLAS -DVOICEBANK_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120
+          cmake -S native -B build -G "Visual Studio 17 2022" -A x64 "-DCMAKE_TOOLCHAIN_FILE=$vcpkg" "-DCMAKE_PREFIX_PATH=$prefix" -DVCPKG_TARGET_TRIPLET=x64-windows -DBLA_VENDOR=OpenBLAS -DVOICEBANK_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DTORCH_CUDA_ARCH_LIST=12.0
           if ($LASTEXITCODE) { throw "CMake configure failed" }
           cmake --build build --config Release --target voicebank_core voicebank_native --parallel 2
           if ($LASTEXITCODE) { throw "Windows CUDA build failed" }
