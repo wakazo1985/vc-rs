@@ -1,0 +1,100 @@
+name: VoiceBank Stage01 public model verification
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    if: github.head_ref == 'voicebank-stage01-verification' || github.ref_name == 'voicebank-stage01-verification'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [russell, joyca]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install CPU validation dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install faiss-cpu numpy requests
+      - name: Verify public archive and original model
+        env:
+          MODEL: ${{ matrix.model }}
+        run: |
+          python - <<'PY'
+          import os, hashlib, json, zipfile, tempfile, pathlib, requests, torch, numpy as np, faiss, traceback
+          model = os.environ['MODEL']
+          sources = {
+            'russell': ('https://huggingface.co/datasets/Rokkonrol/RVC_models/resolve/main/Russell%20Archey%20%5BExplore%20With%20Us%20%28EWU%29%5D.zip', None),
+            'joyca': ('https://huggingface.co/rayzox57/Joyca_High_RVC/resolve/main/Joyca_High_Voice_v2_600e.zip', '4924376afcc16f3a8c109822239fdc5ce73c0e2459bb9fc71e55564aae0e0c99')
+          }
+          url, expected = sources[model]
+          report = {'model':model, 'source':url, 'scope':'public distribution only; not uploaded user files', 'inference':'not tested'}
+          os.makedirs('report', exist_ok=True)
+          try:
+              with tempfile.TemporaryDirectory() as td:
+                  archive = pathlib.Path(td)/'model.zip'
+                  h = hashlib.sha256()
+                  with requests.get(url, stream=True, timeout=(20,120)) as r:
+                      r.raise_for_status()
+                      with archive.open('wb') as out:
+                          for chunk in r.iter_content(1024*1024):
+                              h.update(chunk)
+                              out.write(chunk)
+                  report['archive_sha256'] = h.hexdigest()
+                  report['archive_bytes'] = archive.stat().st_size
+                  report['expected_sha256'] = expected
+                  report['public_hash_matches'] = (expected == h.hexdigest()) if expected else None
+                  if expected and expected != h.hexdigest():
+                      raise ValueError('Published hash mismatch')
+                  with zipfile.ZipFile(archive) as z:
+                      assert z.testzip() is None, 'ZIP CRC failure'
+                      report['zip_crc'] = 'pass'
+                      report['files'] = []
+                      for info in z.infolist():
+                          suffix = pathlib.PurePosixPath(info.filename).suffix.lower()
+                          if suffix not in ('.pth','.index'): continue
+                          target = pathlib.Path(td)/('check'+suffix)
+                          h = hashlib.sha256()
+                          with z.open(info) as src, target.open('wb') as dst:
+                              while chunk := src.read(1024*1024):
+                                  h.update(chunk)
+                                  dst.write(chunk)
+                          item = {'name':info.filename, 'bytes':info.file_size, 'sha256':h.hexdigest()}
+                          report['files'].append(item)
+                          if suffix == '.pth':
+                              obj = torch.load(target, map_location='cpu', weights_only=True)
+                              w = obj['weight']
+                              item.update(version=obj.get('version'), f0=obj.get('f0'), config=obj.get('config'), weight_count=len(w), nonfinite=[k for k,v in w.items() if torch.is_tensor(v) and not torch.isfinite(v).all().item()])
+                              assert not item['nonfinite']
+                          else:
+                              ix = faiss.read_index(str(target))
+                              assert ix.ntotal > 0
+                              q = np.zeros((1,ix.d), dtype=np.float32)
+                              dist, ids = ix.search(q, min(8,ix.ntotal))
+                              item.update(dimension=ix.d, ntotal=ix.ntotal, search_ids=ids.tolist(), search_distances=dist.tolist())
+                              assert (ids >= 0).any() and np.isfinite(dist[ids>=0]).all()
+                          target.unlink()
+                      assert {pathlib.PurePosixPath(x['name']).suffix.lower() for x in report['files']} == {'.pth','.index'}
+                  report['status']='pass'
+          except Exception:
+              report['status']='fail'
+              report['error']=traceback.format_exc()
+          finally:
+              s=json.dumps(report,indent=2,default=str,ensure_ascii=False)
+              pathlib.Path('report',model+'.json').write_text(s,encoding='utf-8')
+              print(s)
+          if report['status'] != 'pass': raise SystemExit(1)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage01-${{ matrix.model }}
+          path: report/
+          if-no-files-found: warn
+          retention-days: 7
